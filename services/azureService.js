@@ -9,7 +9,6 @@ const {
 const axios = require('axios');
 const AzureOpenAI = require('openai').AzureOpenAI;
 const config = require('../config/config');
-const paperlessService = require('./paperlessService');
 const fs = require('fs').promises;
 const path = require('path');
 const {
@@ -68,7 +67,7 @@ class AzureOpenAIService {
         console.log('[DEBUG] Thumbnail already cached');
       } catch {
         console.log('Thumbnail not cached, fetching from Paperless');
-
+        const paperlessService = require('./paperlessService');
         const thumbnailData = await paperlessService.getThumbnailImage(id);
 
         if (!thumbnailData) {
