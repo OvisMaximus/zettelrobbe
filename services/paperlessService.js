@@ -363,6 +363,9 @@ class PaperlessService {
   async createCustomFieldSafely(fieldName, fieldType, default_currency) {
     const normalizedFieldType = String(fieldType || '').trim();
 
+    // Check an already existing field before attempting creation. Paperless
+    // returns 400 for duplicate names, so without this check a configured
+    // type mismatch (e.g. string vs. longtext) would be silently ignored.
     const existingField = await this.findExistingCustomField(fieldName);
     if (existingField) {
       const existingFieldType = String(existingField.data_type || '').trim();
@@ -996,7 +999,7 @@ class PaperlessService {
       includeTagIds = await this.resolveTagIdsByName(includeTagNames);
 
       if (includeTagIds.length === 0) {
-        console.warn('[DEBUG] None of the specified tags were found');
+        console.warn(`[DEBUG] None of the specified tags ${includeTagNames} were found`);
         return [];
       }
 
@@ -1211,7 +1214,7 @@ class PaperlessService {
       }
       
       if (tagIds.length === 0) {
-        console.warn('[DEBUG] None of the specified tags were found');
+        console.warn(`[DEBUG] None of the specified tags ${tagNames} were found`);
         return [];
       }
       
