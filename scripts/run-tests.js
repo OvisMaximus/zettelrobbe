@@ -58,6 +58,8 @@ const TESTS = {
   'document-metadata-batching': 'test-document-metadata-batching.js',
   'pr772-fix': 'test-pr772-fix.js',
   'ollama-response-limit': 'test-ollama-response-limit.js',
+  'ollama-upstream-error': 'test-ollama-upstream-error.js',
+  'predefined-retrigger': 'test-predefined-retrigger.js',
   'response-truncation-detection': 'test-response-truncation-detection.js',
   'ollama-temperature-wiring': 'test-ollama-temperature-wiring.js',
   'quickstart-model-classification': 'test-quickstart-model-classification.js',

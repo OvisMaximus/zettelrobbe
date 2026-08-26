@@ -747,6 +747,67 @@ class OllamaService {
    * @param {Object} schema - Response schema
    * @returns {Object} Ollama API response
    */
+  /**
+   * Extract the cause an Ollama (or its inference backend) reported in a
+   * non-2xx response body. Ollama wraps backend failures — its runner closing
+   * the connection on an oversized prompt, for example — into
+   * `{ error: 'Post "http://…/v1/completions": EOF' }`; without this the
+   * operator only ever sees "Request failed with status code 500" and cannot
+   * tell an Ollama problem from a model-backend problem.
+   *
+   * @param {Object} axiosError
+   * @returns {string|null}
+   */
+  _extractUpstreamErrorMessage(axiosError) {
+    const data = axiosError?.response?.data;
+    if (!data) return null;
+    if (typeof data === 'string') {
+      const trimmed = data.trim();
+      try {
+        return JSON.parse(trimmed)?.error || trimmed || null;
+      } catch {
+        return trimmed || null;
+      }
+    }
+    return data.error || data.message || null;
+  }
+
+  /**
+   * True for failures worth one more attempt: the connection dropped or the
+   * server answered 5xx. A 4xx is a request problem and will fail again.
+   *
+   * @param {Object} axiosError
+   * @returns {boolean}
+   */
+  _isTransientOllamaFailure(axiosError) {
+    if (!axiosError.response) {
+      // No response at all: connection refused/reset/timeout.
+      return true;
+    }
+    return axiosError.response.status >= 500;
+  }
+
+  /**
+   * Wrap an axios failure with the upstream detail attached.
+   *
+   * @param {Object} axiosError - The axios error being wrapped
+   * @param {number} attempt - Which attempt failed (1-based)
+   * @returns {Error}
+   */
+  _wrapOllamaRequestError(axiosError, attempt) {
+    const upstream = this._extractUpstreamErrorMessage(axiosError);
+    const status = axiosError?.response?.status;
+    const detail = upstream ? `: ${upstream}` : '';
+    const wrapped = new Error(
+      `Ollama request failed (HTTP ${status || 'no response'}, attempt ${attempt})${detail}`,
+      { cause: axiosError }
+    );
+    // Keep the axios code so the scan-loop classification (OCR fallback,
+    // failure reasons) keeps working unchanged.
+    wrapped.code = axiosError.code;
+    return wrapped;
+  }
+
   async _callOllamaAPI(prompt, systemPrompt, numCtx, schema) {
     // The same number _calculateNumCtx() already reserved room for. It used to
     // be a hardcoded 256 while the reservation followed the setting, so the
@@ -774,15 +835,32 @@ class OllamaService {
       requestBody.think = false;
     }
 
-    const response = await this.client.post(
-      `${this.apiUrl}/api/generate`,
-      requestBody,
-      {
-        headers: this._buildRequestHeaders(),
+    // One bounded retry for transient failures (backend EOF, 5xx). The
+    // field report behind this: an MLX runner closed its connection once
+    // under memory pressure; the immediate second attempt succeeded.
+    const MAX_ATTEMPTS = 2;
+    let response;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+      try {
+        response = await this.client.post(
+          `${this.apiUrl}/api/generate`,
+          requestBody,
+          {
+            headers: this._buildRequestHeaders(),
+          }
+        );
+        break;
+      } catch (error) {
+        const wrapped = this._wrapOllamaRequestError(error, attempt);
+        console.error(`[ERROR] ${wrapped.message}`);
+        if (attempt >= MAX_ATTEMPTS || !this._isTransientOllamaFailure(error)) {
+          throw wrapped;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000));
       }
-    );
+    }
 
-    if (!response.data) {
+    if (!response?.data) {
       throw new Error('Invalid response from Ollama API');
     }
 

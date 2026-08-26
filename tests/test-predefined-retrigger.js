@@ -29,9 +29,9 @@ const path = require('path');
 let passed = 0;
 let failed = 0;
 
-function test(name, fn) {
+async function test(name, fn) {
   try {
-    fn();
+    await fn();
     console.log(`✅  ${name}`);
     passed++;
   } catch (error) {
@@ -108,30 +108,27 @@ test('The re-trigger respects ignored and permanently-failed documents', () => {
   };
 
   try {
-    await test(
-      'updateDocument removes configured tag ids from the merged payload',
-      async () => {
-        await paperlessService.updateDocument(315, {
-          title: 'New title',
-          tags: [5], // AI-chosen tags
-          removeTagIds: [42], // the predefined-mode trigger tag
-        });
+    await test('updateDocument removes configured tag ids from the merged payload', async () => {
+      await paperlessService.updateDocument(315, {
+        title: 'New title',
+        tags: [5], // AI-chosen tags
+        removeTagIds: [42], // the predefined-mode trigger tag
+      });
 
-        const updateCall = calls.find((call) => call.method === 'patch');
-        assert.ok(updateCall, 'an update request was sent');
-        const sentTags = updateCall.body.tags;
-        assert.deepStrictEqual(
-          [...sentTags].sort((a, b) => a - b),
-          [5, 11],
-          'AI tags merge with existing tags, the trigger tag is gone'
-        );
-        assert.strictEqual(
-          sentTags.includes(42),
-          false,
-          'the trigger tag must not survive the write-back'
-        );
-      }
-    );
+      const updateCall = calls.find((call) => call.method === 'patch');
+      assert.ok(updateCall, 'an update request was sent');
+      const sentTags = updateCall.body.tags;
+      assert.deepStrictEqual(
+        [...sentTags].sort((a, b) => a - b),
+        [5, 11],
+        'AI tags merge with existing tags, the trigger tag is gone'
+      );
+      assert.strictEqual(
+        sentTags.includes(42),
+        false,
+        'the trigger tag must not survive the write-back'
+      );
+    });
   } finally {
     paperlessService.client = originalClient;
   }
