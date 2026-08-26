@@ -31,6 +31,7 @@ function formatStatus(status) {
 }
 
 const TESTS = {
+  'cached-name-id-enum': 'test-cached-name-id-enum.js',
   'dashboard-stats-cache': 'test-dashboard-stats-cache.js',
   'document-type-restriction': 'test-document-type-restriction.js',
   'effective-document-count-cache': 'test-effective-document-count-cache.js',

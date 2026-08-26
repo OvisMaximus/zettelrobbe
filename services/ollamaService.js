@@ -1,5 +1,6 @@
 const {
-    writePromptToFile
+    writePromptToFile,
+    toNameList
 } = require('./serviceUtils');
 const axios = require('axios');
 const config = require('../config/config');
@@ -302,27 +303,13 @@ class OllamaService {
         // Get system prompt based on configuration
         if (config.useExistingData === 'yes' && config.restrictToExistingTags === 'no' && config.restrictToExistingCorrespondents === 'no') {
             // Format existing tags
-            const existingTagsList = existingTags.join(', ');
+            const existingTagsList = toNameList(existingTags).join(', ');
 
-            // Format existing correspondents - handle both array of objects and array of strings
-            const existingCorrespondentList = correspondentList
-                .filter(Boolean)  // Remove any null/undefined entries
-                .map(correspondent => {
-                    if (typeof correspondent === 'string') return correspondent;
-                    return correspondent?.name || '';
-                })
-                .filter(name => name.length > 0)  // Remove empty strings
-                .join(', ');
+            // Format existing correspondents
+            const existingCorrespondentList = toNameList(correspondentList).join(', ');
 
-            // Format existing document types - handle both array of objects and array of strings
-            const existingDocumentTypesList = existingDocumentTypes
-                .filter(Boolean)  // Remove any null/undefined entries
-                .map(docType => {
-                    if (typeof docType === 'string') return docType;
-                    return docType?.name || '';
-                })
-                .filter(name => name.length > 0)  // Remove empty strings
-                .join(', ');
+            // Format existing document types
+            const existingDocumentTypesList = toNameList(existingDocumentTypes).join(', ');
 
             systemPrompt = `
             Pre-existing tags: ${existingTagsList}\n\n
