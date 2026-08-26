@@ -7,11 +7,52 @@ const {
   stripTrailingSlashes,
   createRedirectGuard,
 } = require('./serviceUtils');
+const {CachedNameIdEnum} = require('./CachedNameIdEnum');
+const {safeExtractRelativePath} = require('./serviceUtils');
 
 /** Timeout for the connectivity probe so a hanging host cannot stall a scan. */
 const CONNECTION_PROBE_TIMEOUT_MS = 10000;
-const {CachedNameIdEnum} = require('./CachedNameIdEnum');
-const {safeExtractRelativePath} = require('./serviceUtils');
+
+/** Used when PAPERLESS_REQUEST_TIMEOUT_SECONDS is unset or unreadable. */
+const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
+
+/**
+ * Page size for the tag cache refresh.
+ *
+ * Deliberately larger than the 100 the document reads here use. The tag cache
+ * is an all-or-nothing read that every tag lookup in the app waits on, and
+ * Paperless-ngx pages at 25 unless asked otherwise — an instance with 1331 tags
+ * therefore spent 54 sequential round trips and 42 seconds rebuilding it, with
+ * the dashboard statistics among the callers queued behind it. Tags are small
+ * objects, so a page of them costs little. DRF clamps to its own max_page_size
+ * rather than rejecting, so asking for more than a server allows is safe.
+ */
+const TAG_PAGE_SIZE = 1000;
+
+/**
+ * The deadline every request through `this.client` carries.
+ *
+ * Axios' own default is no timeout, and only checkConnection() ever set one —
+ * so a host that accepted the connection without answering (a Paperless-ngx
+ * container still booting, typically right after a restart) left the caller
+ * waiting forever. That was survivable for a scan, which runs again on the next
+ * tick, but not for the dashboard statistics: their single-flight slot is
+ * handed to every later reader, so one pending call took the endpoint down
+ * until the process was restarted.
+ *
+ * Read per client build rather than at module load, so a value changed through
+ * the settings page applies on the next reconnect.
+ */
+function requestTimeoutMs() {
+  const runtimeConfig = require('../config/config');
+  const seconds = Number(runtimeConfig.paperless?.requestTimeoutSeconds);
+  // Negative or unreadable is a typo, not a request to wait forever. 0 is the
+  // documented opt-out and is what axios itself reads as "no timeout".
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return DEFAULT_REQUEST_TIMEOUT_MS;
+  }
+  return seconds * 1000;
+}
 
 class PaperlessService {
   constructor() {
@@ -93,6 +134,7 @@ class PaperlessService {
           Authorization: `Token ${config.paperless.apiToken}`,
           'Content-Type': 'application/json',
         },
+        timeout: requestTimeoutMs(),
         // Requests carry the Paperless API token, so redirects must not leave
         // the configured host.
         beforeRedirect: createRedirectGuard(() => baseUrl),
@@ -320,11 +362,17 @@ class PaperlessService {
       if (this._refreshPromise) {
         return this._refreshPromise;
       }
-      const expireTime = new Date(
-        this.lastTagRefresh + this.CACHE_LIFETIME
-      ).toISOString();
+      const ttlSeconds = Math.floor(this.CACHE_LIFETIME / 1000);
+      // A cache that was never filled has no age and no expiry. Dating it from
+      // the epoch reported "age: 1786738904s ... expired at: 1970-01-01" on
+      // every cold start, which reads as a clock problem rather than a first
+      // run.
       console.log(
-        `[DEBUG] Tag cache expired (age: ${Math.floor(cacheAge / 1000)}s, TTL: ${Math.floor(this.CACHE_LIFETIME / 1000)}s, expired at: ${expireTime})`
+        this.lastTagRefresh === 0
+          ? `[DEBUG] Tag cache empty, building it (TTL: ${ttlSeconds}s)`
+          : `[DEBUG] Tag cache expired (age: ${Math.floor(cacheAge / 1000)}s, TTL: ${ttlSeconds}s, expired at: ${new Date(
+              this.lastTagRefresh + this.CACHE_LIFETIME
+            ).toISOString()})`
       );
       // No race condition: synchronous code is never preempted in Node.js's
       // event loop, so no other call can reach here between the check above
@@ -354,7 +402,9 @@ class PaperlessService {
     try {
       console.log('[DEBUG] Refreshing tag cache...');
       this.tagCache.clear();
-      let nextUrl = '/tags/';
+      // The page size only has to be asked for once: Paperless-ngx builds its
+      // `next` link from the request URL, so every following page carries it.
+      let nextUrl = `/tags/?page_size=${TAG_PAGE_SIZE}`;
       while (nextUrl) {
         const response = await this.client.get(nextUrl);
 
@@ -392,12 +442,15 @@ class PaperlessService {
   }
 
   async initializeWithCredentials(apiUrl, apiToken) {
+    const baseUrl = stripTrailingSlashes(apiUrl);
     this.client = axios.create({
-      baseURL: apiUrl.replace(/\/+$/, '') + '/api',
+      baseURL: baseUrl + '/api',
       headers: {
         Authorization: `Token ${apiToken}`,
         'Content-Type': 'application/json',
       },
+      timeout: requestTimeoutMs(),
+      beforeRedirect: createRedirectGuard(() => baseUrl),
     });
 
     // Test the connection
@@ -821,8 +874,21 @@ class PaperlessService {
     return tags;
   }
 
-  //todo
-  async getTagCount() {
+  /**
+   * `strict` decides what a failed lookup means to the caller.
+   *
+   * Returning 0 is right where the number is one line of an overview that is
+   * worth showing anyway. It is wrong for the dashboard statistics: a zero
+   * there is indistinguishable from an empty Paperless-ngx, so an unreachable
+   * backend was cached and served as "you have no documents" for a full TTL —
+   * with none of the staleness the page is built to report. Those callers pass
+   * `strict` and get the error, so the build fails and the cache stays empty.
+   *
+   * @param {{strict?: boolean}} [options]
+   * @returns {Promise<number>}
+   * todo
+   */
+  async getTagCount({ strict = false } = {}) {
     this.initialize();
     try {
       const response = await this.client.get('/tags/', {
@@ -831,12 +897,18 @@ class PaperlessService {
       return response.data.count;
     } catch (error) {
       console.error('[ERROR] fetching tag count:', error.message);
+      if (strict) throw error;
       return 0;
     }
   }
 
-  async getCorrespondentCount() {
+  /**
+   * @param {{strict?: boolean}} [options] see getTagCount()
+   * @returns {Promise<number>}
+   */
+  async getCorrespondentCount({ strict = false } = {}) {
     this.initialize();
+    // todo pass strict to throw error if no match found
     return await this.correspondents.getCount(this.client);
   }
 
@@ -1131,7 +1203,28 @@ class PaperlessService {
     return filteredDocuments;
   }
 
-  async getEffectiveDocumentCount() {
+  /**
+   * Stores a computed effective document count and returns it, so every exit
+   * of getEffectiveDocumentCount() populates the cache the same way.
+   *
+   * @param {string} cacheKey
+   * @param {number} count
+   * @returns {number} the count that was cached
+   */
+  cacheEffectiveCount(cacheKey, count) {
+    this._effectiveCountCache = {
+      key: cacheKey,
+      count,
+      expiresAt: Date.now() + this._effectiveCountCacheTtlMs,
+    };
+    return count;
+  }
+
+  /**
+   * @param {{strict?: boolean}} [options] see getTagCount()
+   * @returns {Promise<number>}
+   */
+  async getEffectiveDocumentCount({ strict = false } = {}) {
     const shouldFilterByTags =
       process.env.PROCESS_PREDEFINED_DOCUMENTS === 'yes';
     const includeTagNames = this.parseTagList(process.env.TAGS);
@@ -1153,14 +1246,17 @@ class PaperlessService {
     let includeTagIds = [];
     let excludeTagIds = [];
 
+    // "Nothing matches" is a result like any other and must be cached too —
+    // otherwise these two paths re-resolve the tag list on every call, which is
+    // exactly the per-request Paperless traffic the cache exists to avoid.
     if (shouldFilterByTags) {
       if (includeTagNames.length === 0) {
-        return 0;
+        return this.cacheEffectiveCount(cacheKey, 0);
       }
 
       includeTagIds = await this.resolveTagIdsByName(includeTagNames);
       if (includeTagIds.length === 0) {
-        return 0;
+        return this.cacheEffectiveCount(cacheKey, 0);
       }
     }
 
@@ -1203,18 +1299,13 @@ class PaperlessService {
         }
       }
 
-      this._effectiveCountCache = {
-        key: cacheKey,
-        count: effectiveCount,
-        expiresAt: Date.now() + this._effectiveCountCacheTtlMs,
-      };
-
-      return effectiveCount;
+      return this.cacheEffectiveCount(cacheKey, effectiveCount);
     } catch (error) {
       console.error(
         '[ERROR] fetching effective document count:',
         error.message
       );
+      if (strict) throw error;
       return 0;
     }
   }
@@ -1688,6 +1779,56 @@ class PaperlessService {
     }
   }
 
+  /**
+   * Lightweight probe against the configured Paperless-ngx instance.
+   *
+   * Used by the startup retry loop and by every scan run: most read helpers in
+   * this service swallow transport errors and return empty results, which makes
+   * an unreachable Paperless indistinguishable from "nothing to do". This call
+   * makes that distinction explicit and never throws.
+   *
+   * @returns {Promise<{reachable: boolean, authorized: boolean, status: number|null, error: string|null}>}
+   *   reachable: an HTTP response was received (the host answered).
+   *   authorized: the API token is accepted (not 401/403).
+   */
+  async checkConnection() {
+    this.initialize();
+
+    if (!this.client) {
+      return {
+        reachable: false,
+        authorized: false,
+        status: null,
+        error: 'Paperless-ngx client is not configured',
+      };
+    }
+
+    try {
+      const response = await this.client.get('/users/', {
+        params: { current_user: true, page_size: 1 },
+        timeout: CONNECTION_PROBE_TIMEOUT_MS,
+      });
+
+      return {
+        reachable: true,
+        authorized: true,
+        status: response.status || 200,
+        error: null,
+      };
+    } catch (error) {
+      const status = error.response?.status ?? null;
+
+      // A status code means the host answered, so it is reachable — only the
+      // credentials or permissions may be wrong. Without a status the request
+      // never got through, so authorization is unknown and reported as false.
+      return {
+        reachable: status !== null,
+        authorized: status !== null && status !== 401 && status !== 403,
+        status,
+        error: error.message || 'Unknown connection error',
+      };
+    }
+  }
   async getOwnUserID() {
     this.initialize();
     try {

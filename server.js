@@ -13,7 +13,11 @@ const { runStartupMigrations } = require('./services/startupMigrations');
 const setupRoutes = require('./routes/setup');
 const { isAuthenticated } = require('./routes/auth');
 const mistralOcrService = require('./services/mistralOcrService');
+const ocrAutoProcessService = require('./services/ocrAutoProcessService');
 const reconciliationService = require('./services/reconciliationService');
+const scanHealthService = require('./services/scanHealthService');
+const dashboardStatsService = require('./services/dashboardStatsService');
+const { RUN_STATUS } = scanHealthService;
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const { doubleCsrf } = require('csrf-csrf');
@@ -22,15 +26,11 @@ const { ipKeyGenerator } = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const Logger = require('./services/loggerService');
 const {
-  updateCustomFieldsData,
-  updateDocumentTypeData,
-  updateCorrespondentData,
-} = require('./services/dataProcessingUtils');
-const {
+  validateCustomFieldValue,
   shouldQueueForOcrOnAiError,
   classifyOcrQueueReasonFromAiError,
   isTimeoutError,
-  buildTimeoutErrorMessage
+  buildTimeoutErrorMessage,
 } = require('./services/serviceUtils');
 const dataDir = path.join(process.cwd(), 'data');
 const openApiDir = path.join(dataDir, 'OPENAPI');
@@ -42,7 +42,7 @@ const htmlLogger = new Logger({
   logDir: dataLogsDir,
   format: 'html',
   timestamp: true,
-  maxFileSize: 1024 * 1024 * 10
+  maxFileSize: 1024 * 1024 * 10,
 });
 
 const txtLogger = new Logger({
@@ -50,7 +50,7 @@ const txtLogger = new Logger({
   logDir: dataLogsDir,
   format: 'txt',
   timestamp: true,
-  maxFileSize: 1024 * 1024 * 10
+  maxFileSize: 1024 * 1024 * 10,
 });
 
 const app = express();
@@ -64,7 +64,7 @@ const scanControl = global.__paperlessAiScanControl || {
   stopRequested: false,
   source: null,
   startedAt: null,
-  stopRequestedAt: null
+  stopRequestedAt: null,
 };
 global.__paperlessAiScanControl = scanControl;
 
@@ -84,12 +84,14 @@ async function triggerScanNow(source = 'manual') {
       started: false,
       running: true,
       stopRequested: scanControl.stopRequested,
-      message: 'Scan is already running.'
+      message: 'Scan is already running.',
     };
   }
 
   scanDocuments(source).catch((error) => {
-    console.error(`[ERROR] scanDocuments() failed in triggerScanNow: ${error.message}`);
+    console.error(
+      `[ERROR] scanDocuments() failed in triggerScanNow: ${error.message}`
+    );
     console.debug(error);
   });
 
@@ -97,7 +99,7 @@ async function triggerScanNow(source = 'manual') {
     started: true,
     running: true,
     stopRequested: false,
-    message: 'Scan started.'
+    message: 'Scan started.',
   };
 }
 
@@ -107,7 +109,10 @@ global.__paperlessAiRequestScanStop = requestScanStop;
 function persistJwtSecret(secret) {
   const runtimeDataDir = path.join(process.cwd(), 'data');
   const envFilePath = path.join(runtimeDataDir, '.env');
-  const runtimeOverridesPath = path.join(runtimeDataDir, 'runtime-overrides.json');
+  const runtimeOverridesPath = path.join(
+    runtimeDataDir,
+    'runtime-overrides.json'
+  );
 
   try {
     fsSync.mkdirSync(runtimeDataDir, { recursive: true });
@@ -121,15 +126,23 @@ function persistJwtSecret(secret) {
     let updatedEnvContent = envContent;
 
     if (hasJwtSecretLine) {
-      updatedEnvContent = envContent.replace(/^\s*JWT_SECRET\s*=.*$/m, `JWT_SECRET=${secret}`);
+      updatedEnvContent = envContent.replace(
+        /^\s*JWT_SECRET\s*=.*$/m,
+        `JWT_SECRET=${secret}`
+      );
     } else {
       const trimmed = envContent.trimEnd();
-      updatedEnvContent = trimmed ? `${trimmed}\nJWT_SECRET=${secret}\n` : `JWT_SECRET=${secret}\n`;
+      updatedEnvContent = trimmed
+        ? `${trimmed}\nJWT_SECRET=${secret}\n`
+        : `JWT_SECRET=${secret}\n`;
     }
 
     fsSync.writeFileSync(envFilePath, updatedEnvContent, 'utf8');
   } catch (error) {
-    console.warn('[WARN] Could not persist generated JWT_SECRET to data/.env:', error.message);
+    console.warn(
+      '[WARN] Could not persist generated JWT_SECRET to data/.env:',
+      error.message
+    );
   }
 
   try {
@@ -142,10 +155,17 @@ function persistJwtSecret(secret) {
 
     if (!parsed.JWT_SECRET || String(parsed.JWT_SECRET).trim() === '') {
       parsed.JWT_SECRET = secret;
-      fsSync.writeFileSync(runtimeOverridesPath, JSON.stringify(parsed, null, 2), 'utf8');
+      fsSync.writeFileSync(
+        runtimeOverridesPath,
+        JSON.stringify(parsed, null, 2),
+        'utf8'
+      );
     }
   } catch (error) {
-    console.warn('[WARN] Could not update JWT_SECRET in runtime-overrides.json:', error.message);
+    console.warn(
+      '[WARN] Could not update JWT_SECRET in runtime-overrides.json:',
+      error.message
+    );
   }
 }
 
@@ -159,14 +179,18 @@ function ensureJwtSecret() {
   process.env.JWT_SECRET = generatedSecret;
   persistJwtSecret(generatedSecret);
 
-  console.warn('[WARN] JWT_SECRET was missing. Generated and persisted a new secret. Existing sessions may require re-login.');
+  console.warn(
+    '[WARN] JWT_SECRET was missing. Generated and persisted a new secret. Existing sessions may require re-login.'
+  );
   return generatedSecret;
 }
 
 const JWT_SECRET = ensureJwtSecret();
 
 if (!JWT_SECRET) {
-  console.error('JWT_SECRET environment variable is not set. Refusing to start without a secure JWT secret.');
+  console.error(
+    'JWT_SECRET environment variable is not set. Refusing to start without a secure JWT secret.'
+  );
   process.exit(1);
 }
 
@@ -178,7 +202,9 @@ if (trustProxy !== false) {
 function getCookieSecureMode() {
   return typeof config.getCookieSecureMode === 'function'
     ? config.getCookieSecureMode()
-    : String(process.env.COOKIE_SECURE_MODE || 'auto').trim().toLowerCase();
+    : String(process.env.COOKIE_SECURE_MODE || 'auto')
+        .trim()
+        .toLowerCase();
 }
 
 function shouldUseSecureCookies(req) {
@@ -219,16 +245,15 @@ const retryTracker = new Map();
 // Configurable minimum content length (default: 10 characters)
 const MIN_CONTENT_LENGTH = config.minContentLength;
 
-
 const corsOptions = {
   origin: true,
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: [
-    'Content-Type', 
+    'Content-Type',
     'x-api-key',
-    'Access-Control-Allow-Private-Network'
+    'Access-Control-Allow-Private-Network',
   ],
-  credentials: false
+  credentials: false,
 };
 
 const apiGlobalLimiter = rateLimit({
@@ -236,7 +261,7 @@ const apiGlobalLimiter = rateLimit({
   max: config.globalRateLimitMax,
   message: {
     success: false,
-    error: 'Too many requests. Please try again later.'
+    error: 'Too many requests. Please try again later.',
   },
   standardHeaders: true,
   legacyHeaders: false,
@@ -251,17 +276,18 @@ const apiGlobalLimiter = rateLimit({
     if (token) {
       try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        const userIdentifier = decoded?.id || decoded?.userId || decoded?.username || decoded?.sub;
+        const userIdentifier =
+          decoded?.id || decoded?.userId || decoded?.username || decoded?.sub;
         if (userIdentifier) {
           return `user:${userIdentifier}`;
         }
-      } catch (error) {
+      } catch {
         // Ignore invalid token and fallback to IP
       }
     }
 
     return ipKeyGenerator(req.ip);
-  }
+  },
 });
 
 app.use(cors(corsOptions));
@@ -283,15 +309,19 @@ app.use((req, res, next) => {
   res.locals.theme = resolvedTheme;
   res.locals.appVersion = config.PAPERLESS_AI_VERSION || 'unknown';
   res.locals.appCommitSha = process.env.PAPERLESS_AI_COMMIT_SHA || 'unknown';
-  res.locals.appPaperlessNgxVersion = process.env.PAPERLESS_NGX_VERSION || 'unknown';
-  res.locals.appAiProvider = config.aiProvider || process.env.AI_PROVIDER || 'openai';
+  res.locals.appPaperlessNgxVersion =
+    process.env.PAPERLESS_NGX_VERSION || 'unknown';
+  res.locals.appAiProvider =
+    config.aiProvider || process.env.AI_PROVIDER || 'openai';
   res.locals.appOcrEnabled = config.mistralOcr?.enabled === 'yes';
   res.locals.appOcrProvider = config.mistralOcr?.provider || 'mistral';
   res.locals.appNodeEnv = process.env.NODE_ENV || 'production';
   res.locals.appNodeVersion = process.version;
   res.locals.appPlatform = `${process.platform} (${process.arch})`;
   res.locals.appServerTimeUtc = new Date().toISOString();
-  res.locals.appServerTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  res.locals.appServerTimezone =
+    Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  res.locals.appDateFormat = config.dateFormat || 'DD.MM.YYYY';
   res.locals.appPaperlessApiUrl = config.paperless?.apiUrl || 'unknown';
   res.locals.appOllamaApiUrl = config.ollama?.apiUrl || 'unknown';
   res.locals.appOllamaModel = config.ollama?.model || 'unknown';
@@ -307,8 +337,10 @@ app.use((req, res, next) => {
   res.locals.appTrustProxy = String(config.trustProxy);
   res.locals.appUseExistingData = config.useExistingData || 'no';
   res.locals.appRestrictTags = config.restrictToExistingTags || 'no';
-  res.locals.appRestrictCorrespondents = config.restrictToExistingCorrespondents || 'no';
-  res.locals.appRestrictDocumentTypes = config.restrictToExistingDocumentTypes || 'no';
+  res.locals.appRestrictCorrespondents =
+    config.restrictToExistingCorrespondents || 'no';
+  res.locals.appRestrictDocumentTypes =
+    config.restrictToExistingDocumentTypes || 'no';
   res.locals.appPaperlessTokenSet = Boolean(config.paperless?.apiToken);
   res.locals.appOpenAiKeySet = Boolean(config.openai?.apiKey);
   res.locals.appCustomKeySet = Boolean(config.custom?.apiKey);
@@ -318,49 +350,49 @@ app.use((req, res, next) => {
   res.locals.loginCookieSecurityWarning = null;
 
   if (req.path === '/login' && csrfCookieSecure && !isHttpsRequest(req)) {
-    res.locals.loginCookieSecurityWarning = 'You are accessing the login page over HTTP while the system is configured to use HTTPS by default. To resolve this, either switch to HTTPS or set COOKIE_SECURE_MODE=never in your .env or docker-compose.yml file and restart the container.';
+    res.locals.loginCookieSecurityWarning =
+      'You are accessing the login page over HTTP while the system is configured to use HTTPS by default. To resolve this, either switch to HTTPS or set COOKIE_SECURE_MODE=never in your .env or docker-compose.yml file and restart the container.';
   }
 
   next();
 });
 
 // CSRF Protection configuration
-const {
-  invalidCsrfTokenError,
-  generateCsrfToken,
-  doubleCsrfProtection,
-} = doubleCsrf({
-  getSecret: () => JWT_SECRET,
-  getSessionIdentifier: (req) => {
-    const token = req.cookies?.jwt || req.headers.authorization?.split(' ')[1];
-    if (token) {
-      return `jwt:${token}`;
-    }
+const { invalidCsrfTokenError, generateCsrfToken, doubleCsrfProtection } =
+  doubleCsrf({
+    getSecret: () => JWT_SECRET,
+    getSessionIdentifier: (req) => {
+      const token =
+        req.cookies?.jwt || req.headers.authorization?.split(' ')[1];
+      if (token) {
+        return `jwt:${token}`;
+      }
 
-    const apiKey = req.headers['x-api-key'];
-    const currentApiKey = config.getApiKey();
-    if (currentApiKey && apiKey && apiKey === currentApiKey) {
-      return `api-key:${apiKey}`;
-    }
+      const apiKey = req.headers['x-api-key'];
+      const currentApiKey = config.getApiKey();
+      if (currentApiKey && apiKey && apiKey === currentApiKey) {
+        return `api-key:${apiKey}`;
+      }
 
-    return `ip:${req.ip || 'unknown'}`;
-  },
-  cookieName: "psai.x-csrf-token",
-  cookieOptions: {
-    sameSite: "lax",
-    path: "/",
-    secure: csrfCookieSecure,
-  },
-  size: 64,
-  ignoredMethods: ["GET", "HEAD", "OPTIONS"],
-  getCsrfTokenFromRequest: (req) => req.headers["x-csrf-token"] || req.body._csrf,
-});
+      return `ip:${req.ip || 'unknown'}`;
+    },
+    cookieName: 'psai.x-csrf-token',
+    cookieOptions: {
+      sameSite: 'lax',
+      path: '/',
+      secure: csrfCookieSecure,
+    },
+    size: 64,
+    ignoredMethods: ['GET', 'HEAD', 'OPTIONS'],
+    getCsrfTokenFromRequest: (req) =>
+      req.headers['x-csrf-token'] || req.body._csrf,
+  });
 
 // Middleware to skip CSRF for API Key authenticated requests and provide token to EJS
 app.use((req, res, next) => {
   const apiKey = req.headers['x-api-key'];
   const currentApiKey = config.getApiKey();
-  
+
   // If API Key is valid, skip CSRF
   if (currentApiKey && apiKey && apiKey === currentApiKey) {
     return next();
@@ -371,7 +403,8 @@ app.use((req, res, next) => {
     if (err) {
       if (err === invalidCsrfTokenError) {
         if (req.method === 'POST' && req.path === '/login') {
-          const baseError = 'Invalid CSRF token. The login page may have expired or your browser did not send the CSRF cookie.';
+          const baseError =
+            'Invalid CSRF token. The login page may have expired or your browser did not send the CSRF cookie.';
           const guidance = res.locals.loginCookieSecurityWarning
             ? ' This is commonly caused by HTTP access with secure cookies enabled. Set COOKIE_SECURE_MODE=never for local HTTP and restart, or switch to HTTPS. See: https://zettelrob.be/getting-started/configuration/#cookie-and-proxy-flags-all-supported-values'
             : ' Refresh the login page and try again.';
@@ -379,19 +412,54 @@ app.use((req, res, next) => {
           return res.status(403).render('login', {
             error: `${baseError}${guidance}`,
             mfaRequired: false,
-            username: String(req.body?.username || '')
+            username: String(req.body?.username || ''),
           });
         }
 
-        return res.status(403).json({ error: "Invalid CSRF token" });
+        return res.status(403).json({ error: 'Invalid CSRF token' });
       }
       return next(err);
     }
-    
+
     // Make CSRF token available to EJS templates
     res.locals.csrfToken = generateCsrfToken(req, res);
     next();
   });
+});
+
+/**
+ * @swagger
+ * /api/csrf-token:
+ *   get:
+ *     summary: Issue a CSRF token for the current browser
+ *     description: |
+ *       Returns a token paired with the CSRF cookie this response sets, for a
+ *       page whose own token has gone stale.
+ *
+ *       A token is minted per page render and the cookie it pairs with belongs
+ *       to the browser, not the tab — so a second tab, a navigation, or the
+ *       restart after saving settings leaves every older tab holding a token
+ *       the server no longer accepts. /js/csrf.js calls this after a rejected
+ *       request and repeats the request once.
+ *
+ *       Deliberately unauthenticated: the login form needs the same recovery,
+ *       and a token is only usable together with the cookie sent alongside it.
+ *     tags:
+ *       - System
+ *     responses:
+ *       200:
+ *         description: A token matching the cookie set on this response
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 csrfToken:
+ *                   type: string
+ *                   example: "e3b0c44298fc1c14…"
+ */
+app.get('/api/csrf-token', (req, res) => {
+  res.json({ csrfToken: generateCsrfToken(req, res) });
 });
 
 app.use(['/api', '/manual'], apiGlobalLimiter);
@@ -404,11 +472,16 @@ if (isApiDocsEnabled) {
   swaggerSpec = require('./swagger');
 
   // Swagger documentation route (protected)
-  app.use('/api-docs', isAuthenticated, swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
-    swaggerOptions: {
-      url: '/api-docs/openapi.json'
-    }
-  }));
+  app.use(
+    '/api-docs',
+    isAuthenticated,
+    swaggerUi.serve,
+    swaggerUi.setup(swaggerSpec, {
+      swaggerOptions: {
+        url: '/api-docs/openapi.json',
+      },
+    })
+  );
 
   /**
    * @swagger
@@ -419,7 +492,7 @@ if (isApiDocsEnabled) {
    *       Returns the complete OpenAPI specification for the Zettelrobbe API.
    *       This endpoint attempts to serve a static OpenAPI JSON file first, falling back
    *       to dynamically generating the specification if the file cannot be read.
-   *       
+   *
    *       The OpenAPI specification document contains all API endpoints, parameters,
    *       request bodies, responses, and schemas for the entire application.
    *     tags: [API, System]
@@ -453,14 +526,17 @@ if (isApiDocsEnabled) {
    */
   app.get('/api-docs/openapi.json', isAuthenticated, (req, res) => {
     res.setHeader('Content-Type', 'application/json');
-    
+
     // Try to serve the static file first
     fs.readFile(openApiPath)
-      .then(data => {
+      .then((data) => {
         res.send(JSON.parse(data));
       })
-      .catch(err => {
-        console.warn('Error reading OpenAPI file, generating dynamically:', err.message);
+      .catch((err) => {
+        console.warn(
+          'Error reading OpenAPI file, generating dynamically:',
+          err.message
+        );
         // Fallback to generating the spec if file can't be read
         res.send(swaggerSpec);
       });
@@ -504,7 +580,6 @@ app.set('views', path.join(__dirname, 'views'));
 //   next();
 // });
 
-
 // Initialize data directory
 async function initializeDataDirectory() {
   try {
@@ -529,7 +604,7 @@ async function saveOpenApiSpec() {
       console.log('Creating OPENAPI directory...');
       await fs.mkdir(openApiDir, { recursive: true });
     }
-    
+
     // Write the specification to file
     await fs.writeFile(openApiPath, JSON.stringify(swaggerSpec, null, 2));
     console.log(`OpenAPI specification saved to ${openApiPath}`);
@@ -542,28 +617,41 @@ async function saveOpenApiSpec() {
 }
 
 // Document processing functions
-async function processDocument(doc, existingTags, existingCorrespondentList, existingDocumentTypesList, ownUserId) {
+async function processDocument(
+  doc,
+  existingTags,
+  existingCorrespondentList,
+  existingDocumentTypesList
+) {
   const isProcessed = await documentModel.isDocumentProcessed(doc.id);
   if (isProcessed) return null;
 
   const isIgnored = await documentModel.isDocumentIgnored(doc.id);
   if (isIgnored) {
-    console.debug(`Document ${doc.id} is marked as ignored, skipping permanently`);
+    console.debug(
+      `Document ${doc.id} is marked as ignored, skipping permanently`
+    );
     return null;
   }
 
   const isFailed = await documentModel.isDocumentFailed(doc.id);
   if (isFailed) {
-    console.debug(`Document ${doc.id} is marked as permanently failed, skipping until reset`);
+    console.debug(
+      `Document ${doc.id} is marked as permanently failed, skipping until reset`
+    );
     return null;
   }
 
   await documentModel.setProcessingStatus(doc.id, doc.title, 'processing');
 
   // Check if the document can be edited.
-  const documentEditable = await paperlessService.getPermissionOfDocument(doc.id);
+  const documentEditable = await paperlessService.getPermissionOfDocument(
+    doc.id
+  );
   if (!documentEditable) {
-    console.debug(`Document ${doc.id} is not editable by the Zettelrobbe user, skipping analysis`);
+    console.debug(
+      `Document ${doc.id} is not editable by the Zettelrobbe user, skipping analysis`
+    );
     return null;
   }
 
@@ -571,20 +659,33 @@ async function processDocument(doc, existingTags, existingCorrespondentList, exi
 
   let [content, originalData] = await Promise.all([
     paperlessService.getDocumentContent(doc.id),
-    paperlessService.getDocument(doc.id)
+    paperlessService.getDocument(doc.id),
   ]);
 
   if (!content || content.length < MIN_CONTENT_LENGTH) {
-    console.debug(`Document ${doc.id} has insufficient content (${content?.length || 0} chars, minimum: ${MIN_CONTENT_LENGTH}), skipping analysis`);
+    console.debug(
+      `Document ${doc.id} has insufficient content (${content?.length || 0} chars, minimum: ${MIN_CONTENT_LENGTH}), skipping analysis`
+    );
     // Queue for Mistral OCR if enabled.
     if (mistralOcrService.isEnabled()) {
-      const added = await documentModel.addToOcrQueue(doc.id, doc.title, `short_content_lt_${MIN_CONTENT_LENGTH}`);
+      const added = await documentModel.addToOcrQueue(
+        doc.id,
+        doc.title,
+        `short_content_lt_${MIN_CONTENT_LENGTH}`
+      );
       if (added) {
-        console.info(`Document ${doc.id} queued for Mistral OCR (short_content)`);
+        console.info(
+          `Document ${doc.id} queued for Mistral OCR (short_content)`
+        );
       }
     } else {
       await documentModel.setProcessingStatus(doc.id, doc.title, 'failed');
-      await documentModel.addFailedDocument(doc.id, doc.title, `insufficient_content_lt_${MIN_CONTENT_LENGTH}`, 'ai');
+      await documentModel.addFailedDocument(
+        doc.id,
+        doc.title,
+        `insufficient_content_lt_${MIN_CONTENT_LENGTH}`,
+        'ai'
+      );
       retryTracker.delete(doc.id);
     }
     return null;
@@ -593,7 +694,9 @@ async function processDocument(doc, existingTags, existingCorrespondentList, exi
   // Check retry limit to prevent infinite retry loops
   const docRetries = retryTracker.get(doc.id) || 0;
   if (docRetries >= 3) {
-    console.warn(`Document ${doc.id} has failed ${docRetries} times, skipping to prevent infinite retry loop`);
+    console.warn(
+      `Document ${doc.id} has failed ${docRetries} times, skipping to prevent infinite retry loop`
+    );
     await documentModel.setProcessingStatus(doc.id, doc.title, 'failed');
     retryTracker.delete(doc.id);
     return null;
@@ -604,7 +707,13 @@ async function processDocument(doc, existingTags, existingCorrespondentList, exi
   }
 
   const aiService = AIServiceFactory.getService();
-  const analysis = await aiService.analyzeDocument(content, existingTags, existingCorrespondentList, existingDocumentTypesList, doc.id);
+  const analysis = await aiService.analyzeDocument(
+    content,
+    existingTags,
+    existingCorrespondentList,
+    existingDocumentTypesList,
+    doc.id
+  );
   console.debug('Response from AI service:', analysis);
   if (analysis.error) {
     const aiErrorMessage = isTimeoutError(analysis.error)
@@ -618,23 +727,44 @@ async function processDocument(doc, existingTags, existingCorrespondentList, exi
     let queuedForOcr = false;
     let markedTerminalFailed = false;
     // Queue for Mistral OCR on OCR-relevant AI errors (e.g. low content, invalid response structure)
-    if (mistralOcrService.isEnabled() && shouldQueueForOcrOnAiError(aiErrorMessage)) {
+    if (
+      mistralOcrService.isEnabled() &&
+      shouldQueueForOcrOnAiError(aiErrorMessage)
+    ) {
       const queueReason = classifyOcrQueueReasonFromAiError(aiErrorMessage);
-      const added = await documentModel.addToOcrQueue(doc.id, doc.title, queueReason);
+      const added = await documentModel.addToOcrQueue(
+        doc.id,
+        doc.title,
+        queueReason
+      );
       if (added) {
-        console.log(`[OCR] Document ${doc.id} queued for Mistral OCR (ai_failed: ${aiErrorMessage})`);
+        console.log(
+          `[OCR] Document ${doc.id} queued for Mistral OCR (ai_failed: ${aiErrorMessage})`
+        );
       }
       queuedForOcr = true;
     }
 
     if (!mistralOcrService.isEnabled()) {
       await documentModel.setProcessingStatus(doc.id, doc.title, 'failed');
-      await documentModel.addFailedDocument(doc.id, doc.title, 'ai_failed_ocr_disabled', 'ai');
+      await documentModel.addFailedDocument(
+        doc.id,
+        doc.title,
+        // A service that knows exactly why it gave up says so; everything else
+        // keeps the generic reason this branch has always recorded.
+        analysis.errorCode || 'ai_failed_ocr_disabled',
+        'ai'
+      );
       retryTracker.delete(doc.id);
       markedTerminalFailed = true;
     } else if (!queuedForOcr) {
       await documentModel.setProcessingStatus(doc.id, doc.title, 'failed');
-      await documentModel.addFailedDocument(doc.id, doc.title, 'ai_failed_without_ocr_fallback', 'ai');
+      await documentModel.addFailedDocument(
+        doc.id,
+        doc.title,
+        analysis.errorCode || 'ai_failed_without_ocr_fallback',
+        'ai'
+      );
       retryTracker.delete(doc.id);
       markedTerminalFailed = true;
     }
@@ -655,23 +785,36 @@ async function buildUpdateData(analysis, doc) {
   const updateData = {};
   const options = {
     restrictToExistingTags: config.restrictToExistingTags === 'yes',
-    restrictToExistingCorrespondents: config.restrictToExistingCorrespondents === 'yes',
-    restrictToExistingDocumentTypes: config.restrictToExistingDocumentTypes === 'yes'
+    restrictToExistingCorrespondents:
+      config.restrictToExistingCorrespondents === 'yes',
+    restrictToExistingDocumentTypes:
+      config.restrictToExistingDocumentTypes === 'yes',
   };
 
   // Only process tags if tagging is activated
   if (config.limitFunctions?.activateTagging !== 'no') {
-    const { tagIds, errors } = await paperlessService.processTags(analysis.document.tags, options);
+    const { tagIds, errors } = await paperlessService.processTags(
+      analysis.document.tags,
+      options
+    );
     if (errors.length > 0) {
       console.warn('[ERROR] Some tags could not be processed:', errors);
     }
     updateData.tags = tagIds;
-  } else if (config.limitFunctions?.activateTagging === 'no' && config.addAIProcessedTag === 'yes') {
+  } else if (
+    config.limitFunctions?.activateTagging === 'no' &&
+    config.addAIProcessedTag === 'yes'
+  ) {
     // Add AI processed tags to the document (processTags function awaits a tags array)
     // get tags from .env file and split them by comma and make an array
-    console.debug('Tagging is deactivated but the AI processed tag will still be added');
+    console.debug(
+      'Tagging is deactivated but the AI processed tag will still be added'
+    );
     const tags = config.addAIProcessedTags.split(',');
-    const { tagIds, errors } = await paperlessService.processTags(tags, options);
+    const { tagIds, errors } = await paperlessService.processTags(
+      tags,
+      options
+    );
     if (errors.length > 0) {
       console.warn('[ERROR] Some tags could not be processed:', errors);
     }
@@ -687,9 +830,116 @@ async function buildUpdateData(analysis, doc) {
   // Add created date regardless of settings as it's a core field
   updateData.created = analysis.document.document_date || doc.created;
 
-  await updateDocumentTypeData(analysis, updateData, config, paperlessService, options);
-  await updateCustomFieldsData(analysis, doc, updateData, config, paperlessService);
-  await updateCorrespondentData(analysis, updateData, config, paperlessService, options);
+  // Only process document type if document type classification is activated
+  if (
+    config.limitFunctions?.activateDocumentType !== 'no' &&
+    analysis.document.document_type
+  ) {
+    try {
+      const documentType = await paperlessService.getOrCreateDocumentType(
+        analysis.document.document_type,
+        options
+      );
+      if (documentType) {
+        updateData.document_type = documentType.id;
+      }
+    } catch (error) {
+      console.error(`[ERROR] Error processing document type: ${error.message}`);
+      console.debug(error);
+    }
+  }
+
+  // Only process custom fields if custom fields detection is activated
+  if (
+    config.limitFunctions?.activateCustomFields !== 'no' &&
+    analysis.document.custom_fields
+  ) {
+    const customFields = analysis.document.custom_fields;
+    const processedFields = [];
+    const customFieldsForHistory = [];
+
+    // Get existing custom fields
+    const existingFields = await paperlessService.getExistingCustomFields(
+      doc.id
+    );
+    console.debug('Found existing fields:', existingFields);
+
+    // Keep track of which fields we've processed to avoid duplicates
+    const processedFieldIds = new Set();
+
+    // First, add any new/updated fields
+    for (const key in customFields) {
+      const customField = customFields[key];
+
+      if (
+        !customField.field_name ||
+        customField.value === null ||
+        customField.value === undefined ||
+        String(customField.value).trim() === ''
+      ) {
+        console.debug('Skipping empty or invalid custom field');
+        continue;
+      }
+
+      const fieldDetails = await paperlessService.findExistingCustomField(
+        customField.field_name
+      );
+      if (fieldDetails?.id) {
+        const validation = validateCustomFieldValue(
+          customField.field_name,
+          customField.value,
+          fieldDetails.data_type
+        );
+        if (validation.skip) {
+          if (validation.warn) console.warn(validation.warn);
+          continue;
+        }
+        processedFields.push({
+          field: fieldDetails.id,
+          value: validation.value,
+        });
+        // Capture name + validated value for history at the point where we have both
+        customFieldsForHistory.push({
+          field_name: customField.field_name,
+          value: validation.value,
+        });
+        processedFieldIds.add(fieldDetails.id);
+      }
+    }
+
+    // Then add any existing fields that weren't updated
+    for (const existingField of existingFields) {
+      if (!processedFieldIds.has(existingField.field)) {
+        processedFields.push(existingField);
+      }
+    }
+
+    if (processedFields.length > 0) {
+      updateData.custom_fields = processedFields;
+    }
+    if (customFieldsForHistory.length > 0) {
+      updateData._customFieldsForHistory = customFieldsForHistory;
+    }
+  }
+
+  // Only process correspondent if correspondent detection is activated
+  if (
+    config.limitFunctions?.activateCorrespondents !== 'no' &&
+    analysis.document.correspondent
+  ) {
+    try {
+      const correspondent = await paperlessService.getOrCreateCorrespondent(
+        analysis.document.correspondent,
+        options
+      );
+      if (correspondent) {
+        updateData.correspondent = correspondent.id;
+      }
+    } catch (error) {
+      console.error(`[ERROR] Error processing correspondent: ${error.message}`);
+      console.debug(error);
+    }
+  }
 
   // Always include language if provided as it's a core field
   if (analysis.document.language) {
@@ -700,20 +950,34 @@ async function buildUpdateData(analysis, doc) {
 }
 
 async function saveDocumentChanges(docId, updateData, analysis, originalData) {
-  const { tags: originalTags, correspondent: originalCorrespondent, title: originalTitle } = originalData;
+  const {
+    tags: originalTags,
+    correspondent: originalCorrespondent,
+    title: originalTitle,
+  } = originalData;
 
   // Pull out history-only data and remove it before sending updateData to Paperless
   const historyCustomFields = updateData._customFieldsForHistory || null;
   delete updateData._customFieldsForHistory;
 
   const historyDocTypeName = analysis.document.document_type ?? null;
-  const historyLanguage    = analysis.document.language ?? null;
-  const origDocType        = originalData.document_type ?? null;
-  const origLanguage       = originalData.language ?? null;
+  const historyLanguage = analysis.document.language ?? null;
+  const origDocType = originalData.document_type ?? null;
+  const origLanguage = originalData.language ?? null;
 
-  await documentModel.saveOriginalData(docId, originalTags, originalCorrespondent, originalTitle, origDocType, origLanguage);
+  await documentModel.saveOriginalData(
+    docId,
+    originalTags,
+    originalCorrespondent,
+    originalTitle,
+    origDocType,
+    origLanguage
+  );
 
-  const updatedDocument = await paperlessService.updateDocument(docId, updateData);
+  const updatedDocument = await paperlessService.updateDocument(
+    docId,
+    updateData
+  );
   if (!updatedDocument) {
     throw new Error(`Paperless update failed for document ${docId}`);
   }
@@ -728,7 +992,7 @@ async function saveDocumentChanges(docId, updateData, analysis, originalData) {
       historyCustomFields,
       historyDocTypeName,
       historyLanguage
-    )
+    ),
   ];
 
   if (analysis.metrics) {
@@ -745,50 +1009,9 @@ async function saveDocumentChanges(docId, updateData, analysis, originalData) {
   await Promise.all(persistenceTasks);
 }
 
-// Main scanning functions
-async function scanInitial() {
-  try {
-    const isConfigured = await setupService.isConfigured();
-    if (!isConfigured) {
-      console.log('[ERROR] Setup not completed. Skipping document scan.');
-      return;
-    }
-
-    let [existingTags, documents, ownUserId, existingCorrespondentList, existingDocumentTypes] = await Promise.all([
-      paperlessService.getTags(),
-      paperlessService.getAllDocuments(),
-      paperlessService.getOwnUserID(),
-      paperlessService.listCorrespondentsNames(),
-      paperlessService.listDocumentTypesNames()
-    ]);
-    //get existing correspondent list
-    existingCorrespondentList = existingCorrespondentList.map(correspondent => correspondent.name);
-    let existingDocumentTypesList = existingDocumentTypes.map(docType => docType.name);
-    
-    // Extract tag names from tag objects
-    const existingTagNames = existingTags.map(tag => tag.name);
-
-    for (const doc of documents) {
-      try {
-        const result = await processDocument(doc, existingTagNames, existingCorrespondentList, existingDocumentTypesList, ownUserId);
-        if (!result) continue;
-
-        const { analysis, originalData } = result;
-        const updateData = await buildUpdateData(analysis, doc);
-        await saveDocumentChanges(doc.id, updateData, analysis, originalData);
-        await documentModel.setProcessingStatus(doc.id, doc.title, 'complete');
-      } catch (error) {
-        await documentModel.setProcessingStatus(doc.id, doc.title, 'failed');
-        console.error(`[ERROR] processing document ${doc.id}: ${error.message}`);
-        console.debug(error);
-      }
-    }
-  } catch (error) {
-    console.error(`[ERROR] during initial document scan: ${error.message}`);
-    console.debug(error);
-  }
-}
-
+// Main scanning function
+// The initial scan runs through here as well (source='initial') so it shares the
+// concurrency guard, the stop support and the health reporting below.
 async function scanDocuments(source = 'scheduler') {
   if (scanControl.running) {
     console.info('Scan request ignored because a task is already running');
@@ -802,7 +1025,8 @@ async function scanDocuments(source = 'scheduler') {
     processed: 0,
     skipped: 0,
     failed: 0,
-    stopRequested: false
+    stopRequested: false,
+    abortReason: null,
   };
 
   scanControl.running = true;
@@ -810,25 +1034,55 @@ async function scanDocuments(source = 'scheduler') {
   scanControl.source = source;
   scanControl.startedAt = new Date().toISOString();
   scanControl.stopRequestedAt = null;
+  scanHealthService.recordRunStart(source);
 
   console.info(`Scan started (source=${source})`);
 
   try {
-    let [existingTags, documents, ownUserId, existingCorrespondentList, existingDocumentTypes] = await Promise.all([
+    // Probe first: the read helpers below swallow transport errors and return
+    // empty lists, which would make an unreachable Paperless-ngx look like a
+    // successful scan with nothing to do.
+    const connection = await paperlessService.checkConnection();
+    scanHealthService.recordConnectivity(connection);
+
+    if (!connection.reachable || !connection.authorized) {
+      scanStats.abortReason = connection.reachable
+        ? 'paperless_unauthorized'
+        : 'paperless_unreachable';
+      scanHealthService.recordRunResult({
+        status: RUN_STATUS.PAPERLESS_UNREACHABLE,
+        error: connection.error,
+      });
+      console.error(
+        `[ERROR] Scan aborted: Paperless-ngx is not usable (${connection.error}). ` +
+          `The scheduler stays armed and retries at the next interval (${config.scanInterval}).`
+      );
+      return;
+    }
+
+    let [
+      existingTags,
+      documents,
+      existingCorrespondentList,
+      existingDocumentTypes,
+    ] = await Promise.all([
       paperlessService.getTags(),
       paperlessService.getAllDocuments(),
-      paperlessService.getOwnUserID(),
       paperlessService.listCorrespondentsNames(),
-      paperlessService.listDocumentTypesNames()
+      paperlessService.listDocumentTypesNames(),
     ]);
 
     scanStats.total = documents.length;
 
     // get existing correspondent list
-    existingCorrespondentList = existingCorrespondentList.map((correspondent) => correspondent.name);
+    existingCorrespondentList = existingCorrespondentList.map(
+      (correspondent) => correspondent.name
+    );
 
     // get existing document types list
-    const existingDocumentTypesList = existingDocumentTypes.map((docType) => docType.name);
+    const existingDocumentTypesList = existingDocumentTypes.map(
+      (docType) => docType.name
+    );
 
     // Extract tag names from tag objects
     const existingTagNames = existingTags.map((tag) => tag.name);
@@ -836,12 +1090,19 @@ async function scanDocuments(source = 'scheduler') {
     for (const doc of documents) {
       if (scanControl.stopRequested) {
         scanStats.stopRequested = true;
-        console.info(`Graceful stop requested. Halting scan before next document (source=${scanControl.source || 'unknown'})`);
+        console.info(
+          `Graceful stop requested. Halting scan before next document (source=${scanControl.source || 'unknown'})`
+        );
         break;
       }
 
       try {
-        const result = await processDocument(doc, existingTagNames, existingCorrespondentList, existingDocumentTypesList, ownUserId);
+        const result = await processDocument(
+          doc,
+          existingTagNames,
+          existingCorrespondentList,
+          existingDocumentTypesList
+        );
         if (!result) {
           scanStats.skipped += 1;
           continue;
@@ -852,20 +1113,41 @@ async function scanDocuments(source = 'scheduler') {
         await saveDocumentChanges(doc.id, updateData, analysis, originalData);
         await documentModel.setProcessingStatus(doc.id, doc.title, 'complete');
         scanStats.processed += 1;
+        // The document counters and token figures just changed. Marking the
+        // cache stale costs nothing here; the next dashboard poll pays for the
+        // rebuild, so a long scan does not rebuild once per document.
+        dashboardStatsService.invalidate();
       } catch (error) {
         await documentModel.setProcessingStatus(doc.id, doc.title, 'failed');
         scanStats.failed += 1;
-        console.error(`[ERROR] processing document ${doc.id}: ${error.message}`);
+        // A failure moves the failed counter and the failure rate, which the
+        // dashboard shows just as prominently as the successes.
+        dashboardStatsService.invalidate();
+        console.error(
+          `[ERROR] processing document ${doc.id}: ${error.message}`
+        );
         console.debug(error);
       }
     }
+
+    // Documents that fail individually are not an infrastructure problem, so
+    // the run itself still counts as successful for health reporting.
+    scanHealthService.recordRunResult({ status: RUN_STATUS.OK });
   } catch (error) {
+    scanHealthService.recordRunResult({
+      status: RUN_STATUS.ERROR,
+      error: error.message,
+    });
+    scanStats.abortReason = 'error';
     console.error(`[ERROR] during document scan: ${error.message}`);
     console.debug(error);
   } finally {
     const durationMs = Date.now() - scanStartedAtMs;
+    const abortSuffix = scanStats.abortReason
+      ? `, aborted=${scanStats.abortReason}`
+      : '';
     console.info(
-      `Scan completed (source=${scanStats.source}, total=${scanStats.total}, processed=${scanStats.processed}, skipped=${scanStats.skipped}, failed=${scanStats.failed}, stopRequested=${scanStats.stopRequested}, durationMs=${durationMs})`
+      `Scan completed (source=${scanStats.source}, total=${scanStats.total}, processed=${scanStats.processed}, skipped=${scanStats.skipped}, failed=${scanStats.failed}, stopRequested=${scanStats.stopRequested}${abortSuffix}, durationMs=${durationMs})`
     );
 
     scanControl.running = false;
@@ -873,11 +1155,70 @@ async function scanDocuments(source = 'scheduler') {
     scanControl.source = null;
     scanControl.startedAt = null;
     scanControl.stopRequestedAt = null;
+
+    // Rebuild once the run is over so the first dashboard poll after a scan
+    // reads finished numbers instead of paying for the assembly itself.
+    // Detached: nothing in the scan depends on it, and an unhandled rejection
+    // would take the process down.
+    dashboardStatsService.refresh().catch((error) => {
+      console.debug(
+        `[DASHBOARD-STATS] Refresh after scan failed: ${error.message}`
+      );
+    });
   }
 }
 
 // Routes
 app.use('/', setupRoutes);
+
+// Development-only reference page for the zr UI framework. It ships no product
+// behaviour, only one sample of every component, so it is not registered in a
+// production build and is deliberately absent from the navigation.
+if (process.env.NODE_ENV !== 'production') {
+  /**
+   * @swagger
+   * /styleguide:
+   *   get:
+   *     summary: UI framework styleguide page (development builds only)
+   *     description: |
+   *       Renders one sample of every zr framework component. The route is only
+   *       registered when `NODE_ENV` is not `production`; a production build
+   *       answers this path with the generic 404 handler.
+   *     tags:
+   *       - Navigation
+   *     security:
+   *       - BearerAuth: []
+   *       - ApiKeyAuth: []
+   *     responses:
+   *       200:
+   *         description: Styleguide page rendered successfully
+   *         content:
+   *           text/html:
+   *             schema:
+   *               type: string
+   *       302:
+   *         description: Redirect to login when authentication is missing or invalid
+   *         headers:
+   *           Location:
+   *             schema:
+   *               type: string
+   *               example: /login
+   *       404:
+   *         description: Route not registered because the app runs in production
+   *       500:
+   *         description: Server error
+   */
+  app.get('/styleguide', isAuthenticated, async (req, res) => {
+    try {
+      return res.render('styleguide', {
+        version: config.PAPERLESS_AI_VERSION || ' ',
+      });
+    } catch (error) {
+      console.error('[ERROR] Styleguide page:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  });
+}
 
 /**
  * @swagger
@@ -914,110 +1255,278 @@ app.get('/', async (req, res) => {
   }
 });
 
-/**
- * @swagger
- * /health:
- *   get:
- *     summary: System health check endpoint
- *     description: |
- *       Checks if the application is properly configured and the database is reachable.
- *       This endpoint can be used by monitoring systems to verify service health.
- *       
- *       The endpoint returns a 200 status code with a "healthy" status if everything is 
- *       working correctly, or a 503 status code with error details if there are issues.
- *     tags: [System]
- *     responses:
- *       200:
- *         description: System is healthy and operational
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 status:
- *                   type: string
- *                   example: "healthy"
- *                   description: Health status indication
- *       503:
- *         description: System is not fully configured or database is unreachable
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 status:
- *                   type: string
- *                   enum: [not_configured, error]
- *                   example: "not_configured"
- *                   description: Error status type
- *                 message:
- *                   type: string
- *                   example: "Application setup not completed"
- *                   description: Detailed error message
- */
-app.get('/health', async (req, res) => {
-  try {
-    const isConfigured = await setupService.isConfigured();
-    if (!isConfigured) {
-      return res.status(503).json({ 
-        status: 'not_configured',
-        message: 'Application setup not completed'
-      });
-    }
-
-    await documentModel.isDocumentProcessed(1);
-    res.json({ status: 'healthy' });
-  } catch (error) {
-    console.error(`Health check failed: ${error.message}`);
-    console.debug(error);
-    res.status(503).json({ 
-      status: 'error', 
-      message: error.message 
-    });
-  }
-});
+// /health is served by routes/setup.js, which is mounted above this file's
+// routes. A second handler here was never reachable and has been removed so the
+// OpenAPI spec documents the handler that actually answers.
 
 // Error handler
+// Express detects error middleware by its four-argument signature, so `next`
+// must stay even though it is unused.
+// eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   console.error(err.stack);
   res.status(500).send('Something broke!');
 });
+
+// Backoff schedule for the startup connectivity retry, in milliseconds.
+// The last value repeats until the retry window configured via
+// STARTUP_PAPERLESS_RETRY_MINUTES is exhausted.
+const INITIAL_CONNECT_BACKOFF_MS = [5000, 15000, 30000, 60000, 120000, 300000];
+const DEFAULT_STARTUP_RETRY_MINUTES = 30;
+
+function initialConnectDelayMs(attempt) {
+  const index = Math.min(attempt - 1, INITIAL_CONNECT_BACKOFF_MS.length - 1);
+  return INITIAL_CONNECT_BACKOFF_MS[Math.max(index, 0)];
+}
+
+function startupRetryWindowMs() {
+  const configured = Number(config.startup?.paperlessRetryMinutes);
+  const minutes =
+    Number.isFinite(configured) && configured >= 0
+      ? configured
+      : DEFAULT_STARTUP_RETRY_MINUTES;
+  return minutes * 60 * 1000;
+}
+
+/**
+ * Waits for Paperless-ngx to become usable and then runs the initial scan.
+ *
+ * Runs detached from startup: the scan scheduler is already armed at this
+ * point, so giving up here only means the first scan waits for the next cron
+ * tick instead of never happening (issue #272).
+ */
+async function runInitialScanWhenReachable() {
+  const deadlineMs = Date.now() + startupRetryWindowMs();
+  let attempt = 0;
+
+  for (;;) {
+    const isConfigured = await setupService.isConfigured();
+    if (!isConfigured) {
+      console.warn(
+        'Initial scan skipped: setup is not completed yet. The scheduled scan stays armed.'
+      );
+      return;
+    }
+
+    const connection = await paperlessService.checkConnection();
+    scanHealthService.recordConnectivity(connection);
+
+    if (connection.reachable && connection.authorized) {
+      console.log(`Starting initial scan at ${new Date().toISOString()}`);
+      await scanDocuments('initial');
+      return;
+    }
+
+    attempt += 1;
+    const delayMs = initialConnectDelayMs(attempt);
+
+    if (Date.now() + delayMs > deadlineMs) {
+      // Count the abandoned initial scan as exactly one failed run. Counting
+      // every retry would trip the degraded threshold within minutes and make
+      // /health answer 503 during a perfectly normal slow start.
+      scanHealthService.recordRunResult({
+        status: RUN_STATUS.PAPERLESS_UNREACHABLE,
+        error: connection.error,
+      });
+      console.error(
+        `[STARTUP] Paperless-ngx still not usable after ${attempt} attempt(s): ${connection.error}. ` +
+          `Skipping the initial scan — the scheduled scan (${config.scanInterval}) stays armed and keeps retrying.`
+      );
+      return;
+    }
+
+    console.warn(
+      `[STARTUP] Paperless-ngx not usable yet: ${connection.error}. ` +
+        `Retrying in ${Math.round(delayMs / 1000)}s (attempt ${attempt}). ` +
+        `The scheduled scan (${config.scanInterval}) is armed regardless.`
+    );
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+}
+
+const DEFAULT_PAPERLESS_PROBE_INTERVAL_SECONDS = 60;
+const MIN_PAPERLESS_PROBE_INTERVAL_SECONDS = 10;
+
+function paperlessProbeIntervalMs() {
+  const configured = Number(config.health?.paperlessProbeIntervalSeconds);
+  if (!Number.isFinite(configured)) {
+    return DEFAULT_PAPERLESS_PROBE_INTERVAL_SECONDS * 1000;
+  }
+  if (configured <= 0) {
+    return 0;
+  }
+  return Math.max(configured, MIN_PAPERLESS_PROBE_INTERVAL_SECONDS) * 1000;
+}
+
+/**
+ * Probes Paperless-ngx on a fixed interval, independently of the scan loop.
+ *
+ * The scan loop only probes when it runs, so between two ticks an outage was
+ * invisible to the dashboard — and entirely invisible with
+ * DISABLE_AUTOMATIC_PROCESSING=yes. This keeps `paperless.lastCheckedAt` fresh
+ * so the UI can warn immediately.
+ *
+ * Only connectivity is recorded here; the consecutive-failure counter belongs
+ * to actual scan runs and must not be moved by a passive probe.
+ */
+function startConnectivityMonitor() {
+  const intervalMs = paperlessProbeIntervalMs();
+  if (intervalMs === 0) {
+    console.info(
+      '[HEALTH] Paperless-ngx connectivity probe is disabled (PAPERLESS_PROBE_INTERVAL_SECONDS=0).'
+    );
+    return;
+  }
+
+  let probeRunning = false;
+
+  const probe = async () => {
+    // A scan probes on its own and would only duplicate the request here.
+    if (probeRunning || scanControl.running) {
+      return;
+    }
+    probeRunning = true;
+
+    try {
+      if (!(await setupService.isConfigured())) {
+        // Nothing configured yet — reporting "not reachable" would warn about
+        // a connection the user has not set up.
+        scanHealthService.clearConnectivity();
+        return;
+      }
+
+      scanHealthService.recordConnectivity(
+        await paperlessService.checkConnection()
+      );
+    } catch (error) {
+      console.debug(
+        `[HEALTH] Connectivity probe failed unexpectedly: ${error.message}`
+      );
+    } finally {
+      probeRunning = false;
+    }
+  };
+
+  const timer = setInterval(probe, intervalMs);
+  // Never keep the event loop alive just for the probe.
+  timer.unref?.();
+  console.info(
+    `[HEALTH] Paperless-ngx connectivity probe armed (every ${intervalMs / 1000}s).`
+  );
+
+  probe();
+}
 
 // Start scanning
 async function startScanning() {
   try {
     const isConfigured = await setupService.isConfigured();
     if (!isConfigured) {
-      console.log(`Setup not completed. Visit http://your-machine-ip:${process.env.PAPERLESS_AI_PORT || 3000}/setup to complete setup.`);
+      console.log(
+        `Setup not completed. Visit http://your-machine-ip:${process.env.PAPERLESS_AI_PORT || 3000}/setup to complete setup.`
+      );
     }
 
-    const userId = await paperlessService.getOwnUserID();
-    if (!userId) {
-      console.error('Failed to get own user ID. Abort scanning.');
-      return;
-    }
-
-    console.log('Configured scan interval:', config.scanInterval);
-    console.log(`Starting initial scan at ${new Date().toISOString()}`);
-    if(config.disableAutomaticProcessing != 'yes') {
-      await scanInitial();
-  
-      cron.schedule(config.scanInterval, async () => {
-        console.log(`Starting scheduled scan at ${new Date().toISOString()}`);
-        await scanDocuments();
-      });
-    }
-
-    // Reconciliation: remove stale documents deleted in Paperless-ngx
-    if (config.reconciliationEnabled) {
-      console.log('Configured reconciliation interval:', config.reconciliationInterval);
+    // Reconciliation: remove stale documents deleted in Paperless-ngx.
+    // Armed independently of Paperless-ngx reachability so a temporary outage
+    // cannot leave the app without any scheduled work.
+    if (config.reconciliationEnabled === 'yes') {
+      console.log(
+        'Configured reconciliation interval:',
+        config.reconciliationInterval
+      );
       cron.schedule(config.reconciliationInterval, async () => {
-        console.debug(`[RECONCILIATION] Scheduled run triggered at ${new Date().toISOString()}`);
+        console.debug(
+          `[RECONCILIATION] Scheduled run triggered at ${new Date().toISOString()}`
+        );
         await reconciliationService.reconcileAllDocuments();
       });
     } else {
-      console.info('[RECONCILIATION] Automatic reconciliation is disabled (RECONCILIATION_ENABLED=no).');
+      console.info(
+        '[RECONCILIATION] Automatic reconciliation is disabled (RECONCILIATION_ENABLED=no).'
+      );
     }
+
+    // Dashboard statistics are cached, and the cache is kept warm from here so
+    // no visitor ever waits for the assembly. Armed before the automatic
+    // processing kill-switch below on purpose: the dashboard is served (and
+    // polled) whether or not scanning is enabled.
+    if (isConfigured) {
+      dashboardStatsService.refresh().catch((error) => {
+        console.debug(`[DASHBOARD-STATS] Warmup failed: ${error.message}`);
+      });
+    }
+
+    cron.schedule('* * * * *', async () => {
+      // Never compete with a running scan for the Paperless API — the scan
+      // invalidates the cache per document anyway, and the run end refreshes it.
+      if (scanControl.running) {
+        return;
+      }
+      if (!(await setupService.isConfigured())) {
+        return;
+      }
+      await dashboardStatsService.refresh().catch((error) => {
+        console.debug(
+          `[DASHBOARD-STATS] Scheduled refresh failed: ${error.message}`
+        );
+      });
+    });
+
+    if (config.disableAutomaticProcessing === 'yes') {
+      scanHealthService.markAutomaticProcessingDisabled();
+      console.info(
+        'Automatic document processing is disabled (DISABLE_AUTOMATIC_PROCESSING=yes). No scan is scheduled.'
+      );
+      return;
+    }
+
+    // OCR auto-processing: drain the pending OCR queue without anyone having
+    // to press "Process All Pending". Armed after the kill-switch above
+    // because OCR + AI writes results back to Paperless-ngx, which is exactly
+    // what DISABLE_AUTOMATIC_PROCESSING is meant to stop.
+    if (ocrAutoProcessService.isEnabled()) {
+      const ocrAutoProcessInterval = ocrAutoProcessService.interval;
+      console.log(
+        'Configured OCR auto-processing interval:',
+        ocrAutoProcessInterval
+      );
+      cron.schedule(ocrAutoProcessInterval, async () => {
+        // Never compete with a running scan for the same AI backend.
+        if (scanControl.running) {
+          console.debug(
+            '[OCR] Auto-processing skipped: a document scan is currently running.'
+          );
+          return;
+        }
+        await ocrAutoProcessService.drainQueue();
+      });
+    } else {
+      console.info(
+        '[OCR] Automatic OCR queue processing is disabled (OCR_AUTO_PROCESS_ENABLED=no).'
+      );
+    }
+
+    // Arm the scheduler before talking to Paperless-ngx. A connection failure
+    // at startup must never leave the app running without a scan loop —
+    // every scheduled run re-checks connectivity on its own.
+    console.log('Configured scan interval:', config.scanInterval);
+    cron.schedule(config.scanInterval, async () => {
+      console.log(`Starting scheduled scan at ${new Date().toISOString()}`);
+      if (!(await setupService.isConfigured())) {
+        console.warn('Scheduled scan skipped: setup is not completed.');
+        return;
+      }
+      await scanDocuments();
+    });
+    scanHealthService.markArmed(config.scanInterval);
+
+    // Detached on purpose: startup must not block while Paperless-ngx is still
+    // coming up. unhandledRejection terminates the process, so catch here.
+    runInitialScanWhenReachable().catch((error) => {
+      console.error(`[ERROR] during initial scan: ${error.message}`);
+      console.debug(error);
+    });
   } catch (error) {
     console.error(`[ERROR] in startScanning: ${error.message}`);
     console.debug(error);
@@ -1078,6 +1587,9 @@ async function startServer() {
       console.log(`Server running on port ${port}`);
       warnIfRemoteSetupExposed();
       startScanning();
+      // Armed separately from the scan scheduler so the dashboard also warns
+      // when automatic processing is switched off.
+      startConnectivityMonitor();
     });
   } catch (error) {
     console.error(`Failed to start server: ${error.message}`);
