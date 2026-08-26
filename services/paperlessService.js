@@ -8,7 +8,6 @@ const {
   createRedirectGuard,
 } = require('./serviceUtils');
 const { CachedNameIdEnum } = require('./CachedNameIdEnum');
-const { safeExtractRelativePath } = require('./serviceUtils');
 
 /** Timeout for the connectivity probe so a hanging host cannot stall a scan. */
 const CONNECTION_PROBE_TIMEOUT_MS = 10000;
@@ -53,6 +52,32 @@ function requestTimeoutMs() {
   }
   return seconds * 1000;
 }
+
+/**
+ * Wraps a failed correspondent/document-type creation once race-condition
+ * recovery could not resolve it. Throwing a fresh, contextualised error
+ * instead of rethrowing the caught one keeps the outer handler free of
+ * local-rethrow patterns and carries the entity context to the caller.
+ */
+class EntityCreationError extends Error {
+  /**
+   * @param {string} entityType - 'correspondent' or 'document type'
+   * @param {string} name - The name that was being created
+   * @param {Error} cause - The original API error
+   */
+  constructor(entityType, name, cause) {
+    super(`Failed to process ${entityType} "${name}": ${cause.message}`, {
+      cause,
+    });
+    this.name = 'EntityCreationError';
+    this.entityType = entityType;
+  }
+}
+
+/** True when Paperless-ngx rejected a create as a duplicate. */
+const isUniqueConstraintError = (error) =>
+  error?.response?.status === 400 &&
+  String(error?.response?.data?.error || '').includes('unique constraint');
 
 class PaperlessService {
   constructor() {
@@ -843,8 +868,15 @@ class PaperlessService {
    */
   async getCorrespondentCount({ strict = false } = {}) {
     this.initialize();
-    // todo pass strict to throw error if no match found
-    return await this.correspondents.getCount(this.client);
+    try {
+      return await this.correspondents.getCount(this.client);
+    } catch (error) {
+      console.error('[ERROR] fetching correspondent count:', error.message);
+      // Mirrors getTagCount(): strict=yes is for statistics, where reporting 0
+      // on a failed backend would cache an all-zero library.
+      if (strict) throw error;
+      return 0;
+    }
   }
 
   async getDocumentCount() {
@@ -1222,6 +1254,9 @@ class PaperlessService {
           if (error?.response?.status === 400) {
             this._supportsTagsIdNone = false;
           } else {
+            // Deliberate propagation: only the unsupported-filter case is
+            // handled here, everything else belongs to the outer handler.
+            // noinspection ThrowCaughtLocallyJS
             throw error;
           }
         }
@@ -1782,6 +1817,9 @@ class PaperlessService {
         // malformed query syntax. Keep the selector usable by retrying with a
         // plain title filter instead of returning nothing.
         if (mode !== 'all') {
+          // Deliberate propagation: non-'all' modes have no fallback and the
+          // outer handler reports the failure to the caller.
+          // noinspection ThrowCaughtLocallyJS
           throw error;
         }
 
@@ -1890,64 +1928,52 @@ class PaperlessService {
       `[DEBUG] Processing correspondent with restrictToExistingCorrespondents=${restrictToExistingCorrespondents}`
     );
 
-    try {
-      // Search for the correspondent
-      const existingCorrespondent =
-        await this.searchForExistingCorrespondent(name);
+    const existingCorrespondent =
+      await this.searchForExistingCorrespondent(name);
 
-      if (existingCorrespondent) {
-        console.log(
-          `[DEBUG] Found existing correspondent "${name}" with ID ${existingCorrespondent.id}`
-        );
-        return existingCorrespondent;
-      }
-
-      // If we're restricting to existing correspondents and none was found, return null
-      if (restrictToExistingCorrespondents) {
-        console.log(
-          `[DEBUG] Correspondent "${name}" does not exist and restrictions are enabled, returning null`
-        );
-        return null;
-      }
-
-      // Create new correspondent only if restrictions are not enabled
-      try {
-        const createResponse = await this.client.post('/correspondents/', {
-          name: name,
-        });
-        console.log(
-          `[DEBUG] Created new correspondent "${name}" with ID ${createResponse.data.id}`
-        );
-        return createResponse.data;
-      } catch (createError) {
-        if (
-          createError.response?.status === 400 &&
-          createError.response?.data?.error?.includes('unique constraint')
-        ) {
-          // Race condition check - another process might have created it
-          const retryResponse = await this.client.get('/correspondents/', {
-            params: { name: name },
-          });
-
-          const justCreatedCorrespondent = retryResponse.data.results.find(
-            (c) => c.name.toLowerCase() === name.toLowerCase()
-          );
-
-          if (justCreatedCorrespondent) {
-            console.log(
-              `[DEBUG] Retrieved correspondent "${name}" after constraint error with ID ${justCreatedCorrespondent.id}`
-            );
-            return justCreatedCorrespondent;
-          }
-        }
-        throw createError;
-      }
-    } catch (error) {
-      console.error(
-        `[ERROR] Failed to process correspondent "${name}":`,
-        error.message
+    if (existingCorrespondent) {
+      console.log(
+        `[DEBUG] Found existing correspondent "${name}" with ID ${existingCorrespondent.id}`
       );
-      throw error;
+      return existingCorrespondent;
+    }
+
+    // If we're restricting to existing correspondents and none was found, return null
+    if (restrictToExistingCorrespondents) {
+      console.log(
+        `[DEBUG] Correspondent "${name}" does not exist and restrictions are enabled, returning null`
+      );
+      return null;
+    }
+
+    // Create new correspondent only if restrictions are not enabled
+    try {
+      const createResponse = await this.client.post('/correspondents/', {
+        name: name,
+      });
+      console.log(
+        `[DEBUG] Created new correspondent "${name}" with ID ${createResponse.data.id}`
+      );
+      return createResponse.data;
+    } catch (createError) {
+      if (isUniqueConstraintError(createError)) {
+        // Race condition check - another process might have created it
+        const retryResponse = await this.client.get('/correspondents/', {
+          params: { name: name },
+        });
+
+        const justCreatedCorrespondent = retryResponse.data.results.find(
+          (c) => c.name.toLowerCase() === name.toLowerCase()
+        );
+
+        if (justCreatedCorrespondent) {
+          console.log(
+            `[DEBUG] Retrieved correspondent "${name}" after constraint error with ID ${justCreatedCorrespondent.id}`
+          );
+          return justCreatedCorrespondent;
+        }
+      }
+      throw new EntityCreationError('correspondent', name, createError);
     }
   }
 
@@ -1977,66 +2003,55 @@ class PaperlessService {
       `[DEBUG] Processing document type with restrictToExistingDocumentTypes=${restrictToExistingDocumentTypes}`
     );
 
-    try {
-      // Suche nach existierendem document_type
-      const existingDocType = await this.searchForExistingDocumentType(name);
-      console.log('[DEBUG] Response Document Type Search: ', existingDocType);
+    // Suche nach existierendem document_type
+    const existingDocType = await this.searchForExistingDocumentType(name);
+    console.log('[DEBUG] Response Document Type Search: ', existingDocType);
 
-      if (existingDocType) {
-        console.log(
-          `[DEBUG] Found existing document type "${name}" with ID ${existingDocType.id}`
-        );
-        return existingDocType;
-      }
-
-      if (restrictToExistingDocumentTypes) {
-        console.log(
-          `[DEBUG] Document type "${name}" does not exist and restrictions are enabled, returning null`
-        );
-        return null;
-      }
-
-      // Erstelle neuen document_type
-      try {
-        const createResponse = await this.client.post('/document_types/', {
-          name: name,
-          matching_algorithm: 1, // 1 = ANY
-          match: '', // Optional: Kann später angepasst werden
-          is_insensitive: true,
-        });
-        console.log(
-          `[DEBUG] Created new document type "${name}" with ID ${createResponse.data.id}`
-        );
-        return createResponse.data;
-      } catch (createError) {
-        if (
-          createError.response?.status === 400 &&
-          createError.response?.data?.error?.includes('unique constraint')
-        ) {
-          // Race condition check
-          const retryResponse = await this.client.get('/document_types/', {
-            params: { name: name },
-          });
-
-          const justCreatedDocType = retryResponse.data.results.find(
-            (dt) => dt.name.toLowerCase() === name.toLowerCase()
-          );
-
-          if (justCreatedDocType) {
-            console.log(
-              `[DEBUG] Retrieved document type "${name}" after constraint error with ID ${justCreatedDocType.id}`
-            );
-            return justCreatedDocType;
-          }
-        }
-        throw createError;
-      }
-    } catch (error) {
-      console.error(
-        `[ERROR] Failed to process document type "${name}":`,
-        error.message
+    if (existingDocType) {
+      console.log(
+        `[DEBUG] Found existing document type "${name}" with ID ${existingDocType.id}`
       );
-      throw error;
+      return existingDocType;
+    }
+
+    if (restrictToExistingDocumentTypes) {
+      console.log(
+        `[DEBUG] Document type "${name}" does not exist and restrictions are enabled, returning null`
+      );
+      return null;
+    }
+
+    // Erstelle neuen document_type
+    try {
+      const createResponse = await this.client.post('/document_types/', {
+        name: name,
+        matching_algorithm: 1, // 1 = ANY
+        match: '', // Optional: Kann später angepasst werden
+        is_insensitive: true,
+      });
+      console.log(
+        `[DEBUG] Created new document type "${name}" with ID ${createResponse.data.id}`
+      );
+      return createResponse.data;
+    } catch (createError) {
+      if (isUniqueConstraintError(createError)) {
+        // Race condition check
+        const retryResponse = await this.client.get('/document_types/', {
+          params: { name: name },
+        });
+
+        const justCreatedDocType = retryResponse.data.results.find(
+          (dt) => dt.name.toLowerCase() === name.toLowerCase()
+        );
+
+        if (justCreatedDocType) {
+          console.log(
+            `[DEBUG] Retrieved document type "${name}" after constraint error with ID ${justCreatedDocType.id}`
+          );
+          return justCreatedDocType;
+        }
+      }
+      throw new EntityCreationError('document type', name, createError);
     }
   }
 
