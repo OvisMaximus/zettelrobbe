@@ -451,6 +451,11 @@ module.exports = {
   globalRateLimitMax: parseInt(process.env.GLOBAL_RATE_LIMIT_MAX || '1000', 10),
   predefinedMode: process.env.PROCESS_PREDEFINED_DOCUMENTS,
   ignoreTags: process.env.IGNORE_TAGS || '',
+  // Predefined-scan trigger tags (TAGS in predefined mode) are removed from a
+  // document after it has been processed, so re-adding the tag is what queues
+  // a re-run. Off by default: without it the tag stays, matching legacy
+  // behaviour.
+  removeTriggerTags: parseEnvBoolean(process.env.REMOVE_TRIGGER_TAGS, 'no'),
   tokenLimit: process.env.TOKEN_LIMIT || 128000,
   // How many tokens a provider may spend on its answer. Reserved in the
   // context window and, where the provider offers a knob for it, sent as the

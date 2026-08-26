@@ -2235,9 +2235,28 @@ class PaperlessService {
         console.log(`[DEBUG] Current correspondent:`, currentDoc.correspondent);
         console.log(`[DEBUG] New correspondent:`, updates.correspondent);
 
-        const combinedTags = [
+        let combinedTags = [
           ...new Set([...currentDoc.tags, ...updates.tags]),
         ];
+
+        // Predefined-scan trigger tags are removed here rather than by the
+        // caller: the merge above would otherwise re-add them from
+        // currentDoc.tags on every write-back.
+        if (
+          Array.isArray(updates.removeTagIds) &&
+          updates.removeTagIds.length > 0
+        ) {
+          const removeSet = new Set(updates.removeTagIds.map(Number));
+          combinedTags = combinedTags.filter((tagId) => {
+            const normalized =
+              typeof tagId === 'object' ? Number(tagId?.id) : Number(tagId);
+            return !removeSet.has(normalized);
+          });
+          console.log(
+            `[DEBUG] Removed configured tag ids from document ${documentId}:`,
+            updates.removeTagIds
+          );
+        }
         updates.tags = combinedTags;
 
         console.log(`[DEBUG] Combined tags:`, combinedTags);
