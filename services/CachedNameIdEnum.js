@@ -65,7 +65,7 @@ class CachedNameIdEnum {
       if (response.data.next) {
         nextUrl = safeExtractRelativePath(response.data.next, client);
         if (nextUrl) {
-          console.log(
+          console.debug(
             `[DEBUG] Next page URL: ${nextUrl} elements fetched so far: ${existing_elements.length}`
           );
         } else {
@@ -75,10 +75,10 @@ class CachedNameIdEnum {
       } else {
         nextUrl = null;
         this.cache_last_fetch_time = Date.now();
-        console.log(
+        console.debug(
           `[DEBUG] Fetched ${existing_elements.length} ${this.element_type_name}s`
         );
-        console.log(
+        console.debug(
           `[DEBUG] Cache contains these ${this.element_type_name}s now: 
           ${existing_elements.map((element) => element.name).join(', ')}`
         );
@@ -105,7 +105,7 @@ class CachedNameIdEnum {
       const expireTime = new Date(
         this.cache_last_fetch_time + cache_ttl
       ).toISOString();
-      console.log(
+      console.debug(
         `[DEBUG] ${this.element_type_name} cache expired (age: ${ageSeconds}s, TTL: ${ttlSeconds}s, expired at: ${expireTime})`
       );
     }
@@ -117,19 +117,19 @@ class CachedNameIdEnum {
     await this._check_cache_is_not_outdated(client, cache_ttl);
     let match = this.elements_by_name.get(name.toLowerCase());
     if (match) {
-      console.log(
+      console.debug(
         `[DEBUG] Found exact match for ${this.element_type_name} "${match.name}" with ID ${match.id}`
       );
       return this._result_element_from_element(match);
     }
     match = await this._findSimilar(name);
     if (match) {
-      console.log(
+      console.debug(
         `[DEBUG] Found similar match for ${this.element_type_name} "${name}": "${match.name}" with ID ${match.id}`
       );
       return this._result_element_from_element(match);
     }
-    console.log(
+    console.debug(
       `[DEBUG] No exact nor similar match found for ${this.element_type_name} "${name}"`
     );
     return null;
