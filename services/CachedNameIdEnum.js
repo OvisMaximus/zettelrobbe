@@ -6,13 +6,17 @@ class CachedNameIdEnum {
     url_prefix,
     similarity_prompt,
     cache_ttl_access,
-    ai_service
+    ai_service,
+    page_size = 100
   ) {
     this.ai_service = ai_service;
     this.element_type_name = element_type_name;
     this.url_prefix = url_prefix;
     this.similarity_prompt = similarity_prompt;
     this.cache_ttl_access = cache_ttl_access;
+    // Asked for on every page request. DRF clamps to its own max_page_size
+    // rather than rejecting, so a server that allows less simply pages more.
+    this.page_size = page_size;
     this.cache_last_fetch_time = 0;
     this.cache_refresh_promise = null;
     this.elements_by_id = new Map();
@@ -51,7 +55,11 @@ class CachedNameIdEnum {
     let nextUrl = this.url_prefix;
     let existing_elements = [];
     while (nextUrl) {
-      const response = await client.get(nextUrl, { page_size: 100 });
+      // page_size must ride in `params` — a bare property on the axios config
+      // is silently dropped so that the server answers with its default page size.
+      const response = await client.get(nextUrl, {
+        params: { page_size: this.page_size },
+      });
       existing_elements = existing_elements.concat(response.data.results);
       // Safely extract relative path from next URL to prevent SSRF
       if (response.data.next) {
@@ -335,6 +343,21 @@ class CachedNameIdEnum {
     return match;
   }
 
+  /**
+   * Insert a single element (e.g., one just created on the server) into the
+   * cache without a full refresh.
+   */
+  add(element) {
+    if (!element || element.id == null || !element.name) {
+      return;
+    }
+    this.elements_by_id.set(element.id, element);
+    this.elements_by_name.set(element.name.toLowerCase(), element);
+    if (!this.element_list.some((e) => e.id === element.id)) {
+      this.element_list.push(element);
+    }
+  }
+
   async visitAllContainedElements(client, visitor) {
     this._checkClient(client);
     await this._check_cache_is_not_outdated(client);
@@ -349,6 +372,17 @@ class CachedNameIdEnum {
     this._checkClient(client);
     await this._check_cache_is_not_outdated(client);
     return this.element_list.length;
+  }
+
+  /**
+   * All cached elements as `{id, name}` objects, refreshing when stale.
+   */
+  async getAll(client) {
+    this._checkClient(client);
+    await this._check_cache_is_not_outdated(client);
+    return this.element_list.map((element) =>
+      this._result_element_from_element(element)
+    );
   }
 }
 

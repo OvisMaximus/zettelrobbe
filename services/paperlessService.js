@@ -7,8 +7,8 @@ const {
   stripTrailingSlashes,
   createRedirectGuard,
 } = require('./serviceUtils');
-const {CachedNameIdEnum} = require('./CachedNameIdEnum');
-const {safeExtractRelativePath} = require('./serviceUtils');
+const { CachedNameIdEnum } = require('./CachedNameIdEnum');
+const { safeExtractRelativePath } = require('./serviceUtils');
 
 /** Timeout for the connectivity probe so a hanging host cannot stall a scan. */
 const CONNECTION_PROBE_TIMEOUT_MS = 10000;
@@ -57,13 +57,11 @@ function requestTimeoutMs() {
 class PaperlessService {
   constructor() {
     this.client = null;
-    this.tagCache = new Map();
     this.customFieldCache = new Map();
     this.correspondentNameCache = new Map();
-    this.lastTagRefresh = 0;
+    this.lastCorrespondentRefresh = 0;
     this.lastCorrespondentRefresh = 0;
     this._supportsCorrespondentIdIn = null;
-    this._refreshPromise = null;
     this._effectiveCountCache = null;
     this._effectiveCountCacheTtlMs = 60 * 1000;
     this._supportsTagsIdNone = null;
@@ -78,6 +76,7 @@ class PaperlessService {
     this._cacheTTL = null;
     this._correspondents = null;
     this._documentTypes = null;
+    this._tags = null;
   }
 
   get correspondents() {
@@ -114,6 +113,29 @@ class PaperlessService {
       );
     }
     return this._documentTypes;
+  }
+
+  // Tags share the enum machinery with correspondents and document types.
+  // The larger page size matters here: tags are the one all-or-nothing read
+  // everything else queues behind, and a large library at the DRF default of
+  // 25 per page once stalled startup for a minute (54 sequential requests).
+  get tags() {
+    if (this._tags === null) {
+      const aiServiceFactory = require('./aiServiceFactory');
+      const aiService = aiServiceFactory.getService();
+      this._tags = new CachedNameIdEnum(
+        'tag',
+        '/tags/',
+        'Ignore case and consider typos, misspellings, singular vs plural forms, ' +
+          'abbreviations and compound words. Only match a tag that clearly means the same thing',
+        () => {
+          return this.CACHE_LIFETIME;
+        },
+        aiService,
+        TAG_PAGE_SIZE
+      );
+    }
+    return this._tags;
   }
 
   get CACHE_LIFETIME() {
@@ -353,92 +375,36 @@ class PaperlessService {
     }
   }
 
-  //todo
-  // Aktualisiert den Tag-Cache, wenn er älter als CACHE_LIFETIME ist
+  /**
+   * Make sure the tag cache is populated and not expired. Kept as a named
+   * seam because several call sites and tests speak in these terms; the
+   * freshness logic itself lives in CachedNameIdEnum.
+   */
   async ensureTagCache() {
-    const now = Date.now();
-    const cacheAge = now - this.lastTagRefresh;
-    if (this.tagCache.size === 0 || cacheAge > this.CACHE_LIFETIME) {
-      if (this._refreshPromise) {
-        return this._refreshPromise;
-      }
-      const ttlSeconds = Math.floor(this.CACHE_LIFETIME / 1000);
-      // A cache that was never filled has no age and no expiry. Dating it from
-      // the epoch reported "age: 1786738904s ... expired at: 1970-01-01" on
-      // every cold start, which reads as a clock problem rather than a first
-      // run.
-      console.log(
-        this.lastTagRefresh === 0
-          ? `[DEBUG] Tag cache empty, building it (TTL: ${ttlSeconds}s)`
-          : `[DEBUG] Tag cache expired (age: ${Math.floor(cacheAge / 1000)}s, TTL: ${ttlSeconds}s, expired at: ${new Date(
-              this.lastTagRefresh + this.CACHE_LIFETIME
-            ).toISOString()})`
-      );
-      // No race condition: synchronous code is never preempted in Node.js's
-      // event loop, so no other call can reach here between the check above
-      // and the assignment below.
-      this._refreshPromise = this.refreshTagCache().finally(() => {
-        this._refreshPromise = null;
-      });
-      return this._refreshPromise;
+    if (!this.client) {
+      return;
     }
+    await this.tags.getCount(this.client);
   }
 
   /**
-   * Manually clear the tag cache.
+   * Manually clear (and rebuild on next access) the tag cache.
    * Useful for forcing a refresh after external tag modifications.
    */
   clearTagCache() {
-    this.initialize()
+    this.initialize();
     console.log('[DEBUG] Manually clearing tag cache...');
-    this.tagCache.clear();
-    this.correspondents.flush_cache(this.client);
-    this.lastTagRefresh = 0;
+    if (this.client) {
+      this.tags.flush_cache(this.client);
+      this.correspondents.flush_cache(this.client);
+    }
     console.log('[DEBUG] Tag cache cleared.');
   }
 
-  // Lädt alle existierenden Tags Todo
   async refreshTagCache() {
-    try {
-      console.log('[DEBUG] Refreshing tag cache...');
-      this.tagCache.clear();
-      // The page size only has to be asked for once: Paperless-ngx builds its
-      // `next` link from the request URL, so every following page carries it.
-      let nextUrl = `/tags/?page_size=${TAG_PAGE_SIZE}`;
-      while (nextUrl) {
-        const response = await this.client.get(nextUrl);
-
-        // Validate response structure
-        if (!response?.data?.results) {
-          console.error(
-            '[ERROR] Invalid response structure from API:',
-            response?.data
-          );
-          break;
-        }
-
-        response.data.results.forEach((tag) => {
-          this.tagCache.set(tag.name.toLowerCase(), tag);
-        });
-
-        // Safely extract relative path from next URL to prevent SSRF
-        if (response.data.next) {
-          nextUrl = safeExtractRelativePath(response.data.next, this.client);
-          if (nextUrl) {
-            console.log('[DEBUG] Next page URL:', nextUrl);
-          }
-        } else {
-          nextUrl = null;
-        }
-      }
-      this.lastTagRefresh = Date.now();
-      console.log(
-        `[DEBUG] Tag cache refreshed. Found ${this.tagCache.size} tags.`
-      );
-    } catch (error) {
-      console.error('[ERROR] refreshing tag cache:', error.message);
-      throw error;
-    }
+    this.initialize();
+    console.log('[DEBUG] Refreshing tag cache...');
+    await this.tags.flush_cache(this.client);
   }
 
   async initializeWithCredentials(apiUrl, apiToken) {
@@ -513,7 +479,7 @@ class PaperlessService {
           if (existingFieldType !== normalizedFieldType) {
             const mismatchError = new Error(
               `Custom field "${fieldName}" has type "${existingFieldType}", ` +
-              `but configuration requests "${normalizedFieldType}".`
+                `but configuration requests "${normalizedFieldType}".`
             );
             mismatchError.code = 'CUSTOM_FIELD_TYPE_MISMATCH';
             throw mismatchError;
@@ -616,45 +582,17 @@ class PaperlessService {
     }
   }
 
-  // todo
   async findExistingTag(tagName) {
-    const normalizedName = tagName.toLowerCase();
-
-    // 1. Zuerst im Cache suchen
-    const cachedTag = this.tagCache.get(normalizedName);
-    if (cachedTag) {
-      console.log(
-        `[DEBUG] Found tag "${tagName}" in cache with ID ${cachedTag.id}`
-      );
-      return cachedTag;
+    if (!tagName || typeof tagName !== 'string') {
+      return null;
     }
-
-    // 2. Direkte API-Suche
-    try {
-      const response = await this.client.get('/tags/', {
-        params: {
-          name__iexact: normalizedName, // Case-insensitive exact match
-        },
-      });
-
-      if (response.data.results.length > 0) {
-        const foundTag = response.data.results[0];
-        console.log(
-          `[DEBUG] Found existing tag "${tagName}" via API with ID ${foundTag.id}`
-        );
-        this.tagCache.set(normalizedName, foundTag);
-        return foundTag;
-      }
-    } catch (error) {
-      console.warn(`[ERROR] searching for tag "${tagName}":`, error.message);
-    }
-
-    return null;
+    // Delegates to the enum: exact match first, then substring/term/AI
+    // similarity so a near-duplicate name resolves to the existing tag
+    // instead of creating one.
+    return this.tags.getByName(this.client, tagName);
   }
 
   async createTagSafely(tagName) {
-    const normalizedName = tagName.toLowerCase();
-
     try {
       // Versuche zuerst, den Tag zu erstellen
       const response = await this.client.post('/tags/', { name: tagName });
@@ -662,9 +600,9 @@ class PaperlessService {
       console.log(
         `[DEBUG] Successfully created tag "${tagName}" with ID ${newTag.id}`
       );
-      this.tagCache.set(normalizedName, newTag);
-      // Invalidate cache after creating new tag to ensure consistency
-      this.lastTagRefresh = 0;
+      // Insert into the cache without a full refresh; the enum's maps stay
+      // consistent for the lookups that follow in the same run.
+      this.tags.add(newTag);
       return newTag;
     } catch (error) {
       if (error.response?.status === 400) {
@@ -805,7 +743,6 @@ class PaperlessService {
     }
   }
 
-  // todo
   async getTags() {
     this.initialize();
     if (!this.client) {
@@ -813,9 +750,8 @@ class PaperlessService {
       return [];
     }
 
-    // Use cached tags if available and not expired
-    await this.ensureTagCache();
-    return Array.from(this.tagCache.values());
+    // Cached, freshness-checked read; elements are reduced to {id, name}.
+    return this.tags.getAll(this.client);
   }
 
   //todo
@@ -891,10 +827,9 @@ class PaperlessService {
   async getTagCount({ strict = false } = {}) {
     this.initialize();
     try {
-      const response = await this.client.get('/tags/', {
-        params: { count: true },
-      });
-      return response.data.count;
+      // Served from the shared tag cache like the correspondent count; the
+      // strict flag keeps a dead backend from caching an all-zero library.
+      return await this.tags.getCount(this.client);
     } catch (error) {
       console.error('[ERROR] fetching tag count:', error.message);
       if (strict) throw error;
@@ -1457,19 +1392,18 @@ class PaperlessService {
       return {};
     }
 
-    const namesById = new Map();
-    for (const tag of this.tagCache.values()) {
-      const id = Number(tag?.id);
-      if (Number.isInteger(id) && typeof tag?.name === 'string') {
-        namesById.set(id, tag.name);
-      }
-    }
-
     const resolved = {};
     for (const tagId of uniqueTagIds) {
-      const name = namesById.get(tagId);
-      if (name) {
-        resolved[tagId] = name;
+      try {
+        const tag = await this.tags.getById(this.client, tagId);
+        if (tag && typeof tag.name === 'string') {
+          resolved[tagId] = tag.name;
+        }
+      } catch (error) {
+        console.error(
+          `[ERROR] resolving tag name for #${tagId}:`,
+          error.message
+        );
       }
     }
 
@@ -1662,13 +1596,16 @@ class PaperlessService {
    */
   async getCorrespondentNameById(correspondentId) {
     this.initialize();
-    return this.correspondents.getById(this.client, correspondentId)
+    return this.correspondents.getById(this.client, correspondentId);
   }
 
   async getDocumentTypeNameById(documentTypeId) {
     this.initialize();
     try {
-      let documentType = this.documentTypes.getById(this.client, documentTypeId);
+      let documentType = this.documentTypes.getById(
+        this.client,
+        documentTypeId
+      );
       if (documentType) {
         return documentType.name;
       }
@@ -1694,8 +1631,8 @@ class PaperlessService {
      */
     this.initialize();
     try {
-      const response = await this.client.get(`/tags/${tagId}/`);
-      return response.data.name;
+      const tag = await this.tags.getById(this.client, tagId);
+      return tag ? tag.name : null;
     } catch (error) {
       console.error(
         `[ERROR] fetching tag name for ID ${tagId}:`,
@@ -1938,7 +1875,6 @@ class PaperlessService {
     }
   }
 
-
   // todo
   async getOrCreateCorrespondent(name, options = {}) {
     this.initialize();
@@ -1956,16 +1892,21 @@ class PaperlessService {
 
     try {
       // Search for the correspondent
-      const existingCorrespondent = await this.searchForExistingCorrespondent(name);
+      const existingCorrespondent =
+        await this.searchForExistingCorrespondent(name);
 
       if (existingCorrespondent) {
-        console.log(`[DEBUG] Found existing correspondent "${name}" with ID ${existingCorrespondent.id}`);
+        console.log(
+          `[DEBUG] Found existing correspondent "${name}" with ID ${existingCorrespondent.id}`
+        );
         return existingCorrespondent;
       }
 
       // If we're restricting to existing correspondents and none was found, return null
       if (restrictToExistingCorrespondents) {
-        console.log(`[DEBUG] Correspondent "${name}" does not exist and restrictions are enabled, returning null`);
+        console.log(
+          `[DEBUG] Correspondent "${name}" does not exist and restrictions are enabled, returning null`
+        );
         return null;
       }
 
@@ -2143,12 +2084,11 @@ class PaperlessService {
     }
   }
 
-  // todo
   async getTagTextFromId(tagId) {
     this.initialize();
     try {
-        const response = await this.client.get(`/tags/${tagId}/`);
-        return response.data.name;
+      const tag = await this.tags.getById(this.client, tagId);
+      return tag ? tag.name : null;
     } catch (error) {
       console.error(
         `[ERROR] fetching tag text for ID ${tagId}:`,
@@ -2405,6 +2345,5 @@ class PaperlessService {
     }
   }
 }
-
 
 module.exports = new PaperlessService();

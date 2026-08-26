@@ -55,8 +55,10 @@ async function run() {
   assert.deepStrictEqual(
     pagedClient.getCalls().map(({ url, options }) => [url, options]),
     [
-      ['/correspondents/', { page_size: 100 }],
-      ['/page-1', { page_size: 100 }],
+      // page_size must ride in axios `params` — a flat property on the config
+      // is dropped by real axios and the server answers with its default.
+      ['/correspondents/', { params: { page_size: 100 } }],
+      ['/page-1', { params: { page_size: 100 } }],
     ]
   );
 
