@@ -299,7 +299,7 @@ const METADATA_ENDPOINTS = [
 ];
 
 function stripIpv6Brackets(value) {
-  return String(value || '').replace(/^\[|\]$/g, '');
+  return String(value || '').replace(/^\[|]$/g, '');
 }
 
 function normalizeIpAddress(ipAddress) {
@@ -935,7 +935,7 @@ function extractChatMessageContent(
     return '';
   }
 
-  const jsonMatch = reasoningContent.match(/\{[\s\S]*\}/);
+  const jsonMatch = reasoningContent.match(/\{[\s\S]*}/);
   if (jsonMatch) {
     console.warn(
       `[WARN] [${providerLabel}] Empty message.content, using JSON extracted from reasoning_content.`

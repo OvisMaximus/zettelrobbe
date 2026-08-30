@@ -82,13 +82,21 @@ class OllamaService {
   }
 
   /**
-   * Analyze a document and extract metadata
-   * @param {string} content - Document content
-   * @param {Array} existingTags - List of existing tags
-   * @param {Array} existingCorrespondentList - List of existing correspondents
-   * @param {string} id - Document ID
-   * @param {string} customPrompt - Custom prompt (optional)
-   * @returns {Object} Analysis results
+   * Analyzes a document to extract metadata and tags using an AI model.
+   * @param {string} content - The content of the document to analyze.
+   * @param {Array} existingTags - Array of pre-existing tags to consider during analysis.
+   * @param {Array} existingCorrespondentList - Array of pre-existing correspondents.
+   * @param {Array} existingDocumentTypesList - Array of pre-existing document types.
+   * @param {string|number} id - Unique identifier for the document.
+   * @param {string} [customPrompt] - Custom prompt to guide the analysis process.
+   * @param {Object} [options] - Additional configuration options.
+   * @param {Object} [options.externalApiData] - External data to include in the analysis.
+   * @returns {Promise<Object>} An object containing analysis results, metrics, and status.
+   * @returns {Object} document - Parsed response from the AI analysis.
+   * @returns {Object} metrics - Performance metrics from the analysis process.
+   * @returns {boolean} truncated - Indicates if the content was truncated during processing.
+   * @returns {string} error - Error message if an exception occurred.
+   * @returns {string} errorCode - Error code if an exception occurred.
    */
   async analyzeDocument(
     content,
@@ -113,7 +121,7 @@ class OllamaService {
       if (externalApiData) {
         try {
           validatedExternalApiData =
-            await this._validateAndTruncateExternalApiData(externalApiData);
+            this._validateAndTruncateExternalApiData(externalApiData);
           console.log('[DEBUG] External API data validated and included');
         } catch (error) {
           console.warn(
@@ -239,7 +247,7 @@ class OllamaService {
       }
 
       // Log the prompt and response
-      await this._logPromptAndResponse(prompt, parsedResponse);
+      await this._logPromptAndResponse(systemPrompt, prompt, parsedResponse);
 
       // Return results in consistent format
       return {
@@ -382,7 +390,8 @@ class OllamaService {
 
     if (availableTokens <= 0) {
       throw new Error(
-        'Token limit exceeded: the prompt alone does not fit the configured TOKEN_LIMIT. Raise TOKEN_LIMIT or shorten the system prompt.'
+        'Token limit exceeded: the prompt alone does not fit the configured ' +
+          'TOKEN_LIMIT. Raise TOKEN_LIMIT or shorten the system prompt.'
       );
     }
 
@@ -392,18 +401,21 @@ class OllamaService {
     }
 
     console.log(
-      `[DEBUG] Document content (${text.length} chars) exceeds the context budget (${maxChars} chars for a ${maxWindow}-token window minus prompt and ${responseTokens} reserved answer tokens); truncating`
+      '[DEBUG] Document content (${text.length} chars) exceeds the context ' +
+        'budget (${maxChars} chars for a ${maxWindow}-token window minus prompt' +
+        ' and ${responseTokens} reserved answer tokens); truncating'
     );
     return text.substring(0, maxChars);
   }
 
   /**
-   * Build prompt from content and existing data
-   * @param {string} content - Document content
-   * @param {Array} existingTags - List of existing tags
-   * @param {Array} existingCorrespondent - List of existing correspondents
-   * @param {Array} existingDocumentTypes - List of existing document types
-   * @returns {string} Formatted prompt
+   * Builds and returns a system prompt string combining configuration, content, and metadata.
+   * @param {string} content - The main content of the document to be processed.
+   * @param {string[]} existingTags - Array of existing tags associated with the document.
+   * @param {string[]} existingCorrespondent - Array of existing correspondents related to the document.
+   * @param {string[]} existingDocumentTypes - Array of existing document types.
+   * @param {Object} options - Optional configuration object. May include externalApiData for additional context.
+   * @return {string} The constructed system prompt string combining configuration, content, and metadata.
    */
   _buildPrompt(
     content,
@@ -690,18 +702,6 @@ class OllamaService {
   }
 
   /**
-   * Get available system memory
-   * @returns {Object} Object with totalMemoryMB and freeMemoryMB
-   */
-  async _getAvailableMemory() {
-    const totalMemory = os.totalmem();
-    const freeMemory = os.freemem();
-    const totalMemoryMB = (totalMemory / (1024 * 1024)).toFixed(0);
-    const freeMemoryMB = (freeMemory / (1024 * 1024)).toFixed(0);
-    return { totalMemoryMB, freeMemoryMB };
-  }
-
-  /**
    * Handle thumbnail caching for documents
    * @param {string} id - Document ID
    */
@@ -726,7 +726,7 @@ class OllamaService {
 
   /**
    * Build request headers, adding bearer auth when an API key is set.
-   * The key is read at request time so runtime config changes apply
+   * The key is read at request time, so runtime config changes apply
    * without re-instantiating the singleton.
    * @returns {Object} Headers object
    */
@@ -1053,11 +1053,15 @@ class OllamaService {
   }
 
   /**
-   * Log prompt and response to file
-   * @param {string} prompt - Prompt text
-   * @param {Object} response - Response object
+   * Logs the prompt and response to a file. Combines the system prompt, user
+   * prompt, and response into a formatted string and writes it to a file.
+   * @param {string} systemPrompt - The system message provided to the model.
+   * @param {string} prompt - The user's input prompt.
+   * @param {Object} response - The model's generated response object.
+   * @return {Promise<void>} A promise that resolves when the prompt and
+   *          response are written to the file.
    */
-  async _logPromptAndResponse(prompt, response) {
+  async _logPromptAndResponse(systemPrompt, prompt, response) {
     const content =
       '================================================================================' +
       prompt +
@@ -1066,7 +1070,7 @@ class OllamaService {
       '\n\n' +
       '================================================================================\n\n';
 
-    await writePromptToFile(content);
+    await writePromptToFile(systemPrompt, content);
   }
 
   /**

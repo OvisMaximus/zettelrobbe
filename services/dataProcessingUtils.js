@@ -1,4 +1,5 @@
 const { validateCustomFieldValue } = require('./serviceUtils');
+const os = require('node:os');
 
 async function updateCustomFieldsData(analysis, doc, updateData, config, paperlessService) {
   // Only process custom fields if custom fields detection is activated
@@ -116,8 +117,20 @@ async function updateCorrespondentData(analysis, updateData, config, paperlessSe
   }
 }
 
+/**
+ * @return {Object} An object containing totalMemoryMB and freeMemoryMB as
+ * strings representing memory in megabytes.
+ */
+async function getAvailableMemory() {
+  const totalMemory = os.totalmem();
+  const freeMemory = os.freemem();
+  const totalMemoryMB = (totalMemory / (1024 * 1024)).toFixed(0);
+  const freeMemoryMB = (freeMemory / (1024 * 1024)).toFixed(0);
+  return { totalMemoryMB, freeMemoryMB };
+}
 module.exports = {
   updateCustomFieldsData,
   updateDocumentTypeData,
-  updateCorrespondentData
+  updateCorrespondentData,
+  getAvailableMemory
 };
