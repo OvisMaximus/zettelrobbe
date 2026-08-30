@@ -279,16 +279,30 @@ class FormManager {
 }
 
 // Tags Management
+/* The add button is addressed by id. It used to be found by walking up to a
+   `.space-y-2` ancestor — a Tailwind class that no view has carried since the
+   move to the zr system, so closest() returned null, addTagButton stayed
+   undefined and the guard below skipped initialize() entirely. That took the
+   whole field down with it: the Add button did nothing, Enter fell through to
+   the form and saved instead of adding a tag, and existing chips could not be
+   removed. Both the Tags and the Ignore Tags field were affected. */
 class TagsManager {
-  constructor(tagInputId, tagsContainerId, tagsHiddenInputId) {
+  constructor(
+    tagInputId,
+    tagsContainerId,
+    tagsHiddenInputId,
+    addButtonId = null
+  ) {
     this.tagInput = document.getElementById(tagInputId); //'tagInput'
     this.tagsContainer = document.getElementById(tagsContainerId); // tagsContainer
     this.tagsHiddenInput = document.getElementById(tagsHiddenInputId); // tagsHiddenInput
-    this.addTagButton = this.tagInput
-      ?.closest('.space-y-2')
-      ?.querySelector('button');
+    this.addTagButton = addButtonId
+      ? document.getElementById(addButtonId)
+      : null;
 
-    if (this.tagInput && this.tagsContainer && this.addTagButton) {
+    // The input and its chip list are what the field needs to work. A missing
+    // add button costs the button, not Enter and not chip removal.
+    if (this.tagInput && this.tagsContainer) {
       this.initialize();
 
       // Initialize existing tags with proper event handlers
@@ -384,7 +398,9 @@ class TagsManager {
 
     const removeButton = document.createElement('button');
     removeButton.type = 'button';
-    removeButton.className = '';
+    // Matches the server-rendered chips in settings.ejs; an added chip used to
+    // get an unstyled remove button next to styled ones.
+    removeButton.className = 'zr-link';
     removeButton.innerHTML =
       '<svg class="zr-icon zr-icon--sm" aria-hidden="true"><use href="/icons.svg#i-x"/></svg>';
 
@@ -469,8 +485,13 @@ For the language:
 
 function initializeCoreSettings() {
   new FormManager();
-  new TagsManager('tagInput', 'tagsContainer', 'tags');
-  new TagsManager('ignoreTagInput', 'ignoreTagsContainer', 'ignoreTags');
+  new TagsManager('tagInput', 'tagsContainer', 'tags', 'tagAddButton');
+  new TagsManager(
+    'ignoreTagInput',
+    'ignoreTagsContainer',
+    'ignoreTags',
+    'ignoreTagAddButton'
+  );
   new TagsManager('promptTagInput', 'promptTagsContainer', 'promptTags');
   new PromptManager();
 }
@@ -527,10 +548,17 @@ function initializeFormHandlers() {
     }
   };
 
+  /* `grouping` is optional and only used by the OCR dropdown: it splits the
+     list into a recommended group and the rest, preselecting the first
+     recommended entry. Without it the select renders flat, exactly as before.
+     The recommendation is a hint, never a filter — vision support is detected
+     from model names, and a name says nothing certain about what a model can
+     read. */
   const populateModelSelect = (
     selectElement,
     models,
-    placeholder = 'Select model'
+    placeholder = 'Select model',
+    grouping = null
   ) => {
     if (!selectElement) return;
     selectElement.innerHTML = '';
@@ -540,22 +568,53 @@ function initializeFormHandlers() {
     emptyOption.textContent = placeholder;
     selectElement.appendChild(emptyOption);
 
-    const uniqueModels = Array.from(
-      new Set(
-        (Array.isArray(models) ? models : [])
-          .map((model) => String(model || '').trim())
-          .filter(Boolean)
-      )
-    );
+    const normalizeList = (list) =>
+      Array.from(
+        new Set(
+          (Array.isArray(list) ? list : [])
+            .map((model) => String(model || '').trim())
+            .filter(Boolean)
+        )
+      );
 
-    uniqueModels.forEach((model) => {
+    const uniqueModels = normalizeList(models);
+    const appendOption = (parent, model) => {
       const option = document.createElement('option');
       option.value = model;
       option.textContent = model;
-      selectElement.appendChild(option);
-    });
+      parent.appendChild(option);
+    };
 
-    selectElement.value = uniqueModels.length > 0 ? uniqueModels[0] : '';
+    const recommended = grouping
+      ? normalizeList(grouping.recommended).filter((model) =>
+          uniqueModels.includes(model)
+        )
+      : [];
+    const rest = uniqueModels.filter((model) => !recommended.includes(model));
+
+    if (recommended.length > 0 && rest.length > 0) {
+      const recommendedGroup = document.createElement('optgroup');
+      recommendedGroup.label = grouping.recommendedLabel || 'Recommended';
+      recommended.forEach((model) => appendOption(recommendedGroup, model));
+      selectElement.appendChild(recommendedGroup);
+
+      const restGroup = document.createElement('optgroup');
+      restGroup.label = grouping.otherLabel || 'Other models';
+      rest.forEach((model) => appendOption(restGroup, model));
+      selectElement.appendChild(restGroup);
+    } else {
+      uniqueModels.forEach((model) => appendOption(selectElement, model));
+    }
+
+    const preferred = String(grouping?.preferred || '').trim();
+    if (preferred && uniqueModels.includes(preferred)) {
+      selectElement.value = preferred;
+      return;
+    }
+
+    const firstRecommended = recommended.length > 0 ? recommended[0] : null;
+    selectElement.value =
+      firstRecommended || (uniqueModels.length > 0 ? uniqueModels[0] : '');
   };
 
   const fetchModels = async (url, payload) => {
@@ -997,6 +1056,16 @@ function initializeFormHandlers() {
 
     if (ocrApiUrlContainer) {
       ocrApiUrlContainer.classList.toggle(
+        'hidden',
+        !enabled || provider !== 'custom'
+      );
+    }
+
+    // The recommended/other grouping in the model dropdown only exists on the
+    // classification path, which the Mistral provider does not take.
+    const ocrModelVisionHint = document.getElementById('ocrModelVisionHint');
+    if (ocrModelVisionHint) {
+      ocrModelVisionHint.classList.toggle(
         'hidden',
         !enabled || provider !== 'custom'
       );
@@ -1659,14 +1728,22 @@ function initializeFormHandlers() {
         }
 
         const models = Array.isArray(result.models) ? result.models : [];
-        populateModelSelect(ocrModelInput, models, 'Select OCR model');
+        const visionModels = Array.isArray(result.visionModels)
+          ? result.visionModels
+          : [];
+        // The list is offered whole; vision hits are grouped on top as a
+        // recommendation. Filtering on them hid models that read documents
+        // perfectly well but do not say "vision" in their name.
+        populateModelSelect(ocrModelInput, models, 'Select OCR model', {
+          recommended: visionModels,
+          recommendedLabel: 'Recommended (vision detected)',
+          otherLabel: 'Other models',
+          preferred: result.suggestedModel,
+        });
         await zrDialog({
           icon: 'success',
           title: 'OCR models loaded',
-          text:
-            models.length > 0
-              ? `Found ${models.length} model(s).`
-              : 'No models found.',
+          text: models.length > 0 ? result.message : 'No models found.',
         });
       } catch (error) {
         const errorDetails = getTimeoutAwareErrorDetails(
@@ -2331,9 +2408,20 @@ function initializeFormHandlers() {
         }
 
         if (models.length > 0) {
-          formData.set('mistralOcrModel', models[0]);
+          // The discovery list is no longer vision-filtered, so pick the
+          // suggested model (or the first vision hit) rather than whatever
+          // happens to sort first.
+          const visionModels = Array.isArray(result.visionModels)
+            ? result.visionModels
+            : [];
+          const suggested = String(result.suggestedModel || '').trim();
+          const autoModel =
+            (suggested && models.includes(suggested) && suggested) ||
+            visionModels.find((model) => models.includes(model)) ||
+            models[0];
+          formData.set('mistralOcrModel', autoModel);
           const input = document.getElementById('mistralOcrModel');
-          if (input) input.value = models[0];
+          if (input) input.value = autoModel;
         }
       }
 
@@ -2799,9 +2887,10 @@ function initializeRuntimeOverridePills() {
       return;
     }
 
-    const container =
-      fieldElement.closest('.space-y-2') ||
-      fieldElement.parentElement?.closest('.space-y-2');
+    // `.space-y-2` was a Tailwind ancestor that no longer exists, so this
+    // returned null for every field and the pills never rendered. Settings
+    // rows are either a plain field or a switch row.
+    const container = fieldElement.closest('.zr-field, .zr-switchrow');
     if (!container) {
       return;
     }
