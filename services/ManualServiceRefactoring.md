@@ -27,7 +27,7 @@ Apply TDD
 - Extract common logic to `BaseAnalyzer` class
   - Example: Centralize error handling with `handleAPIError()`
   - Example: Standardize response parsing with `parseJSONResponse()`
-  - Example: Abstract API call interface with `callAPI()`
+  - **Suggestion**: Add validation for `AnalysisResult` structure to reject unexpected keys (e.g., `correspondent` might be missing in some cases)
 
 #### 2. **Provider Adapters**
 - Create separate adapter classes for each AI provider:
@@ -58,6 +58,7 @@ Apply TDD
       });
     }
     ```
+  - Standardize method signatures (e.g. all adapters return text containing a valid JSON object)
 
 #### 3. **ManualService Refactor**
 - Replace switch statement with adapter factory pattern:
@@ -87,6 +88,7 @@ Apply TDD
   - Malformed JSON: `try/catch` validation
   - Network error: `ECONNABORTED` handling
   - Empty response: `null` check
+- **Suggestion**: Add mock for `X-RateLimit-Remaining` header in rate-limiting tests
 
 #### 5. **Edge Case Coverage**
 - Test empty `existingTags` array:
@@ -106,7 +108,6 @@ Apply TDD
 - Test API rate limiting: Validate `X-RateLimit-Remaining` header
 - Test large input content: Validate token calculation for Ollama
 
-
 #### 6. **Return Value Structure**
 All adapters must return objects with this structure:
 ```ts
@@ -123,15 +124,25 @@ Error case:
 ```js
 { tags: [], correspondent: null }
 ```
+
+### 7. **Token Calculation Centralization**
+**Suggestion**: Centralize Ollama token calculation logic in `calculateNumCtx()` (input prompt characters / 2 or /4) to avoid duplication. Example:
+```js
+function calculateNumCtx(promptLength, maxCtx) {
+  return Math.min(Math.floor(promptLength / 2), maxCtx);
+}
+```
+
 ###  **Implementation Steps**
 1. Write tests for `BaseAnalyzer` first (TDD)
 2. Implement `BaseAnalyzer` with abstract `callAPI()`
-3. Create adapter classes with provider-specific `callAPI()`
-4. Mock API calls for each provider in tests
-5. Validate all edge cases with test scenarios
-6. Add Ollama token calculation tests:
+3. Add tests for derived Adapters
+4. Add Ollama token calculation tests:
    ```js
    test('calculates num_ctx correctly', () => {
      expect(ollamaAdapter.calculateNumCtx(100, 1024)).toBe(1124);
    });
    ```
+5. Create adapter classes with provider-specific `callAPI()`
+6. Mock API calls for each provider in tests
+7. Validate all edge cases with test scenarios
