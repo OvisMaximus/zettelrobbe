@@ -147,4 +147,5 @@ function calculateNumCtx(promptLength, maxCtx) {
    ```
 6. Create service classes with provider-specific `callAPI()`
 7. Validate all edge cases with test scenarios
+8. group LlmServices into a subdirectory of services and move all tests testing solely production code in /services into /tests/services
 
