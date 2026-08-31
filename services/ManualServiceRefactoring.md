@@ -9,7 +9,8 @@ We will also use these adapters to refactor ollamaService.js, openaiService.js, 
 and azureService.js.
 
 Apply TDD
-
+Adhere to the stylguide in /CLAUDE.md
+Ensure all tests are symmetrically to the existing tests and are integrated in the test suite.
 
 ### **Expected Benefits**
 - Single point of business logic
@@ -24,14 +25,14 @@ Apply TDD
 ### design approach
 
 #### 1. **Base Adapter Pattern**
-- Extract common logic to `BaseAdapter` class
+- Extract common logic to `LlmService` class
 - Centralize error handling with `handleAPIError()`
 - Standardize response parsing with `parseJSONResponse()`
 - **Suggestion**: Add validation for `AnalysisResult` structure to reject unexpected keys (e.g., `correspondent` might be missing in some cases)
 
-#### 2. **Provider Adapters**
-- Create separate adapter classes for each AI provider:
-  - `OpenAIAdapter`:
+#### 2. **Provider Services**
+- Create separate Service classes for each AI provider:
+  - `OpenAIService`:
     ```js
     async callAPI(prompt) {
       return this.openai.chat.completions.create({
@@ -40,7 +41,7 @@ Apply TDD
       });
     }
     ```
-  - `OllamaAdapter`:
+  - `OllamaService`:
     ```js
     async callAPI(prompt) {
       return this.ollama.post('/api/generate', {
@@ -49,7 +50,7 @@ Apply TDD
       });
     }
     ```
-  - `AzureAdapter`:
+  - `AzureService`:
     ```js
     async callAPI(prompt) {
       return this.openai.chat.completions.create({
@@ -63,8 +64,8 @@ Apply TDD
 #### 3. **ManualService Refactor**
 - Replace switch statement with adapter factory pattern:
   ```js
-  const adapter = new (require(`services/analyzers/${config.aiProvider}Adapter`))(config);
-  return await adapter.analyze(content, existingTags);
+  const service = new (require(`services/analyzers/${config.aiProvider}Service`))(config);
+  return await service.analyze(content, existingTags);
   ```
 - Inject provider-specific configuration via constructor
 - Centralize error handling with `handleAPIError()`
@@ -134,15 +135,16 @@ function calculateNumCtx(promptLength, maxCtx) {
 ```
 
 ###  **Implementation Steps**
-1. Write tests for `BaseService` first (TDD)
-2. Implement `BaseService` with abstract `callAPI()`
-3. Add tests for derived Adapters
+1. Write tests for `LlmService` first (TDD)
+2. Implement `LlmService` with abstract `callAPI()`
+3. Add tests for derived Services
 4. Mock API calls for each provider in tests
 5. Add Ollama token calculation tests:
    ```js
    test('calculates num_ctx correctly', () => {
-     expect(ollamaAdapter.calculateNumCtx(100, 1024)).toBe(1124);
+     expect(ollamaService.calculateNumCtx(100, 1024)).toBe(1124);
    });
    ```
-6. Create adapter classes with provider-specific `callAPI()`
+6. Create service classes with provider-specific `callAPI()`
 7. Validate all edge cases with test scenarios
+
