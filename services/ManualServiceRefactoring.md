@@ -23,11 +23,11 @@ Apply TDD
 
 ### design approach
 
-#### 1. **Base Analyzer Pattern**
-- Extract common logic to `BaseAnalyzer` class
-  - Example: Centralize error handling with `handleAPIError()`
-  - Example: Standardize response parsing with `parseJSONResponse()`
-  - **Suggestion**: Add validation for `AnalysisResult` structure to reject unexpected keys (e.g., `correspondent` might be missing in some cases)
+#### 1. **Base Adapter Pattern**
+- Extract common logic to `BaseAdapter` class
+- Centralize error handling with `handleAPIError()`
+- Standardize response parsing with `parseJSONResponse()`
+- **Suggestion**: Add validation for `AnalysisResult` structure to reject unexpected keys (e.g., `correspondent` might be missing in some cases)
 
 #### 2. **Provider Adapters**
 - Create separate adapter classes for each AI provider:
@@ -134,15 +134,15 @@ function calculateNumCtx(promptLength, maxCtx) {
 ```
 
 ###  **Implementation Steps**
-1. Write tests for `BaseAnalyzer` first (TDD)
-2. Implement `BaseAnalyzer` with abstract `callAPI()`
+1. Write tests for `BaseService` first (TDD)
+2. Implement `BaseService` with abstract `callAPI()`
 3. Add tests for derived Adapters
-4. Add Ollama token calculation tests:
+4. Mock API calls for each provider in tests
+5. Add Ollama token calculation tests:
    ```js
    test('calculates num_ctx correctly', () => {
      expect(ollamaAdapter.calculateNumCtx(100, 1024)).toBe(1124);
    });
    ```
-5. Create adapter classes with provider-specific `callAPI()`
-6. Mock API calls for each provider in tests
+6. Create adapter classes with provider-specific `callAPI()`
 7. Validate all edge cases with test scenarios
