@@ -80,6 +80,7 @@ const TESTS = {
   'setup-remote-guard': 'test-setup-remote-guard.js',
   'thumbnail-auth-guard': 'test-thumbnail-auth-guard.js',
   'thumbnail-startup-migration': 'test-thumbnail-startup-migration.js',
+  'thumbnail-optional-analysis': 'test-thumbnail-optional-analysis.js',
   'restriction-service': 'test-restriction-service.js',
   'updated-service': 'test-updated-service.js',
   'prompt-existing-data-serialization':
@@ -179,6 +180,7 @@ const AREAS = {
     'scanner-startup-resilience',
     'paperless-unreachable-banner',
     'thumbnail-startup-migration',
+    'thumbnail-optional-analysis',
     'ai-temperature-config',
     'custom-field-monetary-normalization',
     'ollama-token-metrics',

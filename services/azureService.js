@@ -12,10 +12,7 @@ const AzureOpenAI = require('openai').AzureOpenAI;
 const config = require('../config/config');
 const fs = require('fs').promises;
 const path = require('path');
-const {
-  THUMBNAIL_CACHE_DIR,
-  getThumbnailCachePath,
-} = require('./thumbnailCachePaths');
+const { cacheThumbnail } = require('./thumbnailCache');
 const RestrictionPromptService = require('./restrictionPromptService');
 const responseLogPath = path.join(
   process.cwd(),
@@ -49,7 +46,6 @@ class AzureOpenAIService {
     customPrompt = null,
     options = {}
   ) {
-    const cachePath = getThumbnailCachePath(id);
     try {
       this.initialize();
       const now = new Date();
@@ -62,23 +58,8 @@ class AzureOpenAIService {
         throw new Error('AzureOpenAI client not initialized');
       }
 
-      // Handle thumbnail caching
-      try {
-        await fs.access(cachePath);
-        console.log('[DEBUG] Thumbnail already cached');
-      } catch {
-        console.log('Thumbnail not cached, fetching from Paperless');
-        const paperlessService = require('./paperlessService');
-        const thumbnailData = await paperlessService.getThumbnailImage(id);
-
-        if (!thumbnailData) {
-          console.warn('Thumbnail not found');
-          return;
-        }
-
-        await fs.mkdir(THUMBNAIL_CACHE_DIR, { recursive: true });
-        await fs.writeFile(cachePath, thumbnailData);
-      }
+      // Cache the thumbnail for the UI; never let it affect the analysis.
+      await cacheThumbnail(id);
 
       // Format existing data - callers may hand over entity objects or plain names
       const existingTagNames = toNameList(existingTags).join(', ');

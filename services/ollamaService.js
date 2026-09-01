@@ -1,17 +1,7 @@
-const {
-  writePromptToFile,
-  toNameList,
-  truncateToTokenLimit,
-} = require('./serviceUtils');
+const { writePromptToFile, toNameList } = require('./serviceUtils');
 const axios = require('axios');
 const config = require('../config/config');
-const fs = require('fs').promises;
-const paperlessService = require('./paperlessService');
-const os = require('os');
-const {
-  THUMBNAIL_CACHE_DIR,
-  getThumbnailCachePath,
-} = require('./thumbnailCachePaths');
+const { cacheThumbnail } = require('./thumbnailCache');
 const RestrictionPromptService = require('./restrictionPromptService');
 
 /**
@@ -111,8 +101,8 @@ class OllamaService {
       // Truncate content if needed
       content = this._truncateContent(content);
 
-      // Cache thumbnail
-      await this._handleThumbnailCaching(id);
+      // Cache the thumbnail for the UI; never let it affect the analysis.
+      await cacheThumbnail(id);
 
       // Get external API data if available and validate it
       let externalApiData = options.externalApiData || null;
@@ -699,29 +689,6 @@ class OllamaService {
     console.log('Dynamic calculated num_ctx:', numCtx);
 
     return numCtx;
-  }
-
-  /**
-   * Handle thumbnail caching for documents
-   * @param {string} id - Document ID
-   */
-  async _handleThumbnailCaching(id) {
-    if (!id) return;
-
-    const cachePath = getThumbnailCachePath(id);
-    try {
-      await fs.access(cachePath);
-      console.log('[DEBUG] Thumbnail already cached');
-    } catch {
-      console.log('Thumbnail not cached, fetching from Paperless');
-      const thumbnailData = await paperlessService.getThumbnailImage(id);
-      if (!thumbnailData) {
-        console.warn('Thumbnail not found');
-        return;
-      }
-      await fs.mkdir(THUMBNAIL_CACHE_DIR, { recursive: true });
-      await fs.writeFile(cachePath, thumbnailData);
-    }
   }
 
   /**
