@@ -94,6 +94,8 @@ const TESTS = {
   'ai-temperature-config': 'test-ai-temperature-config.js',
   'custom-field-monetary-normalization':
     'test-custom-field-monetary-normalization.js',
+  'llm-analysis-result-contract': 'test-llm-analysis-result-contract.js',
+  'llm-ocr-fallback-phrases': 'test-llm-ocr-fallback-phrases.js',
   'mistral-ocr-no-processed-on-update-failure':
     'test-mistral-ocr-no-processed-on-update-failure.js',
   'ocr-provider-lmstudio-compatible':
@@ -186,6 +188,8 @@ const AREAS = {
     'ollama-token-metrics',
     'reconciliation-service',
     'settings-paperless-url-fallback',
+    'llm-analysis-result-contract',
+    'llm-ocr-fallback-phrases',
   ],
   prompts: [
     'restriction-service',
