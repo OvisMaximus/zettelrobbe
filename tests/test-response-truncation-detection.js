@@ -8,12 +8,16 @@
  * the document to the OCR queue, which re-reads the PDF and re-runs the same
  * request against the same limit.
  *
- * The playground path is the seam used here: it takes the same client and the
- * same guard as the analysis path, but caches no thumbnail, so the stub is the
- * only collaborator involved.
+ * Both public seams are exercised per provider — analyzeDocument() and
+ * analyzePlayground() carry their own catch block, and the scan loop reads
+ * analysis.errorCode, so a service that raises the right error but drops the
+ * code on the way out records a generic failure and loses the OCR decision.
+ * The provider client is the only collaborator stubbed; the thumbnail cache is
+ * pre-seeded so the analysis path reaches the client without a Paperless call.
  */
 
 const assert = require('assert');
+const fs = require('fs').promises;
 
 process.env.AI_PROVIDER = 'openai';
 process.env.OPENAI_API_KEY = 'test-key';
@@ -27,9 +31,14 @@ process.env.CUSTOM_MODEL = 'test-model';
 process.env.SYSTEM_PROMPT = 'Analyse the document.';
 
 const { assertCompletionNotTruncated } = require('../services/serviceUtils');
+const {
+  THUMBNAIL_CACHE_DIR,
+  getThumbnailCachePath,
+} = require('../services/thumbnailCachePaths');
 const openaiService = require('../services/openaiService');
 const azureService = require('../services/azureService');
 const customService = require('../services/customService');
+const ollamaService = require('../services/ollamaService');
 
 let failed = 0;
 const check = async (label, fn) => {
@@ -51,6 +60,16 @@ const COMPLETE_ANSWER = JSON.stringify({
   language: 'de',
 });
 
+// A prefix of the answer above: valid JSON right up to the point it stops.
+const CUT_OFF_ANSWER = COMPLETE_ANSWER.slice(0, -12);
+
+// Own id so the seeded thumbnail cannot collide with a real cached document.
+const DOCUMENT_ID = 'test263truncation';
+
+// The response limit the services read from config.responseTokens; eval_count
+// reaching it is what tells Ollama's guard which limit bit.
+const RESPONSE_TOKENS = 1000;
+
 function completion(finishReason, content = COMPLETE_ANSWER) {
   return {
     choices: [{ message: { content }, finish_reason: finishReason }],
@@ -65,6 +84,52 @@ function stubClient(service, response) {
     models: { list: async () => ({ data: [] }) },
   };
 }
+
+/** Same for Ollama, which answers over axios instead of an SDK. */
+function stubOllamaClient(responseData) {
+  ollamaService.client = {
+    post: async () => ({ data: responseData }),
+    get: async () => ({ status: 200, data: { models: [] } }),
+  };
+}
+
+/**
+ * Per-provider arrangements for the same two events. Kept as thunks so each
+ * case re-stubs immediately before it runs and cannot inherit a stale client.
+ */
+function openAiCompatibleProvider(label, service) {
+  return {
+    label,
+    service,
+    arrangeCutOff: () =>
+      stubClient(service, completion('length', CUT_OFF_ANSWER)),
+    arrangeComplete: () => stubClient(service, completion('stop')),
+  };
+}
+
+const PROVIDERS = [
+  openAiCompatibleProvider('OpenAI', openaiService),
+  openAiCompatibleProvider('Azure', azureService),
+  openAiCompatibleProvider('Custom', customService),
+  {
+    label: 'Ollama',
+    service: ollamaService,
+    arrangeCutOff: () =>
+      stubOllamaClient({
+        response: CUT_OFF_ANSWER,
+        done_reason: 'length',
+        eval_count: RESPONSE_TOKENS,
+        prompt_eval_count: 900,
+      }),
+    arrangeComplete: () =>
+      stubOllamaClient({
+        response: COMPLETE_ANSWER,
+        done_reason: 'stop',
+        eval_count: 120,
+        prompt_eval_count: 900,
+      }),
+  },
+];
 
 (async () => {
   console.log('\n=== Response truncation detection ===');
@@ -110,64 +175,92 @@ function stubClient(service, response) {
     );
   });
 
-  /* --- each provider actually consults it -------------------------------- */
+  /* --- each provider actually consults it, on both public seams ---------- */
 
-  const services = [
-    ['OpenAI', openaiService],
-    ['Azure', azureService],
-    ['Custom', customService],
-  ];
+  /* Pre-seed the thumbnail cache so analyzeDocument() gets past its caching
+     step without reaching Paperless. Ollama skips the step entirely once the
+     file is there, the OpenAI-compatible three take their fs.access() hit. */
+  await fs.mkdir(THUMBNAIL_CACHE_DIR, { recursive: true });
+  await fs.writeFile(
+    getThumbnailCachePath(DOCUMENT_ID),
+    Buffer.from([0x89, 0x50, 0x4e, 0x47])
+  );
 
-  await check('every analysis catch block carries the code onward', () => {
-    // The scan loop reads analysis.errorCode; a service that throws the right
-    // error but drops the code on the way out records a generic failure.
-    const fs = require('fs');
-    for (const name of [
-      'openaiService',
-      'azureService',
-      'customService',
-      'ollamaService',
-    ]) {
-      const source = fs.readFileSync(`services/${name}.js`, 'utf8');
-      const guards = (source.match(/errorCode: error\.code/g) || []).length;
-      const catches = (
-        source.match(
-          /document: \{ tags: \[\], correspondent: null \},\n\s*metrics: null,/g
-        ) || []
-      ).length;
-      assert.strictEqual(
-        guards,
-        catches,
-        `${name}: ${catches} analysis catch block(s) but ${guards} carry errorCode`
-      );
-    }
-  });
+  /* The failure shape the scan loop branches on: no metadata to write back,
+     no metrics to record, and the code that decides OCR fallback. Asserted
+     rather than read out of the source, so it survives the code moving. */
+  const assertReportsCutOff = (analysis) => {
+    assert.strictEqual(analysis.errorCode, 'ai_response_truncated');
+    assert.match(analysis.error, /stopped generating/);
+    assert.deepStrictEqual(analysis.document, {
+      tags: [],
+      correspondent: null,
+    });
+    assert.strictEqual(analysis.metrics, null);
+  };
 
-  for (const [label, service] of services) {
+  for (const { label, service, arrangeCutOff, arrangeComplete } of PROVIDERS) {
     await check(
-      `${label}: a cut-off answer is reported, not parsed`,
+      `${label}: analyzeDocument reports a cut-off answer with its code`,
       async () => {
         // Truncated JSON would otherwise fail to parse and be blamed on the model.
-        stubClient(
-          service,
-          completion('length', COMPLETE_ANSWER.slice(0, -12))
+        arrangeCutOff();
+        const analysis = await service.analyzeDocument(
+          'Rechnung',
+          [],
+          [],
+          [],
+          DOCUMENT_ID
         );
-        const analysis = await service.analyzePlayground('Rechnung', 'Analyse');
-        assert.strictEqual(analysis.errorCode, 'ai_response_truncated');
-        assert.match(analysis.error, /stopped generating/);
+        assertReportsCutOff(analysis);
       }
     );
 
-    await check(`${label}: a complete answer is unaffected`, async () => {
-      stubClient(service, completion('stop'));
-      const analysis = await service.analyzePlayground('Rechnung', 'Analyse');
-      assert.strictEqual(analysis.error, undefined);
-      assert.strictEqual(
-        analysis.document.correspondent,
-        'Telekom Deutschland GmbH'
-      );
-    });
+    await check(
+      `${label}: analyzeDocument passes a complete answer through`,
+      async () => {
+        arrangeComplete();
+        const analysis = await service.analyzeDocument(
+          'Rechnung',
+          [],
+          [],
+          [],
+          DOCUMENT_ID
+        );
+        assert.strictEqual(analysis.error, undefined);
+        assert.strictEqual(analysis.errorCode, undefined);
+        assert.strictEqual(
+          analysis.document.correspondent,
+          'Telekom Deutschland GmbH'
+        );
+      }
+    );
+
+    await check(
+      `${label}: analyzePlayground reports a cut-off answer with its code`,
+      async () => {
+        arrangeCutOff();
+        const analysis = await service.analyzePlayground('Rechnung', 'Analyse');
+        assertReportsCutOff(analysis);
+      }
+    );
+
+    await check(
+      `${label}: analyzePlayground passes a complete answer through`,
+      async () => {
+        arrangeComplete();
+        const analysis = await service.analyzePlayground('Rechnung', 'Analyse');
+        assert.strictEqual(analysis.error, undefined);
+        assert.strictEqual(analysis.errorCode, undefined);
+        assert.strictEqual(
+          analysis.document.correspondent,
+          'Telekom Deutschland GmbH'
+        );
+      }
+    );
   }
+
+  await fs.rm(getThumbnailCachePath(DOCUMENT_ID), { force: true });
 
   if (failed > 0) {
     console.error(`\n${failed} truncation detection case(s) failed`);
