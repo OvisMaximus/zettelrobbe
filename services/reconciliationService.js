@@ -12,7 +12,7 @@
  */
 
 const paperlessService = require('./paperlessService');
-const documentModel   = require('../models/document');
+const documentModel = require('../models/document');
 
 /** Maximum time (ms) to wait for an active scan to complete before giving up. */
 const SCAN_WAIT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
@@ -42,34 +42,58 @@ class ReconciliationService {
     const deadline = Date.now() + SCAN_WAIT_TIMEOUT_MS;
     while (this._getScanControl().running) {
       if (Date.now() >= deadline) {
-        console.warn('[RECONCILIATION] Timed out waiting for scan to finish. Skipping this run.');
+        console.warn(
+          '[RECONCILIATION] Timed out waiting for scan to finish. Skipping this run.'
+        );
         return false;
       }
-      await new Promise(resolve => setTimeout(resolve, SCAN_POLL_INTERVAL_MS));
+      await new Promise((resolve) =>
+        setTimeout(resolve, SCAN_POLL_INTERVAL_MS)
+      );
     }
     return true;
   }
 
   /**
    * Performs a full reconciliation pass:
-   * 1. Fetches all current document IDs from Paperless-ngx.
-   * 2. Compares them with the IDs stored in processed_documents.
-   * 3. Deletes stale entries (across all three AI-DB tables) via
+   * 1. Confirms Paperless-ngx is reachable and the token is accepted.
+   * 2. Fetches all current document IDs from Paperless-ngx, strictly.
+   * 3. Compares them with the IDs stored in processed_documents.
+   * 4. Deletes stale entries (across all three AI-DB tables) via
    *    deleteDocumentsIdList(), which already handles processed_documents,
    *    history_documents, and original_documents in a single call.
    *
-   * @returns {Promise<{skipped: boolean, removed: number, durationMs: number} | null>}
+   * Every step before the delete is a veto. This pass is the only thing in the
+   * app that removes local records on its own, and the record it removes from
+   * original_documents is the only copy of a document's pre-AI state — so an
+   * answer that merely looks like an empty archive must never be acted upon.
+   * A run that vetoes returns `skipped: true` with a `reason`, and the next
+   * scheduled run reconciles again once Paperless-ngx answers properly.
+   *
+   * @returns {Promise<{skipped: boolean, removed: number, durationMs: number, reason?: string}>}
    */
   async reconcileAllDocuments() {
     if (this.isReconciling) {
-      console.debug('[RECONCILIATION] Already running. Skipping duplicate trigger.');
-      return { skipped: true, removed: 0, durationMs: 0 };
+      console.debug(
+        '[RECONCILIATION] Already running. Skipping duplicate trigger.'
+      );
+      return {
+        skipped: true,
+        removed: 0,
+        durationMs: 0,
+        reason: 'already_running',
+      };
     }
 
     // Queue: wait for an active scan to complete first.
     const ready = await this._waitForScanIdle();
     if (!ready) {
-      return { skipped: true, removed: 0, durationMs: 0 };
+      return {
+        skipped: true,
+        removed: 0,
+        durationMs: 0,
+        reason: 'scan_in_progress',
+      };
     }
 
     this.isReconciling = true;
@@ -77,6 +101,37 @@ class ReconciliationService {
 
     try {
       console.debug('[RECONCILIATION] Starting reconciliation pass...');
+
+      // A probe before the list: an unreachable host or a rejected token turns
+      // every following read into "no documents", which is indistinguishable
+      // from an emptied archive once the ids are in a Set.
+      let connection;
+      try {
+        connection = await paperlessService.checkConnection();
+      } catch (err) {
+        console.warn(
+          `[RECONCILIATION] Connection check failed: ${err.message}. Skipping this run.`
+        );
+        return {
+          skipped: true,
+          removed: 0,
+          durationMs: Date.now() - startMs,
+          reason: 'connection_check_failed',
+        };
+      }
+
+      if (!connection?.reachable || !connection?.authorized) {
+        console.warn(
+          `[RECONCILIATION] Paperless-ngx is not usable (reachable=${!!connection?.reachable}, ` +
+            `authorized=${!!connection?.authorized}, status=${connection?.status ?? 'none'}). Skipping this run.`
+        );
+        return {
+          skipped: true,
+          removed: 0,
+          durationMs: Date.now() - startMs,
+          reason: 'paperless_unavailable',
+        };
+      }
 
       // --- Fetch valid document IDs from Paperless-ngx ---
       // Use applyFilters: false so that IGNORE_TAGS / PROCESS_PREDEFINED_DOCUMENTS
@@ -86,18 +141,46 @@ class ReconciliationService {
       // would be wrongly treated as deleted and removed from history.
       let paperlessDocs;
       try {
-        console.debug('[RECONCILIATION] Fetching unfiltered document list (bypassing IGNORE_TAGS/TAGS scan filters)');
-        paperlessDocs = await paperlessService.getAllDocuments({ applyFilters: false });
+        console.debug(
+          '[RECONCILIATION] Fetching unfiltered document list (bypassing IGNORE_TAGS/TAGS scan filters)'
+        );
+        // strict: a partial list is not a shorter archive. Without it a 502 on
+        // page 2 delivered the pages fetched so far, and everything behind the
+        // failed page was deleted as stale.
+        paperlessDocs = await paperlessService.getAllDocuments({
+          applyFilters: false,
+          strict: true,
+        });
       } catch (err) {
-        console.error(`[RECONCILIATION] Failed to fetch documents from Paperless-ngx: ${err.message}`);
-        return { skipped: true, removed: 0, durationMs: Date.now() - startMs };
+        console.error(
+          `[RECONCILIATION] Failed to fetch documents from Paperless-ngx: ${err.message}`
+        );
+        return {
+          skipped: true,
+          removed: 0,
+          durationMs: Date.now() - startMs,
+          reason: 'document_list_incomplete',
+        };
+      }
+
+      if (!Array.isArray(paperlessDocs) || paperlessDocs.length === 0) {
+        console.warn(
+          '[RECONCILIATION] Paperless-ngx reported no documents at all. ' +
+            'Refusing to treat that as a deletion of the entire archive. Skipping this run.'
+        );
+        return {
+          skipped: true,
+          removed: 0,
+          durationMs: Date.now() - startMs,
+          reason: 'empty_document_list',
+        };
       }
 
       // Build a Set of valid, positive integer IDs for O(1) lookups.
       const validIdSet = new Set(
         paperlessDocs
-          .map(d => d.id)
-          .filter(id => Number.isInteger(id) && id > 0)
+          .map((d) => d.id)
+          .filter((id) => Number.isInteger(id) && id > 0)
       );
 
       // --- Fetch locally tracked processed documents ---
@@ -105,39 +188,82 @@ class ReconciliationService {
       try {
         processedDocs = await documentModel.getProcessedDocuments();
       } catch (err) {
-        console.error(`[RECONCILIATION] Failed to read processed_documents: ${err.message}`);
-        return { skipped: true, removed: 0, durationMs: Date.now() - startMs };
+        console.error(
+          `[RECONCILIATION] Failed to read processed_documents: ${err.message}`
+        );
+        return {
+          skipped: true,
+          removed: 0,
+          durationMs: Date.now() - startMs,
+          reason: 'processed_documents_unreadable',
+        };
       }
 
       // --- Find stale IDs (in AI DB but no longer in Paperless-ngx) ---
-      const staleIds = processedDocs
-        .map(d => d.document_id)
-        .filter(id => {
+      const trackedIds = processedDocs
+        .map((d) => d.document_id)
+        .filter((id) => {
           if (!id || !Number.isInteger(Number(id)) || Number(id) <= 0) {
-            console.warn(`[RECONCILIATION] Skipping invalid document_id: ${id}`);
+            console.warn(
+              `[RECONCILIATION] Skipping invalid document_id: ${id}`
+            );
             return false;
           }
-          return !validIdSet.has(Number(id));
+          return true;
         });
+
+      const staleIds = trackedIds.filter((id) => !validIdSet.has(Number(id)));
 
       if (staleIds.length === 0) {
         const durationMs = Date.now() - startMs;
-        console.debug(`[RECONCILIATION] No stale entries found. (${durationMs}ms)`);
+        console.debug(
+          `[RECONCILIATION] No stale entries found. (${durationMs}ms)`
+        );
         return { skipped: false, removed: 0, durationMs };
+      }
+
+      // A run in which not one tracked document is still present is the shape
+      // every remaining failure mode takes — a list from the wrong instance, a
+      // token scoped to a different user, an answer that parsed but held
+      // foreign ids. A genuine "the user emptied the archive" looks identical
+      // from here, so it is deferred to a human rather than acted on: nothing
+      // is deleted and the counts say what was seen. The cost is that an
+      // archive whose every processed document really was deleted has to be
+      // cleaned up by hand; that is the cheaper mistake of the two.
+      if (staleIds.length === trackedIds.length) {
+        console.warn(
+          `[RECONCILIATION] All ${trackedIds.length} tracked documents would be deleted at once ` +
+            `(Paperless-ngx returned ${validIdSet.size} document ids). This looks like a bad answer, ` +
+            'not an emptied archive. Refusing to delete; remove the entries manually if they really are gone.'
+        );
+        return {
+          skipped: true,
+          removed: 0,
+          durationMs: Date.now() - startMs,
+          reason: 'all_tracked_documents_stale',
+        };
       }
 
       // --- Delete stale entries from all three AI-DB tables ---
       try {
         await documentModel.deleteDocumentsIdList(staleIds);
       } catch (err) {
-        console.error(`[RECONCILIATION] Failed to delete stale entries: ${err.message}`);
-        return { skipped: false, removed: 0, durationMs: Date.now() - startMs };
+        console.error(
+          `[RECONCILIATION] Failed to delete stale entries: ${err.message}`
+        );
+        return {
+          skipped: false,
+          removed: 0,
+          durationMs: Date.now() - startMs,
+          reason: 'delete_failed',
+        };
       }
 
       const durationMs = Date.now() - startMs;
-      console.info(`[RECONCILIATION] Removed ${staleIds.length} stale entries in ${durationMs}ms.`);
+      console.info(
+        `[RECONCILIATION] Removed ${staleIds.length} stale entries in ${durationMs}ms.`
+      );
       return { skipped: false, removed: staleIds.length, durationMs };
-
     } finally {
       this.isReconciling = false;
     }
