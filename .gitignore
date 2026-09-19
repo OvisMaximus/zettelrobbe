@@ -33,6 +33,7 @@ dist/
 *.local.*
 .vscode/
 .idea/
+.ollamassist/
 # AI context files (auto-generated)
 COPILOT.md
 .DS_Store

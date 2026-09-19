@@ -353,7 +353,12 @@ class CustomOpenAIService {
       const message = response?.choices?.[0]?.message;
       let jsonContent = extractChatMessageContent(message, 'Custom OpenAI');
       if (!jsonContent) {
-        throw new Error('Invalid API response structure');
+        if(!response) throw new Error (`API response is empty.`);
+        if(!response.choices) throw new Error (`API response is missing choices.`);
+        if(!response.choices[0]) throw new Error (`API response is missing choices[0].`);
+        if(!response.choices[0].message) throw new Error (`API response is missing choices[0].message.`);
+        if(!response.choices[0].message.content) throw new Error (`API response is missing choices[0].message.content.`);
+        throw new Error(`Invalid API response structure: ${message?.content}`);
       }
 
       // Log token usage
@@ -375,7 +380,7 @@ class CustomOpenAIService {
         parsedResponse = parsedResult.parsed;
         jsonContent = parsedResult.normalized;
       } catch (error) {
-        console.error(`Failed to parse JSON response: ${error.message}`);
+        console.log(`[ERROR] Failed to parse JSON response: ${error.message}`);
         console.debug(error);
         throw error;
       }

@@ -1203,6 +1203,10 @@ module.exports = {
 
   async addToOcrQueue(documentId, title, reason = 'manual') {
     try {
+      // TODO cleanup status hack, check usages of this method
+      // status hack: this method is called to force ocr to reprocess a document.
+      // keeping the status as done prevents this. I wonder if there are side
+      // effects now when called in a use case which does not imply forced OCR.
       const result = db
         .prepare(
           `
@@ -1211,7 +1215,7 @@ module.exports = {
         ON CONFLICT(document_id) DO UPDATE SET
           title = excluded.title,
           reason = excluded.reason,
-          status = CASE WHEN status = 'done' THEN 'done' ELSE 'pending' END,
+          status = CASE WHEN status = 'done' THEN 'pending' ELSE 'pending' END, 
           added_at = CASE WHEN status = 'done' THEN added_at ELSE CURRENT_TIMESTAMP END
         WHERE status != 'processing'
       `
