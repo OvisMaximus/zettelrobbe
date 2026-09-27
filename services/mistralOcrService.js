@@ -12,6 +12,7 @@ const PaperlessService = require('./paperlessService');
 const popplerService = require('./popplerService');
 const documentModel = require('../models/document');
 const AIServiceFactory = require('./aiServiceFactory');
+const documentProcessingService = require('./documentProcessingService');
 const { isTimeoutError, buildTimeoutErrorMessage } = require('./serviceUtils');
 
 class MistralOcrService {
@@ -997,8 +998,8 @@ class MistralOcrService {
 
   /**
    * Run AI analysis on a document using OCR text (instead of Paperless content).
-   * Mirrors the processDocument / buildUpdateData / saveDocumentChanges flow
-   * from server.js but accepts pre-extracted text.
+   * Mirrors processDocument from server.js but accepts pre-extracted text;
+   * the write-back is the same documentProcessingService the scan uses.
    * @private
    */
   async _runAiAnalysis(documentId, ocrText) {
@@ -1035,85 +1036,15 @@ class MistralOcrService {
       throw new Error(analysis.error);
     }
 
-    // Build update data (simplified – reuse paperlessService helpers)
-    const updateData = {};
-    const config = require('../config/config');
-    const options = {
-      restrictToExistingTags: config.restrictToExistingTags === 'yes',
-      restrictToExistingCorrespondents:
-        config.restrictToExistingCorrespondents === 'yes',
-      restrictToExistingDocumentTypes:
-        config.restrictToExistingDocumentTypes === 'yes',
-      // For the creation guard's record of which document a mapping served.
-      documentId,
-    };
-
-    if (config.limitFunctions?.activateTagging !== 'no') {
-      const { tagIds } = await PaperlessService.processTags(
-        analysis.document.tags,
-        options
-      );
-      updateData.tags = tagIds;
-    }
-    if (config.limitFunctions?.activateTitle !== 'no') {
-      updateData.title = analysis.document.title || originalData.title;
-    }
-    updateData.created =
-      analysis.document.document_date || originalData.created;
-    if (
-      config.limitFunctions?.activateDocumentType !== 'no' &&
-      analysis.document.document_type
-    ) {
-      const dt = await PaperlessService.getOrCreateDocumentType(
-        analysis.document.document_type,
-        options
-      );
-      if (dt) updateData.document_type = dt.id;
-    }
-    if (
-      config.limitFunctions?.activateCorrespondents !== 'no' &&
-      analysis.document.correspondent
-    ) {
-      const corr = await PaperlessService.getOrCreateCorrespondent(
-        analysis.document.correspondent,
-        options
-      );
-      if (corr) updateData.correspondent = corr.id;
-    }
-    if (analysis.document.language) {
-      updateData.language = analysis.document.language;
-    }
-
-    // Apply updates to Paperless
-    const updatedDocument = await PaperlessService.updateDocument(
-      documentId,
-      updateData
+    const updateData = await documentProcessingService.buildUpdateData(
+      analysis,
+      originalData
     );
-    if (!updatedDocument) {
-      throw new Error(`Paperless update failed for document ${documentId}`);
-    }
-
-    // Persist metrics & history
-    if (analysis.metrics) {
-      await documentModel.addOpenAIMetrics(
-        documentId,
-        analysis.metrics.promptTokens,
-        analysis.metrics.completionTokens,
-        analysis.metrics.totalTokens
-      );
-    }
-    await documentModel.addProcessedDocument(
+    await documentProcessingService.saveDocumentChanges(
       documentId,
-      updateData.title || originalData.title
-    );
-    await documentModel.addToHistory(
-      documentId,
-      updateData.tags || [],
-      updateData.title || originalData.title,
-      analysis.document.correspondent,
-      null,
-      analysis.document.document_type || null,
-      analysis.document.language || null
+      updateData,
+      analysis,
+      originalData
     );
 
     return analysis;
