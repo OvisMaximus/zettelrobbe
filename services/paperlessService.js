@@ -1361,7 +1361,9 @@ class PaperlessService {
       includeTagIds = await this.resolveTagIdsByName(includeTagNames);
 
       if (includeTagIds.length === 0) {
-        console.warn('[DEBUG] None of the specified tags were found');
+        console.warn(
+          `[DEBUG] None of the specified tags were found: ${includeTagNames.join(', ')}`
+        );
         return [];
       }
 
@@ -1609,7 +1611,9 @@ class PaperlessService {
       }
 
       if (tagIds.length === 0) {
-        console.warn('[DEBUG] None of the specified tags were found');
+        console.warn(
+          `[DEBUG] None of the specified tags were found: ${tagNames.join(', ')}`
+        );
         return [];
       }
 
