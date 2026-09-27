@@ -95,6 +95,8 @@ const TESTS = {
     'test-custom-field-monetary-normalization.js',
   'custom-field-longtext': 'test-custom-field-longtext.js',
   'document-processing-service': 'test-document-processing-service.js',
+  'settings-custom-field-type-conflict':
+    'test-settings-custom-field-type-conflict.js',
   'mistral-ocr-no-processed-on-update-failure':
     'test-mistral-ocr-no-processed-on-update-failure.js',
   'ocr-provider-lmstudio-compatible':
@@ -221,6 +223,7 @@ const AREAS = {
     'custom-field-monetary-normalization',
     'custom-field-longtext',
     'document-processing-service',
+    'settings-custom-field-type-conflict',
     'ollama-token-metrics',
     'reconciliation-service',
     'settings-paperless-url-fallback',

@@ -605,6 +605,49 @@ class PaperlessService {
     }
   }
 
+  /**
+   * Find configured custom fields whose name Paperless-ngx already has under
+   * another data type.
+   *
+   * Paperless-ngx refuses to create a second field with the same name, and
+   * createCustomFieldSafely() takes that refusal as "already there". A field
+   * configured as `longtext` but existing as `string` therefore went
+   * unnoticed, and every value over 128 characters was dropped later.
+   *
+   * @param {Array<{value: string, data_type: string}>} fields Configured fields.
+   * @returns {Promise<Array<{name: string, configuredType: string,
+   *   paperlessType: string}>|null>} The conflicting fields, or null when
+   *   Paperless-ngx could not be asked.
+   */
+  async findCustomFieldTypeConflicts(fields) {
+    if (!Array.isArray(fields) || fields.length === 0) {
+      return [];
+    }
+
+    this.initialize();
+    try {
+      await this.refreshCustomFieldCache();
+    } catch {
+      return null;
+    }
+
+    return fields.flatMap((field) => {
+      const existing = this.customFieldCache.get(
+        String(field.value || '').toLowerCase()
+      );
+      if (!existing?.data_type || existing.data_type === field.data_type) {
+        return [];
+      }
+      return [
+        {
+          name: field.value,
+          configuredType: field.data_type,
+          paperlessType: existing.data_type,
+        },
+      ];
+    });
+  }
+
   async getExistingCustomFields(documentId) {
     try {
       const response = await this.client.get(`/documents/${documentId}/`);

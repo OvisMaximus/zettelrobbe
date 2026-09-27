@@ -8123,19 +8123,20 @@ router.get('/health', async (req, res) => {
  *                   type: string
  *                   example: "Settings updated successfully"
  *       400:
- *         description: Invalid configuration parameters
+ *         description: |
+ *           Invalid configuration parameters, or a custom field added or changed in
+ *           this request whose name Paperless-ngx already has with another data type.
  *         content:
  *           application/json:
  *             schema:
  *               type: object
  *               properties:
- *                 status:
+ *                 success:
+ *                   type: boolean
+ *                   example: false
+ *                 error:
  *                   type: string
- *                   enum: ["error"]
- *                   example: "error"
- *                 message:
- *                   type: string
- *                   example: "Invalid settings: AI provider required when automatic processing is enabled"
+ *                   example: 'Custom field "Notes" exists in Paperless-ngx with the type "string", not "longtext". Remove it and add it again with the type Paperless-ngx has, or use another name.'
  *       500:
  *         description: Server error while updating settings
  *         content:
@@ -8458,6 +8459,55 @@ router.post('/settings', express.json(), async (req, res) => {
       } catch (error) {
         console.error('Error processing custom fields:', error);
         processedCustomFields = [];
+      }
+    }
+
+    // A field Paperless-ngx already has under another type is never created;
+    // the existing one is used, and every value its type cannot hold is
+    // dropped during processing. Refuse such fields when they are added or
+    // changed here. Entries that were configured before only warn, so a
+    // mismatch in an operator-injected CUSTOM_FIELDS cannot lock the page.
+    const typeConflicts = await paperlessService.findCustomFieldTypeConflicts(
+      processedCustomFields
+    );
+    if (typeConflicts === null) {
+      console.warn(
+        '[WARN] Could not compare custom field types with Paperless-ngx; saving without the check'
+      );
+    } else if (typeConflicts.length > 0) {
+      const customFieldKey = (name, type) =>
+        `${String(name || '').toLowerCase()}\u0000${type}`;
+      let previousKeys = new Set();
+      try {
+        const previous = JSON.parse(currentConfig.CUSTOM_FIELDS);
+        previousKeys = new Set(
+          (previous.custom_fields || []).map((field) =>
+            customFieldKey(field.value, field.data_type)
+          )
+        );
+      } catch {
+        // An unreadable previous value makes every entry count as new.
+      }
+
+      const refused = [];
+      for (const conflict of typeConflicts) {
+        const describe = `Custom field "${conflict.name}" exists in Paperless-ngx with the type "${conflict.paperlessType}", not "${conflict.configuredType}".`;
+        if (
+          previousKeys.has(
+            customFieldKey(conflict.name, conflict.configuredType)
+          )
+        ) {
+          console.warn(`[WARN] ${describe}`);
+        } else {
+          refused.push(describe);
+        }
+      }
+
+      if (refused.length > 0) {
+        return res.status(400).json({
+          success: false,
+          error: `${refused.join(' ')} Remove ${refused.length === 1 ? 'it' : 'them'} and add ${refused.length === 1 ? 'it' : 'them'} again with the type Paperless-ngx has, or use another name.`,
+        });
       }
     }
 
