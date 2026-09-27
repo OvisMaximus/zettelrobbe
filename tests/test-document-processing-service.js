@@ -54,8 +54,15 @@ function inject(modulePath, exports) {
  * @param {Object} [overrides]
  * @param {Object|null} [overrides.updateResult] What updateDocument resolves to.
  * @param {Object} [overrides.analysis] What the AI service returns (OCR path).
+ * @param {Object|null} [overrides.correspondent] What getOrCreateCorrespondent resolves to.
+ * @param {Object} [overrides.limitFunctions] Feature toggles over the all-on default.
  */
-function load({ updateResult = { id: 42 }, analysis = null } = {}) {
+function load({
+  updateResult = { id: 42 },
+  analysis = null,
+  correspondent = { id: 7, name: 'Telekom' },
+  limitFunctions = {},
+} = {}) {
   Object.values(modulePaths).forEach((modulePath) => {
     delete require.cache[modulePath];
   });
@@ -75,6 +82,7 @@ function load({ updateResult = { id: 42 }, analysis = null } = {}) {
       activateDocumentType: 'yes',
       activateTitle: 'yes',
       activateCustomFields: 'yes',
+      ...limitFunctions,
     },
     restrictToExistingTags: 'no',
     restrictToExistingCorrespondents: 'no',
@@ -89,10 +97,7 @@ function load({ updateResult = { id: 42 }, analysis = null } = {}) {
       id: 3,
       name: 'Invoice',
     }),
-    getOrCreateCorrespondent: record('getOrCreateCorrespondent', {
-      id: 7,
-      name: 'Telekom',
-    }),
+    getOrCreateCorrespondent: record('getOrCreateCorrespondent', correspondent),
     getExistingCustomFields: record('getExistingCustomFields', [
       { field: 5, value: 'old notes' },
       { field: 9, value: 'kept' },
@@ -248,6 +253,57 @@ async function main() {
     );
     assert.strictEqual(callsTo('addProcessedDocument')[0].args[1], 'Scan 0001');
     assert.strictEqual(callsTo('addToHistory')[0].args[2], 'Scan 0001');
+  });
+
+  await test('history records the names Paperless-ngx has, not the model answer', async () => {
+    const { documentProcessingService, callsTo } = load();
+    const updateData = await documentProcessingService.buildUpdateData(
+      sampleAnalysis(),
+      { id: 42, title: 'Scan 0001' }
+    );
+    await documentProcessingService.saveDocumentChanges(
+      42,
+      updateData,
+      sampleAnalysis(),
+      { title: 'Scan 0001' }
+    );
+    const historyArgs = callsTo('addToHistory')[0].args;
+    assert.strictEqual(
+      historyArgs[3],
+      'Telekom',
+      'the correspondent the model named was mapped to an existing one'
+    );
+    assert.strictEqual(historyArgs[5], 'Invoice');
+  });
+
+  await test('history stays empty for what was not set', async () => {
+    const { documentProcessingService, callsTo } = load({
+      correspondent: null,
+      limitFunctions: { activateDocumentType: 'no' },
+    });
+    const updateData = await documentProcessingService.buildUpdateData(
+      sampleAnalysis(),
+      { id: 42, title: 'Scan 0001' }
+    );
+    assert.strictEqual(updateData.correspondent, undefined);
+    assert.strictEqual(updateData.document_type, undefined);
+    await documentProcessingService.saveDocumentChanges(
+      42,
+      updateData,
+      sampleAnalysis(),
+      { title: 'Scan 0001' }
+    );
+    const historyArgs = callsTo('addToHistory')[0].args;
+    assert.strictEqual(
+      historyArgs[3],
+      null,
+      'a correspondent the restriction rejected was never written'
+    );
+    assert.strictEqual(
+      historyArgs[5],
+      null,
+      'document type detection is off, so the document type was never written'
+    );
   });
 
   await test('the OCR path writes custom fields and the restore snapshot', async () => {

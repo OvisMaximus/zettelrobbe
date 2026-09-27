@@ -20,7 +20,8 @@ class DocumentProcessingService {
    * Build the Paperless-ngx update payload for one analysed document.
    *
    * Honours the activate* feature toggles and the restrictToExisting*
-   * settings. The returned object may carry `_customFieldsForHistory`, which
+   * settings. The returned object may carry keys starting with an underscore
+   * (history-only data), which
    * {@link DocumentProcessingService#saveDocumentChanges} strips before the
    * payload is sent.
    *
@@ -88,6 +89,8 @@ class DocumentProcessingService {
         );
         if (documentType) {
           updateData.document_type = documentType.id;
+          updateData._documentTypeNameForHistory =
+            documentType.name || analysis.document.document_type;
         }
       } catch (error) {
         console.error(
@@ -121,6 +124,8 @@ class DocumentProcessingService {
         );
         if (correspondent) {
           updateData.correspondent = correspondent.id;
+          updateData._correspondentNameForHistory =
+            correspondent.name || analysis.document.correspondent;
         }
       } catch (error) {
         console.error(
@@ -237,12 +242,18 @@ class DocumentProcessingService {
       title: originalTitle,
     } = originalData;
 
-    // Pull out history-only data and remove it before sending updateData to Paperless
+    // Pull out history-only data and remove it before sending updateData to
+    // Paperless. The history records what was written, so correspondent and
+    // document type are the names Paperless-ngx has — which differ from the
+    // model's answer whenever an existing entry or another spelling was used —
+    // and stay empty when nothing was set.
     const historyCustomFields = updateData._customFieldsForHistory || null;
+    const historyCorrespondentName =
+      updateData._correspondentNameForHistory ?? null;
+    const historyDocTypeName = updateData._documentTypeNameForHistory ?? null;
     delete updateData._customFieldsForHistory;
-
-    const historyCorrespondentName = analysis.document.correspondent ?? null;
-    const historyDocTypeName = analysis.document.document_type ?? null;
+    delete updateData._correspondentNameForHistory;
+    delete updateData._documentTypeNameForHistory;
 
     const historyLanguage = analysis.document.language ?? null;
     const origDocType = originalData.document_type ?? null;
