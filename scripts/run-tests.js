@@ -93,6 +93,7 @@ const TESTS = {
   'ai-temperature-config': 'test-ai-temperature-config.js',
   'custom-field-monetary-normalization':
     'test-custom-field-monetary-normalization.js',
+  'custom-field-longtext': 'test-custom-field-longtext.js',
   'mistral-ocr-no-processed-on-update-failure':
     'test-mistral-ocr-no-processed-on-update-failure.js',
   'ocr-provider-lmstudio-compatible':
@@ -217,6 +218,7 @@ const AREAS = {
     'thumbnail-startup-migration',
     'ai-temperature-config',
     'custom-field-monetary-normalization',
+    'custom-field-longtext',
     'ollama-token-metrics',
     'reconciliation-service',
     'settings-paperless-url-fallback',
