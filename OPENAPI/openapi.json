@@ -5981,22 +5981,19 @@
             }
           },
           "400": {
-            "description": "Invalid configuration parameters",
+            "description": "Invalid configuration parameters, or a custom field added or changed in\nthis request whose name Paperless-ngx already has with another data type.\n",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "status": {
-                      "type": "string",
-                      "enum": [
-                        "error"
-                      ],
-                      "example": "error"
+                    "success": {
+                      "type": "boolean",
+                      "example": false
                     },
-                    "message": {
+                    "error": {
                       "type": "string",
-                      "example": "Invalid settings: AI provider required when automatic processing is enabled"
+                      "example": "Custom field \"Notes\" exists in Paperless-ngx with the type \"string\", not \"longtext\". Remove it and add it again with the type Paperless-ngx has, or use another name."
                     }
                   }
                 }

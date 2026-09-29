@@ -291,9 +291,9 @@ async function main() {
     assert.strictEqual(result.errors[0].tagName, AI_TAG);
   });
 
-  await test('server.js leaves the completion tag to processTags()', async () => {
+  await test('the write-back leaves the completion tag to processTags()', async () => {
     const source = fs.readFileSync(
-      path.join(__dirname, '..', 'server.js'),
+      path.join(__dirname, '..', 'services', 'documentProcessingService.js'),
       'utf8'
     );
 
