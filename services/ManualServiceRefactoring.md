@@ -29,6 +29,7 @@ Rules for this work:
 ## Validation Against the Source Code
 
 The following was verified against the working tree. Each finding constrains the design that follows.
+Line numbers were re-checked after the merge of upstream v2026.09.03 (merge `9d337d2`).
 
 ### 1. `manualService.js` is dead code
 
@@ -39,8 +40,12 @@ The duplication that the "manual" business service actually suffers from lives i
 `routes/setup.js`, which switches on `process.env.AI_PROVIDER` inline over the four _dedicated_
 singletons:
 
-- `routes/setup.js:7511-7578` — `POST /manual/analyze`, four-way switch calling `analyzeDocument()`.
-- `routes/setup.js:7657-7717` — `POST /manual/playground`, four-way switch calling `analyzePlayground()`.
+- `routes/setup.js:7477-7543` — `POST /manual/analyze`, four-way switch (`:7495-7537`) calling
+  `analyzeDocument()`.
+
+The second switch, `POST /manual/playground` over `analyzePlayground()`, is gone: upstream removed
+the Playground (#359), and the merge took that over, including the local `analyzePlayground()` in
+`ollamaService.js`.
 
 Further evidence that `manualService.js` was abandoned rather than maintained:
 
@@ -56,8 +61,8 @@ Further evidence that `manualService.js` was abandoned rather than maintained:
 - Its Ollama path never sends the document content at all — `prompt` is just
   `process.env.SYSTEM_PROMPT` (`manualService.js:218`).
 
-**Decision:** delete `services/manualService.js` as part of this work and point the two
-`/manual/*` endpoints at `AIServiceFactory.getService()`. Do not port its behavior — it is worse
+**Decision:** delete `services/manualService.js` as part of this work and point
+`POST /manual/analyze` at `AIServiceFactory.getService()`. Do not port its behavior — it is worse
 than the dedicated services on every axis: no token budgeting, no content truncation, no restriction
 placeholders, no structured output, no retry, no metrics.
 
@@ -65,15 +70,16 @@ placeholders, no structured output, no retry, no metrics.
 
 | Service            | Lines | Relationship                                    |
 | ------------------ | ----- | ----------------------------------------------- |
-| `openaiService.js` | 629   | ~90 % identical to azure/custom                 |
-| `azureService.js`  | 597   | ~90 % identical to openai/custom                |
-| `customService.js` | 706   | ~90 % identical, plus the strongest JSON parser |
-| `ollamaService.js` | 1164  | genuinely different transport and token model   |
+| `openaiService.js` | 550   | ~90 % identical to azure/custom                 |
+| `azureService.js`  | 568   | ~90 % identical to openai/custom                |
+| `customService.js` | 698   | ~90 % identical, plus the strongest JSON parser |
+| `ollamaService.js` | 1231  | genuinely different transport and token model   |
 
 The largest duplicated block is **prompt construction**: the
 `CUSTOM_FIELDS` → `customFieldsTemplate` → `%CUSTOMFIELDS%` block appears **six times**
-(`openaiService.js:125-160`, `azureService.js:114-149`, `customService.js:209-244`,
-`ollamaService.js:147-179`, `:434-469`, `:585-622`), followed each time by the same
+(`openaiService.js:125-160`, `azureService.js:143-178`, `customService.js:219-254`,
+`ollamaService.js:128-160` in `analyzeDocument()`, `:348-383` in `_buildPrompt()` and `:499-534` in
+`_generateCustomFieldsTemplate()`), followed each time by the same
 `useExistingData` / `mustHavePrompt` / `RestrictionPromptService` / `USE_PROMPT_TAGS` /
 `customPrompt` cascade.
 
@@ -92,17 +98,19 @@ Produced by all four services and consumed by three call sites:
   errorCode?: string }
 ```
 
-Consumers: `server.js:766-821`, `services/mistralOcrService.js:988-997`,
-`routes/setup.js:3167-3177`. Any narrowing of `document` drops title, document type, date, language
-or custom fields silently — the write-back in `paperlessService.updateDocument()` simply stops
-setting those fields.
+Consumers: `server.js:854-890` (`processDocument()`), `services/mistralOcrService.js:1027-1052`
+(`_runAiAnalysis()`), `routes/setup.js:3135-3165` (`processDocument()`) and `POST /manual/analyze`
+(`routes/setup.js:7495-7537`), which returns the result as JSON. The first three hand `document` to
+`documentProcessingService.buildUpdateData()`, which since the merge is the single write-back for
+scan, queue and OCR. Any narrowing of `document` drops title, document type, date, language or
+custom fields silently — `buildUpdateData()` simply stops setting those fields.
 
 ### 4. The error contract is load-bearing and phrase-matched — it must be preserved verbatim
 
 `analyzeDocument()` **never throws**; it returns the failure in `error`/`errorCode`.
-`server.js:774-821` then routes the document to the OCR queue based on
+`server.js:870-890` (and `routes/setup.js:3160`) then routes the document to the OCR queue based on
 `shouldQueueForOcrOnAiError()` / `classifyOcrQueueReasonFromAiError()`
-(`services/serviceUtils.js:812-861`), which match on **exact phrases**:
+(`services/serviceUtils.js:847-900`), which match on **exact phrases**:
 
 - `'insufficient content for ai analysis'`
 - `'invalid response structure'`
@@ -110,9 +118,14 @@ setting those fields.
 - `'invalid json response from api'`
 - `'invalid api response structure'`
 
-Rewording any of these silently disables OCR fallback. Guarded by the `ocr-fallback-ai-errors` and
-`response-truncation-detection` tests. The `error.code = 'ai_response_truncated'` marker
-(`serviceUtils.js:802`, `ollamaService.js:920`) has the same status.
+Rewording any of these silently disables OCR fallback. Guarded by the `ocr-fallback-ai-errors`,
+`response-truncation-detection` and `llm-ocr-fallback-phrases` tests. The
+`error.code = 'ai_response_truncated'` marker (`serviceUtils.js:834`, `ollamaService.js:791`) has the
+same status.
+
+This already happened once: `38a5352` replaced Custom's "Invalid API response structure" with
+detailed messages ("API response is missing choices."), and `llm-ocr-fallback-phrases` went red.
+`355ac29` keeps the detail behind the phrase ("Invalid API response structure: missing choices.").
 
 Consequence for the design: `analyzeDocument()` keeps its non-throwing contract. A version that
 throws on, say, a missing `SYSTEM_PROMPT` would take down the scan loop instead of queueing the
@@ -123,12 +136,12 @@ document.
 Two separate functions, easily conflated:
 
 ```js
-// ollamaService.js:678-683 — conservative 2 chars/token, deliberate and documented
+// ollamaService.js:568-570 — conservative 2 chars/token, deliberate and documented
 _calculatePromptTokenCount(prompt) {
   return Math.ceil(prompt.length / 2);
 }
 
-// ollamaService.js:691-702 — tokens, with the answer reserved
+// ollamaService.js:581-588 — tokens, with the answer reserved
 _calculateNumCtx(promptTokenCount, expectedResponseTokens) {
   return Math.min(promptTokenCount + expectedResponseTokens, Number(config.tokenLimit));
 }
@@ -138,18 +151,28 @@ The `/2` divisor exists because non-English tokenization (CJK, German) produces 
 characters per token instead of ~4; `manualService.js:234` used `/4` and would truncate those
 documents. Centralizing the estimators must **preserve `/2` for Ollama**, not unify the divisors.
 
-`_fitContentToContext()` (`ollamaService.js:379-409`) uses the same `/2` estimate by construction, so
+`_fitContentToContext()` (`ollamaService.js:290-320`) uses the same `/2` estimate by construction, so
 the two agree. Whatever holds this arithmetic after the refactor has to keep that property.
 
 ### 6. The transport seam needs a wide signature
 
-Ollama's transport needs `(prompt, systemPrompt, numCtx, schema)` (`ollamaService.js:811`), sends
+Ollama's transport needs `(prompt, systemPrompt, numCtx, schema)` (`ollamaService.js:678`), sends
 `format: schema` for structured output, computes `num_ctx`/`num_predict`, carries a bounded retry for
-transient failures (`:841-861`), and inspects `done_reason` for truncation (`:886-922`). Its response
-may arrive as a **JS object** rather than a string (`:929-949`).
+transient failures (`:643-735`, `_wrapOllamaRequestError()` at `:664`), and inspects `done_reason`
+for truncation (`:739-795`). Its response may arrive as a **JS object** rather than a string
+(`_processOllamaResponse()`, `:803`).
 
 A single-string `callAPI(prompt)` cannot carry any of that, which is why `CompletionRequest` below is
 a record rather than a string.
+
+`generateText(prompt, options)` widened the seam further with the merge. The Duplicates and
+"Simplify tags" features (`entityMatchAiService.js`, `tagSimplifyService.js`) call it with options
+that `services/aiGenerateOptions.js` reads the same way for all four providers: `systemPrompt`,
+`temperature` (where `0` is a value), a completion cap, a model override, an abort signal,
+reasoning on/off and a progress handler that streams partial text (`ai-provider-streaming` test).
+Upstream already unified the option parsing; what is still per provider is how each option reaches
+the API. The transport contract has to carry all of it, or the generation path regresses for those
+features.
 
 ### 7. behavioral drift between the four services — each item needs an explicit decision
 
@@ -158,18 +181,18 @@ today. These are the actual bugs the work will surface:
 
 | #   | Drift                                                                                                                       | Location                                                                                                                                                                         | Proposed resolution                                                                                                                                                                                                                                         |
 | --- | --------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| a   | Azure hardcodes `temperature: 0.3` while openai/custom use `config.aiTemperatureAnalysis`                                   | `azureService.js:258`, `:426`                                                                                                                                                    | Use the config value. Fixes a real bug; `test-ai-temperature-config.js` only covers config parsing, not the Azure wiring, so add a wiring test.                                                                                                             |
+| a   | Azure hardcodes `temperature: 0.3` while openai/custom use `config.aiTemperatureAnalysis`                                   | `azureService.js:286`                                                                                                                                                            | Use the config value. Fixes a real bug; `test-ai-temperature-config.js` only covers config parsing, not the Azure wiring, so add a wiring test.                                                                                                             |
 | b   | ~~`return;` (undefined!) when a thumbnail is missing — callers then read `.document` of `undefined`~~ **resolved**          | was `openaiService.js:87`, `azureService.js:76`, `customService.js:171`                                                                                                          | Fixed ahead of the refactor together with row j — same statement block, same root cause. See the note below the table.                                                                                                                                      |
-| c   | "Insufficient content" early return exists only in OpenAI                                                                   | `openaiService.js:310-332`, `:505-527`                                                                                                                                           | Keep, apply to all providers. The phrase feeds OCR fallback (Finding 4).                                                                                                                                                                                    |
+| c   | "Insufficient content" early return exists only in OpenAI                                                                   | `openaiService.js:310-332`                                                                                                                                                       | Keep, apply to all providers. The phrase feeds OCR fallback (Finding 4).                                                                                                                                                                                    |
 | d   | Three different JSON parsers                                                                                                | `customService.js:35-126` (brace-matched, strongest) vs. `openaiService.js:299-334` / `azureService.js:286-298` (naive strip) vs. `ollamaService.js:977-1053` (regex + sanitize) | One parser built from custom's `_extractFirstJsonValue` + `<think>` stripping + Ollama's sanitize fallback; keep Ollama's object passthrough as a pre-step.                                                                                                 |
 | e   | Only custom normalizes timeouts                                                                                             | `customService.js:428-436`                                                                                                                                                       | Apply `isTimeoutError`/`buildTimeoutErrorMessage` for all providers.                                                                                                                                                                                        |
-| f   | `generateText` max-token handling differs four ways                                                                         | openai: none; `azureService.js:528`: `max_tokens`; `customService.js:625-654`: clamped; `ollamaService.js:1105`: `num_predict`                                                   | Keep custom's clamping as the shared rule; the transport maps it to its own knob.                                                                                                                                                                           |
-| g   | `checkStatus` differs by nature                                                                                             | openai/custom `models.list()`; `azureService.js:574-580` REST GET; `ollamaService.js:1143` `/api/ps`                                                                             | Stays in the transport. Not business logic.                                                                                                                                                                                                                 |
-| h   | Unreachable branches in `openaiService.initialize()` for providers `ollama` and `custom`                                    | `openaiService.js:33-44`                                                                                                                                                         | `aiServiceFactory` never routes those providers here and both direct call sites in `routes/setup.js` are guarded by `AI_PROVIDER === 'openai'`. Verify, then drop.                                                                                          |
+| f   | `generateText` option handling — **mostly resolved upstream**                                                               | `services/aiGenerateOptions.js`, used by all four `generateText()` implementations                                                                                               | Upstream unified how options are read (completion cap, temperature, system prompt, model, abort, reasoning, progress). Keep `aiGenerateOptions.js` as the shared reader; the transports only map the result onto their own knobs.                           |
+| g   | `checkStatus` differs by nature                                                                                             | openai/custom `models.list()`; Azure REST GET; `ollamaService.js:1210` `/api/ps`                                                                                                 | Stays in the transport. Not business logic.                                                                                                                                                                                                                 |
+| h   | Unreachable branches in `openaiService.initialize()` for providers `ollama` and `custom`                                    | `openaiService.js:46-60`                                                                                                                                                         | `aiServiceFactory` never routes those providers here and both direct call sites in `routes/setup.js` are guarded by `AI_PROVIDER === 'openai'`. Verify, then drop.                                                                                          |
 | i   | Thumbnail caching sits inside `analyzeDocument` although the thumbnail never enters the prompt                              | all four                                                                                                                                                                         | Still out of scope as a _placement_ question, but the four copies are now one call to `services/thumbnailCache.js`. Moving it out of `analyzeDocument` is a one-line change once a caller wants it.                                                         |
 | j   | ~~`getThumbnailCachePath(id)` runs **outside** the try block, so an invalid id makes `analyzeDocument` throw~~ **resolved** | was `openaiService.js:63`, `azureService.js:52`, `customService.js:147`                                                                                                          | Fixed ahead of the refactor. See the note below the table.                                                                                                                                                                                                  |
-| k   | An answer with neither tags nor a correspondent is a **failure** on three providers and a **success** on Ollama             | `openaiService.js:329-331`, `azureService.js`, `customService.js` vs. `ollamaService.js`                                                                                         | Ollama logs "No tags or correspondent found…" and returns an all-null `document` with populated `metrics` and **no `error`**. So the scan loop writes nulls back to Paperless and never falls back to OCR. Adopt the throwing behaviour of the other three. |
-| l   | An empty provider payload is worded "No response data from Ollama API", which matches **no** OCR marker                     | `ollamaService.js` vs. `openaiService.js:262`, `azureService.js`, `customService.js`                                                                                             | The other three say "Invalid API response structure", which `shouldQueueForOcrOnAiError()` matches. Unify the wording on the shared phrase, or add this one to the marker list.                                                                             |
+| k   | An answer with neither tags nor a correspondent is a **failure** on three providers and a **success** on Ollama             | `openaiService.js:316-329`, `azureService.js`, `customService.js` vs. `ollamaService.js:223`                                                                                     | Ollama logs "No tags or correspondent found…" and returns an all-null `document` with populated `metrics` and **no `error`**. So the scan loop writes nulls back to Paperless and never falls back to OCR. Adopt the throwing behaviour of the other three. |
+| l   | An empty provider payload is worded "No response data from Ollama API", which matches **no** OCR marker                     | `ollamaService.js:821` vs. `openaiService.js`, `azureService.js`, `customService.js`                                                                                             | The other three say "Invalid API response structure", which `shouldQueueForOcrOnAiError()` matches. Unify the wording on the shared phrase, or add this one to the marker list.                                                                             |
 | m   | Custom classifies `socket hang up` as a timeout and replaces the message                                                    | `customService.js:331`                                                                                                                                                           | Consequence of row e: `isTimeoutError()` swallows the original text into "AI response timeout reached…". Decide deliberately whether a dropped connection is a timeout when the handling is unified.                                                        |
 
 Rows k and l were found by writing the step-1 safety net, not by reading the code — both are
@@ -305,8 +328,7 @@ class DocumentAnalyzer {
   async analyzeDocument(content, existingTags = [], existingCorrespondentList = [],
                         existingDocumentTypesList = [], id, customPrompt = null, options = {}) { ... }
 
-  async analyzePlayground(content, prompt) { ... }
-  async generateText(prompt) { ... }
+  async generateText(prompt, options = {}) { ... }   // options as read by aiGenerateOptions.js
   checkStatus() { return this.transport.checkStatus(); }
 }
 ```
@@ -409,13 +431,14 @@ Planned tests (each registered in `TESTS` in `scripts/run-tests.js` and in an `A
 | `llm-transport-request-mapping`       | chat transports send `messages[]` with system+user and omit `temperature` for `o3-mini`; Ollama transport sends `format`, `num_ctx`, `num_predict`, `think:false` unless `OLLAMA_THINK=true`                                                                        |
 | `llm-azure-temperature-wiring`        | Azure analysis requests carry `config.aiTemperatureAnalysis`, not a hardcoded `0.3` — Finding 7a                                                                                                                                                                    |
 | ~~`llm-missing-thumbnail-continues`~~ | **already delivered** as `tests/test-thumbnail-optional-analysis.js` (Findings 7b/7j). Keep it green through the refactor instead of writing a new one; it exercises `analyzeDocument` end to end, so the composition roots must keep calling `cacheThumbnail(id)`. |
-| `llm-provider-parity`                 | all four composition roots expose `analyzeDocument`/`analyzePlayground`/`generateText`/`checkStatus` and, given the same fake transport payload, produce byte-identical `document` objects                                                                          |
+| `llm-provider-parity`                 | all four composition roots expose `analyzeDocument`/`generateText`/`checkStatus` and, given the same fake transport payload, produce byte-identical `document` objects                                                                                              |
 
 Existing tests that must stay green without modification (they are the real acceptance criteria):
 `ocr-fallback-ai-errors`, `response-truncation-detection`, `ollama-response-limit`,
 `ollama-upstream-error`, `ollama-temperature-wiring`, `ollama-token-metrics`,
 `prompt-existing-data-serialization`, `restriction-service`, `restricted-document-types-placeholder`,
-`document-type-restriction`, `ai-temperature-config`, `playground-deprecation`.
+`document-type-restriction`, `ai-temperature-config`, `ai-provider-streaming`.
+(`playground-deprecation` was retired upstream together with the Playground, #359.)
 
 Repo hygiene for every step:
 
@@ -459,16 +482,16 @@ carry no behavioral risk; the risk starts at step 4.
 6. **Introduce `documentAnalyzer.js`** and the four composition roots. Reduce
    `services/{openai,azure,custom,ollama}Service.js` to re-export shims. Add `llm-provider-parity`.
    Fix Finding 7a here (Azure temperature) with its test.
-7. **Delete `services/manualService.js`** and repoint `POST /manual/analyze` and
-   `POST /manual/playground` (`routes/setup.js:7511`, `:7657`) at `AIServiceFactory.getService()`,
-   collapsing both four-way switches. Clean up what used to trigger Finding 7j while here: all four
-   branches pass `id || []` (`routes/setup.js:7535`, `:7550`, `:7559`, `:7568`), and `String([])` is
+7. **Delete `services/manualService.js`** and repoint `POST /manual/analyze`
+   (`routes/setup.js:7477`) at `AIServiceFactory.getService()`, collapsing its four-way switch.
+   Clean up what used to trigger Finding 7j while here: all four branches pass `id || []`
+   (`routes/setup.js:7501`, `:7516`, `:7525`, `:7534`), and `String([])` is
    `''`, which `getThumbnailCachePath()` rejects. That no longer costs the analysis — the request now
    succeeds with a warning — but `id || []` is still a nonsense default; pass the id through as-is,
    or require it. Note that
    `/manual/analyze` currently calls
-   `documentModel.addOpenAIMetrics()` only on the OpenAI branch while `/manual/playground` calls it on
-   three of four — decide explicitly whether metrics are recorded for every provider, and if the
+   `documentModel.addOpenAIMetrics()` only on the OpenAI branch — decide explicitly whether metrics
+   are recorded for every provider, and if the
    response shape changes, update the `@swagger` JSDoc and run `node scripts/regen-openapi.js`
    (the CI drift check will fail otherwise).
 8. **Verify Finding 7h** (unreachable `initialize()` branches in the former `openaiService`) and drop
@@ -488,8 +511,11 @@ carry no behavioral risk; the risk starts at step 4.
   single `cacheThumbnail(id)` call per provider rather than four inline copies, so hoisting it to
   the caller is a small change whenever someone wants to make it.
 - **Vision/multimodal analysis**, which is presumably why the thumbnail is cached at all.
-- **`analyzePlayground` deduplication beyond the shared collaborators** — the endpoint is already
-  deprecated (`routes/setup.js:7584`, `playground-deprecation` test); do not invest in it.
+- **`CachedNameIdEnum`'s semantic match calls a method no provider has.** `_findSemanticMatch()`
+  (`services/CachedNameIdEnum.js:176`) calls `ai_service.generateAnswer()`, which exists only in
+  test stubs. The call throws, is caught and returns "no match", so tag/correspondent/document type
+  lookup silently falls back to its text matchers. Either point it at `generateText(prompt, options)`
+  with a JSON schema once step 6 has settled that contract, or drop the AI tier.
 - **A structured-output (`response_format`/`format`) path for the chat transports** to match what
   Ollama already does. Would likely remove most of `responseParser`, but it is a behavior change
   needing its own validation against real providers.
@@ -499,10 +525,10 @@ carry no behavioral risk; the risk starts at step 4.
 
 ## Risks
 
-| Risk                                                                         | Mitigation                                                                                                                           |
-| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| OCR fallback silently stops working because an error phrase changed          | `llm-ocr-fallback-phrases` written in step 1, before any code moves                                                                  |
-| A caller reads a field that the unified `document` object no longer carries  | `llm-provider-parity` compares full objects; `server.js:766`, `mistralOcrService.js:988`, `routes/setup.js:3167` reviewed explicitly |
-| Ollama's token arithmetic subtly changes and long documents start truncating | `charBudget` keeps the `/2` divisor and the real `num_ctx` formula; `ollama-response-limit` and `ollama-token-metrics` guard it      |
-| No test exercises a real provider API                                        | Step 9 keeps a manual smoke run against at least one live provider in the acceptance criteria                                        |
-| The refactor lands as one unreviewable diff                                  | Steps 2-6 are individually green and individually landable                                                                           |
+| Risk                                                                         | Mitigation                                                                                                                            |
+| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| OCR fallback silently stops working because an error phrase changed          | `llm-ocr-fallback-phrases` written in step 1, before any code moves                                                                   |
+| A caller reads a field that the unified `document` object no longer carries  | `llm-provider-parity` compares full objects; `server.js:854`, `mistralOcrService.js:1027`, `routes/setup.js:3135` reviewed explicitly |
+| Ollama's token arithmetic subtly changes and long documents start truncating | `charBudget` keeps the `/2` divisor and the real `num_ctx` formula; `ollama-response-limit` and `ollama-token-metrics` guard it       |
+| No test exercises a real provider API                                        | Step 9 keeps a manual smoke run against at least one live provider in the acceptance criteria                                         |
+| The refactor lands as one unreviewable diff                                  | Steps 2-6 are individually green and individually landable                                                                            |
