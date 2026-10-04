@@ -1,4 +1,4 @@
-const { writePromptToFile, toNameList } = require('./serviceUtils');
+const { writePromptToFile } = require('./serviceUtils');
 const {
   abortSignal,
   abortedGenerationError,
@@ -14,7 +14,8 @@ const {
 const axios = require('axios');
 const config = require('../config/config');
 const { cacheThumbnail } = require('./thumbnailCache');
-const RestrictionPromptService = require('./restrictionPromptService');
+const { buildAnalysisPrompt } = require('./llm/promptBuilder');
+const { buildCustomFieldsBlock } = require('./llm/customFieldsTemplate');
 
 /**
  * Service for document analysis using Ollama
@@ -122,45 +123,8 @@ class OllamaService {
           options
         );
       } else {
-        // Parse CUSTOM_FIELDS for custom prompt
-        let customFieldsObj;
-        try {
-          customFieldsObj = JSON.parse(process.env.CUSTOM_FIELDS);
-        } catch (error) {
-          console.error(`Failed to parse CUSTOM_FIELDS: ${error.message}`);
-          console.debug(error);
-          customFieldsObj = { custom_fields: [] };
-        }
-
-        const customFieldsTemplate = {};
-        customFieldsObj.custom_fields.forEach((field, index) => {
-          let valueHint;
-          if (field.data_type === 'date') {
-            valueHint =
-              'Fill in the date in ISO 8601 format (YYYY-MM-DD) based on your analysis';
-          } else if (field.data_type === 'boolean') {
-            valueHint = "Fill in 'true' or 'false' based on your analysis";
-          } else {
-            valueHint = 'Fill in the value based on your analysis';
-          }
-          customFieldsTemplate[index] = {
-            field_name: field.value,
-            value: valueHint,
-          };
-        });
-
-        const customFieldsStr =
-          '"custom_fields": ' +
-          JSON.stringify(customFieldsTemplate, null, 2)
-            .split('\n')
-            .map((line) => '    ' + line)
-            .join('\n');
-
         promptPrefix =
-          customPrompt +
-          '\n\n' +
-          config.mustHavePrompt.replace('%CUSTOMFIELDS%', customFieldsStr) +
-          '\n\n';
+          buildAnalysisPrompt({ customPrompt }).systemPrompt + '\n\n';
         console.log('[DEBUG] Ollama Service started with custom prompt');
       }
 
@@ -335,84 +299,10 @@ class OllamaService {
     existingDocumentTypes = [],
     options = {}
   ) {
-    let systemPrompt;
-
     // Validate that existingCorrespondent is an array and handle if it's not
     const correspondentList = Array.isArray(existingCorrespondent)
       ? existingCorrespondent
       : [];
-
-    // Parse CUSTOM_FIELDS from environment variable
-    let customFieldsObj;
-    try {
-      customFieldsObj = JSON.parse(process.env.CUSTOM_FIELDS);
-    } catch (error) {
-      console.error(`Failed to parse CUSTOM_FIELDS: ${error.message}`);
-      console.debug(error);
-      customFieldsObj = { custom_fields: [] };
-    }
-
-    // Generate custom fields template for the prompt
-    const customFieldsTemplate = {};
-
-    customFieldsObj.custom_fields.forEach((field, index) => {
-      let valueHint;
-      if (field.data_type === 'date') {
-        valueHint =
-          'Fill in the date in ISO 8601 format (YYYY-MM-DD) based on your analysis';
-      } else if (field.data_type === 'boolean') {
-        valueHint = "Fill in 'true' or 'false' based on your analysis";
-      } else {
-        valueHint = 'Fill in the value based on your analysis';
-      }
-      customFieldsTemplate[index] = {
-        field_name: field.value,
-        value: valueHint,
-      };
-    });
-
-    // Convert template to string for replacement and wrap in custom_fields
-    const customFieldsStr =
-      '"custom_fields": ' +
-      JSON.stringify(customFieldsTemplate, null, 2)
-        .split('\n')
-        .map((line) => '    ' + line) // Add proper indentation
-        .join('\n');
-
-    // Get system prompt based on configuration
-    if (
-      config.useExistingData === 'yes' &&
-      config.restrictToExistingTags === 'no' &&
-      config.restrictToExistingCorrespondents === 'no'
-    ) {
-      // Format existing tags
-      const existingTagsList = toNameList(existingTags).join(', ');
-
-      // Format existing correspondents
-      const existingCorrespondentList =
-        toNameList(correspondentList).join(', ');
-
-      // Format existing document types
-      const existingDocumentTypesList = toNameList(existingDocumentTypes).join(
-        ', '
-      );
-
-      systemPrompt =
-        `
-            Pre-existing tags: ${existingTagsList}\n\n
-            Pre-existing correspondents: ${existingCorrespondentList}\n\n
-            Pre-existing document types: ${existingDocumentTypesList}\n\n
-            ` +
-        process.env.SYSTEM_PROMPT +
-        '\n\n' +
-        config.mustHavePrompt.replace('%CUSTOMFIELDS%', customFieldsStr);
-    } else {
-      const mustHavePrompt = config.mustHavePrompt.replace(
-        '%CUSTOMFIELDS%',
-        customFieldsStr
-      );
-      systemPrompt = process.env.SYSTEM_PROMPT + '\n\n' + mustHavePrompt;
-    }
 
     // Get validated external API data if available
     let validatedExternalApiData = null;
@@ -431,26 +321,12 @@ class OllamaService {
       }
     }
 
-    // Process placeholder replacements in system prompt
-    systemPrompt = RestrictionPromptService.processRestrictionsInPrompt(
-      systemPrompt,
+    const { systemPrompt } = buildAnalysisPrompt({
       existingTags,
-      correspondentList,
-      existingDocumentTypes,
-      config
-    );
-
-    // Include validated external API data if available
-    if (validatedExternalApiData) {
-      systemPrompt += `\n\nAdditional context from external API:\n${validatedExternalApiData}`;
-    }
-
-    if (process.env.USE_PROMPT_TAGS === 'yes') {
-      systemPrompt =
-        `
-            Take these tags and try to match one or more to the document content.\n\n
-            ` + config.specialPromptPreDefinedTags;
-    }
+      existingCorrespondentList: correspondentList,
+      existingDocumentTypesList: existingDocumentTypes,
+      externalApiData: validatedExternalApiData,
+    });
 
     return `${systemPrompt}
         ${JSON.stringify(content)}
@@ -463,7 +339,7 @@ class OllamaService {
    * @param {number} maxTokens - Maximum tokens allowed for external data (default: 500)
    * @returns {string} - Validated and potentially truncated data string
    */
-  async _validateAndTruncateExternalApiData(apiData, maxTokens = 500) {
+  _validateAndTruncateExternalApiData(apiData, maxTokens = 500) {
     if (!apiData) {
       return null;
     }
@@ -494,42 +370,7 @@ class OllamaService {
    * @returns {string} Custom fields template as a string
    */
   _generateCustomFieldsTemplate() {
-    let customFieldsObj;
-    try {
-      customFieldsObj = JSON.parse(process.env.CUSTOM_FIELDS);
-    } catch (error) {
-      console.error(`Failed to parse CUSTOM_FIELDS: ${error.message}`);
-      console.debug(error);
-      customFieldsObj = { custom_fields: [] };
-    }
-
-    // Generate custom fields template for the prompt
-    const customFieldsTemplate = {};
-
-    customFieldsObj.custom_fields.forEach((field, index) => {
-      let valueHint;
-      if (field.data_type === 'date') {
-        valueHint =
-          'Fill in the date in ISO 8601 format (YYYY-MM-DD) based on your analysis';
-      } else if (field.data_type === 'boolean') {
-        valueHint = "Fill in 'true' or 'false' based on your analysis";
-      } else {
-        valueHint = 'Fill in the value based on your analysis';
-      }
-      customFieldsTemplate[index] = {
-        field_name: field.value,
-        value: valueHint,
-      };
-    });
-
-    // Convert template to string for replacement and wrap in custom_fields
-    return (
-      '"custom_fields": ' +
-      JSON.stringify(customFieldsTemplate, null, 2)
-        .split('\n')
-        .map((line) => '    ' + line) // Add proper indentation
-        .join('\n')
-    );
+    return buildCustomFieldsBlock();
   }
 
   /**

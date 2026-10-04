@@ -466,9 +466,25 @@ carry no behavioral risk; the risk starts at step 4.
    are copied into the test rather than imported. Importing that list would make the test agree
    with whatever the source says, which is the opposite of pinning it.
 
-2. **Extract `customFieldsTemplate.js` and `promptBuilder.js`** with `llm-prompt-builder`, and have
-   all four existing services call them. Six duplicates become one; no other behavior changes.
-   `prompt-existing-data-serialization` and the restriction tests are the guard.
+2. ~~**Extract `customFieldsTemplate.js` and `promptBuilder.js`**~~ **Done.**
+   `services/llm/customFieldsTemplate.js` (`buildCustomFieldsBlock()`) and
+   `services/llm/promptBuilder.js` (`buildAnalysisPrompt()` → `{ systemPrompt, promptTags }`) replace
+   the six copies. `llm-prompt-builder` (27 cases) pins the cascade and checks that every provider
+   sends what the builder built. `ollamaService._buildPrompt()` stays as a thin wrapper, because
+   `prompt-existing-data-serialization` and `restricted-document-types-placeholder` call it.
+
+   Verified by recording the requests of all four providers for eight prompt scenarios before and
+   after: the 24 requests of openai/azure/custom are byte-identical. Ollama differs in two
+   deliberate ways. Its two fixed text blocks are now indented with 8 spaces instead of 12, like
+   the other three; the wording is unchanged. And it sends the external API data instead of
+   `[object Promise]`: its `_validateAndTruncateExternalApiData()` was `async` but never awaited
+   by either caller. It awaited nothing itself, so it is synchronous now.
+
+   Not changed on purpose: a `CUSTOM_FIELDS` that parses but has no `custom_fields` array still
+   throws inside `buildCustomFieldsBlock()` (and so fails the analysis), as all six copies did.
+   Ollama still ignores `PROMPT_TAGS` as user content; the chat providers only use it for the
+   token count.
+
 3. **Extract `responseParser.js`** (custom's brace matcher + `<think>` stripping + Ollama's sanitize
    fallback + Ollama's object passthrough) with `llm-response-parser`, and route all four services
    through it. Resolves Finding 7d.

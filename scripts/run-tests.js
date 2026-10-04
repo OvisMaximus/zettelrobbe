@@ -99,6 +99,7 @@ const TESTS = {
     'test-custom-field-monetary-normalization.js',
   'llm-analysis-result-contract': 'test-llm-analysis-result-contract.js',
   'llm-ocr-fallback-phrases': 'test-llm-ocr-fallback-phrases.js',
+  'llm-prompt-builder': 'test-llm-prompt-builder.js',
   'custom-field-longtext': 'test-custom-field-longtext.js',
   'document-processing-service': 'test-document-processing-service.js',
   'settings-custom-field-type-conflict':
@@ -243,6 +244,7 @@ const AREAS = {
     'updated-service',
     'prompt-existing-data-serialization',
     'restricted-document-types-placeholder',
+    'llm-prompt-builder',
     'token-limit-config',
     'truncate-returns-string',
   ],

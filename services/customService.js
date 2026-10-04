@@ -6,7 +6,6 @@ const {
   assertCompletionNotTruncated,
   isTimeoutError,
   buildTimeoutErrorMessage,
-  toNameList,
 } = require('./serviceUtils');
 const {
   abortSignal,
@@ -27,7 +26,7 @@ const config = require('../config/config');
 const fs = require('fs').promises;
 const path = require('path');
 const { cacheThumbnail } = require('./thumbnailCache');
-const RestrictionPromptService = require('./restrictionPromptService');
+const { buildAnalysisPrompt } = require('./llm/promptBuilder');
 const responseLogPath = path.join(
   process.cwd(),
   'data',
@@ -182,15 +181,6 @@ class CustomOpenAIService {
       // Cache the thumbnail for the UI; never let it affect the analysis.
       await cacheThumbnail(id);
 
-      // Format existing data - callers may hand over entity objects or plain names
-      const existingTagNames = toNameList(existingTags).join(', ');
-      const existingCorrespondentNames = toNameList(
-        existingCorrespondentList
-      ).join(', ');
-      const existingDocumentTypeNames = toNameList(
-        existingDocumentTypesList
-      ).join(', ');
-
       // Get external API data if available and validate it
       let externalApiData = options.externalApiData || null;
       let validatedExternalApiData = null;
@@ -209,100 +199,16 @@ class CustomOpenAIService {
         }
       }
 
-      let systemPrompt = '';
-      let promptTags = '';
       const model = config.custom.model;
-
-      // Parse CUSTOM_FIELDS from environment variable
-      let customFieldsObj;
-      try {
-        customFieldsObj = JSON.parse(process.env.CUSTOM_FIELDS);
-      } catch (error) {
-        console.error(`Failed to parse CUSTOM_FIELDS: ${error.message}`);
-        console.debug(error);
-        customFieldsObj = { custom_fields: [] };
-      }
-
-      // Generate custom fields template for the prompt
-      const customFieldsTemplate = {};
-
-      customFieldsObj.custom_fields.forEach((field, index) => {
-        let valueHint;
-        if (field.data_type === 'date') {
-          valueHint =
-            'Fill in the date in ISO 8601 format (YYYY-MM-DD) based on your analysis';
-        } else if (field.data_type === 'boolean') {
-          valueHint = "Fill in 'true' or 'false' based on your analysis";
-        } else {
-          valueHint = 'Fill in the value based on your analysis';
-        }
-        customFieldsTemplate[index] = {
-          field_name: field.value,
-          value: valueHint,
-        };
-      });
-
-      // Convert template to string for replacement and wrap in custom_fields
-      const customFieldsStr =
-        '"custom_fields": ' +
-        JSON.stringify(customFieldsTemplate, null, 2)
-          .split('\n')
-          .map((line) => '    ' + line) // Add proper indentation
-          .join('\n');
-
-      // Get system prompt based on configuration
-      if (
-        config.useExistingData === 'yes' &&
-        config.restrictToExistingTags === 'no' &&
-        config.restrictToExistingCorrespondents === 'no'
-      ) {
-        systemPrompt =
-          `
-        Pre-existing tags: ${existingTagNames}\n\n
-        Pre-existing correspondents: ${existingCorrespondentNames}\n\n
-        Pre-existing document types: ${existingDocumentTypeNames}\n\n
-        ` +
-          process.env.SYSTEM_PROMPT +
-          '\n\n' +
-          config.mustHavePrompt.replace('%CUSTOMFIELDS%', customFieldsStr);
-        promptTags = '';
-      } else {
-        const mustHavePrompt = config.mustHavePrompt.replace(
-          '%CUSTOMFIELDS%',
-          customFieldsStr
-        );
-        systemPrompt = process.env.SYSTEM_PROMPT + '\n\n' + mustHavePrompt;
-        promptTags = '';
-      }
-
-      // Process placeholder replacements in system prompt
-      systemPrompt = RestrictionPromptService.processRestrictionsInPrompt(
-        systemPrompt,
+      const { systemPrompt, promptTags } = buildAnalysisPrompt({
         existingTags,
         existingCorrespondentList,
-        existingDocumentTypesList
-      );
-
-      // Include validated external API data if available
-      if (validatedExternalApiData) {
-        systemPrompt += `\n\nAdditional context from external API:\n${validatedExternalApiData}`;
-      }
-
-      if (process.env.USE_PROMPT_TAGS === 'yes') {
-        promptTags = process.env.PROMPT_TAGS;
-        systemPrompt =
-          `
-        Take these tags and try to match one or more to the document content.\n\n
-        ` + config.specialPromptPreDefinedTags;
-      }
-
-      // Custom prompt override if provided
+        existingDocumentTypesList,
+        externalApiData: validatedExternalApiData,
+        customPrompt,
+      });
       if (customPrompt) {
         console.log('[DEBUG] Replace system prompt with custom prompt');
-        systemPrompt =
-          customPrompt +
-          '\n\n' +
-          config.mustHavePrompt.replace('%CUSTOMFIELDS%', customFieldsStr);
       }
 
       // Calculate tokens AFTER all prompt modifications are complete
@@ -351,8 +257,6 @@ class CustomOpenAIService {
       // console.log(`[DEBUG] Prompt tags: ${promptTags}`);
       // console.log(`[DEBUG] Model: ${model}`);
       // console.log(`[DEBUG] Custom fields: ${customFieldsStr}`);
-      // console.log(`[DEBUG] Existing tags: ${existingTagNames}`);
-      // console.log(`[DEBUG] Existing correspondents: ${existingCorrespondentNames}`);
       // console.log(`[DEBUG] Custom prompt: ${customPrompt}`);
       // console.log(`[DEBUG] External API data: ${validatedExternalApiData}`);
       // console.log('######################################################################');
