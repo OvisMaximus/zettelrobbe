@@ -382,12 +382,21 @@ class CustomOpenAIService {
       const message = response?.choices?.[0]?.message;
       let jsonContent = extractChatMessageContent(message, 'Custom OpenAI');
       if (!jsonContent) {
-        if(!response) throw new Error (`API response is empty.`);
-        if(!response.choices) throw new Error (`API response is missing choices.`);
-        if(!response.choices[0]) throw new Error (`API response is missing choices[0].`);
-        if(!response.choices[0].message) throw new Error (`API response is missing choices[0].message.`);
-        if(!response.choices[0].message.content) throw new Error (`API response is missing choices[0].message.content.`);
-        throw new Error(`Invalid API response structure: ${message?.content}`);
+        // Every message keeps the "Invalid API response structure" prefix:
+        // shouldQueueForOcrOnAiError() matches on that phrase, and without it
+        // the document no longer reaches the OCR fallback.
+        const missing = !response
+          ? 'the response is empty'
+          : !response.choices
+            ? 'missing choices'
+            : !response.choices[0]
+              ? 'missing choices[0]'
+              : !response.choices[0].message
+                ? 'missing choices[0].message'
+                : !response.choices[0].message.content
+                  ? 'missing choices[0].message.content'
+                  : `unusable content ${message?.content}`;
+        throw new Error(`Invalid API response structure: ${missing}.`);
       }
 
       // Log token usage
