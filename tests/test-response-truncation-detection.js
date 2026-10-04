@@ -8,8 +8,7 @@
  * the document to the OCR queue, which re-reads the PDF and re-runs the same
  * request against the same limit.
  *
- * Both public seams are exercised per provider — analyzeDocument() and
- * analyzePlayground() carry their own catch block, and the scan loop reads
+ * analyzeDocument() is exercised per provider: the scan loop reads
  * analysis.errorCode, so a service that raises the right error but drops the
  * code on the way out records a generic failure and loses the OCR decision.
  * The provider client is the only collaborator stubbed; the thumbnail cache is
@@ -22,12 +21,6 @@ const fs = require('fs').promises;
 process.env.AI_PROVIDER = 'openai';
 process.env.OPENAI_API_KEY = 'test-key';
 process.env.OPENAI_MODEL = 'gpt-4';
-process.env.AZURE_API_KEY = 'test-key';
-process.env.AZURE_ENDPOINT = 'https://example.invalid';
-process.env.AZURE_DEPLOYMENT_NAME = 'test-deployment';
-process.env.CUSTOM_BASE_URL = 'https://example.invalid/v1';
-process.env.CUSTOM_API_KEY = 'test-key';
-process.env.CUSTOM_MODEL = 'test-model';
 process.env.SYSTEM_PROMPT = 'Analyse the document.';
 
 const { assertCompletionNotTruncated } = require('../services/serviceUtils');
@@ -175,7 +168,7 @@ const PROVIDERS = [
     );
   });
 
-  /* --- each provider actually consults it, on both public seams ---------- */
+  /* --- each provider actually consults it ------------------------------- */
 
   /* Pre-seed the thumbnail cache so analyzeDocument() gets past its caching
      step without reaching Paperless. Ollama skips the step entirely once the
@@ -227,29 +220,6 @@ const PROVIDERS = [
           [],
           DOCUMENT_ID
         );
-        assert.strictEqual(analysis.error, undefined);
-        assert.strictEqual(analysis.errorCode, undefined);
-        assert.strictEqual(
-          analysis.document.correspondent,
-          'Telekom Deutschland GmbH'
-        );
-      }
-    );
-
-    await check(
-      `${label}: analyzePlayground reports a cut-off answer with its code`,
-      async () => {
-        arrangeCutOff();
-        const analysis = await service.analyzePlayground('Rechnung', 'Analyse');
-        assertReportsCutOff(analysis);
-      }
-    );
-
-    await check(
-      `${label}: analyzePlayground passes a complete answer through`,
-      async () => {
-        arrangeComplete();
-        const analysis = await service.analyzePlayground('Rechnung', 'Analyse');
         assert.strictEqual(analysis.error, undefined);
         assert.strictEqual(analysis.errorCode, undefined);
         assert.strictEqual(

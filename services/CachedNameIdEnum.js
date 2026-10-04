@@ -358,6 +358,14 @@ class CachedNameIdEnum {
     }
   }
 
+  /**
+   * Drop the cached elements without reading the server; the next access
+   * refills the cache.
+   */
+  invalidate() {
+    this._clear();
+  }
+
   async visitAllContainedElements(client, visitor) {
     this._checkClient(client);
     await this._check_cache_is_not_outdated(client);

@@ -12,12 +12,8 @@ const PaperlessService = require('./paperlessService');
 const popplerService = require('./popplerService');
 const documentModel = require('../models/document');
 const AIServiceFactory = require('./aiServiceFactory');
+const documentProcessingService = require('./documentProcessingService');
 const { isTimeoutError, buildTimeoutErrorMessage } = require('./serviceUtils');
-const {
-  updateCustomFieldsData,
-  updateDocumentTypeData,
-  updateCorrespondentData
-} = require('./dataProcessingUtils');
 
 class MistralOcrService {
   constructor() {
@@ -1002,8 +998,8 @@ class MistralOcrService {
 
   /**
    * Run AI analysis on a document using OCR text (instead of Paperless content).
-   * Mirrors the processDocument / buildUpdateData / saveDocumentChanges flow
-   * from server.js but accepts pre-extracted text.
+   * Mirrors processDocument from server.js but accepts pre-extracted text;
+   * the write-back is the same documentProcessingService the scan uses.
    * @private
    */
   async _runAiAnalysis(documentId, ocrText) {
@@ -1040,89 +1036,18 @@ class MistralOcrService {
       throw new Error(analysis.error);
     }
 
-    const updateData = {};
-
-    const config = require('../config/config');
-    const options = {
-      restrictToExistingTags: config.restrictToExistingTags === 'yes',
-      restrictToExistingCorrespondents:
-        config.restrictToExistingCorrespondents === 'yes',
-      restrictToExistingDocumentTypes:
-        config.restrictToExistingDocumentTypes === 'yes',
-    };
-
-    await this.calculateNewDocumentMetadata(config, analysis, options, updateData, originalData);
-
-    // Apply updates to Paperless
-    const updatedDocument = await PaperlessService.updateDocument(
-      documentId,
-      updateData
+    const updateData = await documentProcessingService.buildUpdateData(
+      analysis,
+      originalData
     );
-    if (!updatedDocument) {
-      throw new Error(`Paperless update failed for document ${documentId}`);
-    }
-
-    const currentCorrespondentId = updatedDocument.correspondent ?? updateData.correspondent;
-    const currentCorrespondent = currentCorrespondentId
-      ? await PaperlessService.getCorrespondentNameById(currentCorrespondentId)
-      : null;
-    const currentDocumentTypeId = updatedDocument.document_type ?? updateData.document_type;
-    const currentDocumentType = currentDocumentTypeId
-      ? await PaperlessService.getDocumentTypeNameById(currentDocumentTypeId)
-      : null;
-
-    // Persist metrics & history
-    if (analysis.metrics) {
-      await documentModel.addOpenAIMetrics(
-        documentId,
-        analysis.metrics.promptTokens,
-        analysis.metrics.completionTokens,
-        analysis.metrics.totalTokens
-      );
-    }
-    await documentModel.addProcessedDocument(
+    await documentProcessingService.saveDocumentChanges(
       documentId,
-      updateData.title || originalData.title
-    );
-    await documentModel.addToHistory(
-      documentId,
-      updateData.tags || [],
-      updateData.title || originalData.title,
-      currentCorrespondent?.name ?? null,
-      null,
-      currentDocumentType?.name ?? null,
-      analysis.document.language || null
+      updateData,
+      analysis,
+      originalData
     );
 
     return analysis;
-  }
-
-
-  async calculateNewDocumentMetadata(config, analysis, options,
-                                     updateData, originalData) {
-    if (config.limitFunctions?.activateTagging !== 'no') {
-      const { tagIds } = await PaperlessService.processTags(
-        analysis.document.tags,
-        options
-      );
-      updateData.tags = tagIds;
-    }
-    if (config.limitFunctions?.activateTitle !== 'no') {
-      updateData.title = analysis.document.title || originalData.title;
-    }
-
-    await updateDocumentTypeData(analysis,
-      updateData, config, PaperlessService, options);
-    await updateCorrespondentData(analysis,
-      updateData, config, PaperlessService, options);
-    await updateCustomFieldsData(analysis,
-      originalData, updateData, config, PaperlessService);
-
-    updateData.created =
-      analysis.document.document_date || originalData.created;
-
-    updateData.language =
-      analysis.document.language || updateData.language;
   }
 }
 

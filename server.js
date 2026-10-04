@@ -14,9 +14,12 @@ const setupRoutes = require('./routes/setup');
 const { isAuthenticated } = require('./routes/auth');
 const mistralOcrService = require('./services/mistralOcrService');
 const ocrAutoProcessService = require('./services/ocrAutoProcessService');
+const duplicateReviewJobService = require('./services/duplicateReviewJobService');
+const duplicateMergeService = require('./services/duplicateMergeService');
 const reconciliationService = require('./services/reconciliationService');
 const scanHealthService = require('./services/scanHealthService');
 const dashboardStatsService = require('./services/dashboardStatsService');
+const documentProcessingService = require('./services/documentProcessingService');
 const { RUN_STATUS } = scanHealthService;
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
@@ -26,7 +29,6 @@ const { ipKeyGenerator } = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const Logger = require('./services/loggerService');
 const {
-  validateCustomFieldValue,
   shouldQueueForOcrOnAiError,
   classifyOcrQueueReasonFromAiError,
   isTimeoutError,
@@ -96,6 +98,25 @@ async function triggerScanNow(source = 'manual') {
       started: false,
       running: false,
       message: 'OCR auto-processing is currently running.',
+    };
+  }
+
+  // The Duplicates and Simplify pages write tags too; the scan loop itself
+  // stands down for them, and the button is told why nothing started.
+  if (duplicateReviewJobService.isRunning()) {
+    return {
+      started: false,
+      running: false,
+      message:
+        'A Duplicates or Simplify job is running. Try again when it has finished.',
+    };
+  }
+  if (duplicateMergeService.isWriting()) {
+    return {
+      started: false,
+      running: false,
+      message:
+        'A merge, undo or delete is being written. Try again in a moment.',
     };
   }
 
@@ -903,260 +924,6 @@ async function processDocument(
   return { analysis, originalData };
 }
 
-async function buildUpdateData(analysis, doc) {
-  const updateData = {};
-  const options = {
-    restrictToExistingTags: config.restrictToExistingTags === 'yes',
-    restrictToExistingCorrespondents:
-      config.restrictToExistingCorrespondents === 'yes',
-    restrictToExistingDocumentTypes:
-      config.restrictToExistingDocumentTypes === 'yes',
-  };
-
-  // Only process tags if tagging is activated
-  if (config.limitFunctions?.activateTagging !== 'no') {
-    const { tagIds, errors } = await paperlessService.processTags(
-      analysis.document.tags,
-      options
-    );
-    if (errors.length > 0) {
-      console.warn('[ERROR] Some tags could not be processed:', errors);
-    }
-    updateData.tags = tagIds;
-  } else if (
-    config.limitFunctions?.activateTagging === 'no' &&
-    config.addAIProcessedTag === 'yes'
-  ) {
-    // Add AI processed tags to the document (processTags function awaits a tags array)
-    // get tags from .env file and split them by comma and make an array
-    console.debug(
-      'Tagging is deactivated but the AI processed tag will still be added'
-    );
-    const tags = config.addAIProcessedTags.split(',');
-    const { tagIds, errors } = await paperlessService.processTags(
-      tags,
-      options
-    );
-    if (errors.length > 0) {
-      console.warn('[ERROR] Some tags could not be processed:', errors);
-    }
-    updateData.tags = tagIds;
-    console.debug('Tagging is deactivated');
-  }
-
-  // Only process title if title generation is activated
-  if (config.limitFunctions?.activateTitle !== 'no') {
-    updateData.title = analysis.document.title || doc.title;
-  }
-
-  // Add created date regardless of settings as it's a core field
-  updateData.created = analysis.document.document_date || doc.created;
-
-  // Only process document type if document type classification is activated
-  if (
-    config.limitFunctions?.activateDocumentType !== 'no' &&
-    analysis.document.document_type
-  ) {
-    try {
-      const documentType = await paperlessService.getOrCreateDocumentType(
-        analysis.document.document_type,
-        options
-      );
-      if (documentType) {
-        updateData.document_type = documentType.id;
-      }
-    } catch (error) {
-      console.error(`[ERROR] Error processing document type: ${error.message}`);
-      console.debug(error);
-    }
-  }
-
-  // Only process custom fields if custom fields detection is activated
-  if (
-    config.limitFunctions?.activateCustomFields !== 'no' &&
-    analysis.document.custom_fields
-  ) {
-    const customFields = analysis.document.custom_fields;
-    const processedFields = [];
-    const customFieldsForHistory = [];
-
-    // Get existing custom fields
-    const existingFields = await paperlessService.getExistingCustomFields(
-      doc.id
-    );
-    console.debug('Found existing fields:', existingFields);
-
-    // Keep track of which fields we've processed to avoid duplicates
-    const processedFieldIds = new Set();
-
-    // First, add any new/updated fields
-    for (const key in customFields) {
-      const customField = customFields[key];
-
-      if (
-        !customField.field_name ||
-        customField.value === null ||
-        customField.value === undefined ||
-        String(customField.value).trim() === ''
-      ) {
-        console.debug('Skipping empty or invalid custom field');
-        continue;
-      }
-
-      const fieldDetails = await paperlessService.findExistingCustomField(
-        customField.field_name
-      );
-      if (fieldDetails?.id) {
-        const validation = validateCustomFieldValue(
-          customField.field_name,
-          customField.value,
-          fieldDetails.data_type
-        );
-        if (validation.skip) {
-          if (validation.warn) console.warn(validation.warn);
-          continue;
-        }
-        processedFields.push({
-          field: fieldDetails.id,
-          value: validation.value,
-        });
-        // Capture name + validated value for history at the point where we have both
-        customFieldsForHistory.push({
-          field_name: customField.field_name,
-          value: validation.value,
-        });
-        processedFieldIds.add(fieldDetails.id);
-      }
-    }
-
-    // Then add any existing fields that weren't updated
-    for (const existingField of existingFields) {
-      if (!processedFieldIds.has(existingField.field)) {
-        processedFields.push(existingField);
-      }
-    }
-
-    if (processedFields.length > 0) {
-      updateData.custom_fields = processedFields;
-    }
-    if (customFieldsForHistory.length > 0) {
-      updateData._customFieldsForHistory = customFieldsForHistory;
-    }
-  }
-
-  // Only process correspondent if correspondent detection is activated
-  if (
-    config.limitFunctions?.activateCorrespondents !== 'no' &&
-    analysis.document.correspondent
-  ) {
-    try {
-      const correspondent = await paperlessService.getOrCreateCorrespondent(
-        analysis.document.correspondent,
-        options
-      );
-      if (correspondent) {
-        updateData.correspondent = correspondent.id;
-      }
-    } catch (error) {
-      console.error(`[ERROR] Error processing correspondent: ${error.message}`);
-      console.debug(error);
-    }
-  }
-
-  // Always include language if provided as it's a core field
-  if (analysis.document.language) {
-    updateData.language = analysis.document.language;
-  }
-
-  return updateData;
-}
-
-async function saveDocumentChanges(docId, updateData, analysis, originalData) {
-  const {
-    tags: originalTags,
-    correspondent: originalCorrespondent,
-    title: originalTitle,
-  } = originalData;
-
-  // Pull out history-only data and remove it before sending updateData to Paperless
-  const historyCustomFields = updateData._customFieldsForHistory || null;
-  delete updateData._customFieldsForHistory;
-
-  const historyDocTypeName = analysis.document.document_type ?? null;
-  const historyLanguage = analysis.document.language ?? null;
-  const origDocType = originalData.document_type ?? null;
-  const origLanguage = originalData.language ?? null;
-
-  // Predefined-scan trigger tags have done their job once the document has
-  // been processed; leaving them in place would make the next scan re-run
-  // the document forever. Removal only happens when the operator opts in.
-  if (
-    config.predefinedMode === 'yes' &&
-    config.removeTriggerTags === 'yes' &&
-    Array.isArray(updateData.tags)
-  ) {
-    try {
-      const triggerNames = (process.env.TAGS || '')
-        .split(',')
-        .map((tag) => tag.trim())
-        .filter(Boolean);
-      if (triggerNames.length > 0) {
-        updateData.removeTagIds = await paperlessService.resolveTagIdsByName(
-          triggerNames
-        );
-      }
-    } catch (error) {
-      console.warn(
-        `[WARN] Could not resolve trigger tags for removal on document ${docId}:`,
-        error.message
-      );
-    }
-  }
-
-  await documentModel.saveOriginalData(
-    docId,
-    originalTags,
-    originalCorrespondent,
-    originalTitle,
-    origDocType,
-    origLanguage
-  );
-
-  const updatedDocument = await paperlessService.updateDocument(
-    docId,
-    updateData
-  );
-  if (!updatedDocument) {
-    throw new Error(`Paperless update failed for document ${docId}`);
-  }
-
-  const persistenceTasks = [
-    documentModel.addProcessedDocument(docId, updateData.title),
-    documentModel.addToHistory(
-      docId,
-      updateData.tags,
-      updateData.title,
-      analysis.document.correspondent,
-      historyCustomFields,
-      historyDocTypeName,
-      historyLanguage
-    ),
-  ];
-
-  if (analysis.metrics) {
-    persistenceTasks.push(
-      documentModel.addOpenAIMetrics(
-        docId,
-        analysis.metrics.promptTokens,
-        analysis.metrics.completionTokens,
-        analysis.metrics.totalTokens
-      )
-    );
-  }
-
-  await Promise.all(persistenceTasks);
-}
-
 // Main scanning function
 // The initial scan runs through here as well (source='initial') so it shares the
 // concurrency guard, the stop support and the health reporting below.
@@ -1173,6 +940,23 @@ async function scanDocuments(source = 'scheduler') {
   if (ocrAutoProcessService.running) {
     console.info(
       'Scan request ignored because OCR auto-processing is currently running'
+    );
+    return;
+  }
+
+  // The Duplicates and Simplify pages write tags too: their jobs wait for a
+  // running scan, and a scan waits for them, because a scan that tags
+  // documents while a merge deletes tags is how a document ends up with an
+  // id that no longer exists. A merge, undo or delete made by hand counts
+  // as well; it is over in seconds and the next tick catches up.
+  const busy = duplicateReviewJobService.isRunning()
+    ? 'a Duplicates or Simplify job is running'
+    : duplicateMergeService.isWriting()
+      ? 'a merge, undo or delete is being written'
+      : null;
+  if (busy) {
+    console.info(
+      `Scan request ignored because ${busy}; the next scheduled scan tries again`
     );
     return;
   }
@@ -1279,8 +1063,16 @@ async function scanDocuments(source = 'scheduler') {
         }
 
         const { analysis, originalData } = result;
-        const updateData = await buildUpdateData(analysis, doc);
-        await saveDocumentChanges(doc.id, updateData, analysis, originalData);
+        const updateData = await documentProcessingService.buildUpdateData(
+          analysis,
+          doc
+        );
+        await documentProcessingService.saveDocumentChanges(
+          doc.id,
+          updateData,
+          analysis,
+          originalData
+        );
         await documentModel.setProcessingStatus(doc.id, doc.title, 'complete');
         scanStats.processed += 1;
         // The document counters and token figures just changed. Marking the
