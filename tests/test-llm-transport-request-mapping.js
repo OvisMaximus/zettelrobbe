@@ -570,6 +570,309 @@ const ANALYSIS_REQUEST = {
     }
   );
 
+  /* --- generateText(): the shared half in the transport (step 5b) ---------- */
+
+  const generationTransport = (respond, generation = {}) => {
+    const requests = [];
+    const calls = [];
+    const transport = new ChatCompletionsTransport({
+      label: 'Fake',
+      createClient: () => ({
+        chat: {
+          completions: {
+            create: async (request, requestOptions) => {
+              requests.push(request);
+              calls.push(requestOptions);
+              return respond(request);
+            },
+          },
+        },
+      }),
+      generation: {
+        notReadyMessage: 'Fake client not initialized - missing API key',
+        remedy: 'Raise Response Tokens (RESPONSE_TOKENS).',
+        buildRequest: async (prompt) => ({
+          model: 'fake-model',
+          messages: [{ role: 'user', content: prompt }],
+          temperature: 0.7,
+        }),
+        ...generation,
+      },
+    });
+    return { transport, requests, calls };
+  };
+
+  await check('chat generate: sends what the provider built', async () => {
+    const { transport, requests, calls } = generationTransport(async () =>
+      completion('<think>hm</think>The answer.')
+    );
+    const text = await transport.generate('hello');
+    assert.strictEqual(text, 'The answer.');
+    assert.deepStrictEqual(requests, [
+      {
+        model: 'fake-model',
+        messages: [{ role: 'user', content: 'hello' }],
+        temperature: 0.7,
+      },
+    ]);
+    assert.deepStrictEqual(calls, [undefined], 'no request options');
+    assert.deepStrictEqual(transport.lastGenerateTextUsage, {
+      promptTokens: 9,
+      completionTokens: 3,
+      totalTokens: 12,
+      reasoningTokens: null,
+    });
+  });
+
+  await check(
+    'chat generate: a signal rides in the request options',
+    async () => {
+      const { transport, calls } = generationTransport(async () =>
+        completion('ok')
+      );
+      const controller = new AbortController();
+      await transport.generate('hello', { signal: controller.signal });
+      assert.deepStrictEqual(calls, [{ signal: controller.signal }]);
+    }
+  );
+
+  await check('chat generate: not ready names the provider', async () => {
+    const transport = new ChatCompletionsTransport({
+      label: 'Fake',
+      createClient: () => null,
+      generation: {
+        notReadyMessage: 'Fake client not initialized - missing API key',
+        buildRequest: async () => ({}),
+      },
+    });
+    await assert.rejects(
+      () => transport.generate('hello'),
+      (error) =>
+        error.message === 'Fake client not initialized - missing API key'
+    );
+  });
+
+  await check(
+    'chat generate: no text is "Invalid API response structure"',
+    async () => {
+      const { transport } = generationTransport(async () => completion(''));
+      await assert.rejects(
+        () => transport.generate('hello'),
+        (error) => error.message === 'Invalid API response structure'
+      );
+    }
+  );
+
+  await check(
+    'chat generate: a provider may describe the empty answer',
+    async () => {
+      const { transport } = generationTransport(async () => completion(''), {
+        describeEmptyText: () => 'Invalid API response structure: empty.',
+      });
+      await assert.rejects(
+        () => transport.generate('hello'),
+        (error) => error.message === 'Invalid API response structure: empty.'
+      );
+    }
+  );
+
+  await check('chat generate: a cut-off answer keeps its prefix', async () => {
+    const { transport } = generationTransport(async () =>
+      completion('Half an ans', 'length')
+    );
+    await assert.rejects(
+      () => transport.generate('hello'),
+      (error) =>
+        error.code === 'ai_response_truncated' &&
+        error.partialText === 'Half an ans' &&
+        /Raise Response Tokens/.test(error.message)
+    );
+  });
+
+  await check(
+    'ollama generate: maps the request onto /api/generate',
+    async () => {
+      const posts = [];
+      const previousThink = config.ollama.think;
+      config.ollama.think = false;
+      let text;
+      try {
+        text = await ollamaTransport(
+          [{ data: ollamaData({ response: '<think>x</think> Hi there. ' }) }],
+          posts
+        ).generate('hello', {}, { responseTokens: 300, numCtx: 2048 });
+      } finally {
+        config.ollama.think = previousThink;
+      }
+      assert.strictEqual(text, 'Hi there.');
+      assert.deepStrictEqual(posts[0].body, {
+        model: 'llama3',
+        prompt: 'hello',
+        system:
+          "You are a helpful assistant. Generate a clear, concise, and informative response to the user's question or request.",
+        stream: false,
+        options: {
+          temperature: config.aiTemperatureGeneration,
+          top_p: 0.9,
+          num_predict: 300,
+          num_ctx: 2048,
+        },
+        think: false,
+      });
+    }
+  );
+
+  await check(
+    'ollama generate: options override model, system, temperature, think',
+    async () => {
+      const posts = [];
+      await ollamaTransport(
+        [{ data: ollamaData({ response: 'ok' }) }],
+        posts
+      ).generate(
+        'hello',
+        {
+          model: 'judge',
+          systemPrompt: 'Be brief.',
+          temperature: 0,
+          reasoning: true,
+        },
+        { responseTokens: 300, numCtx: 2048 }
+      );
+      const { body } = posts[0];
+      assert.strictEqual(body.model, 'judge');
+      assert.strictEqual(body.system, 'Be brief.');
+      assert.strictEqual(body.options.temperature, 0);
+      assert.strictEqual(body.think, true);
+    }
+  );
+
+  await check('ollama generate: records the usage it was told', async () => {
+    const transport = ollamaTransport(
+      [{ data: ollamaData({ response: 'ok' }) }],
+      []
+    );
+    await transport.generate(
+      'hello',
+      {},
+      { responseTokens: 300, numCtx: 2048 }
+    );
+    assert.deepStrictEqual(transport.lastGenerateTextUsage, {
+      promptTokens: 9,
+      completionTokens: 3,
+      totalTokens: 12,
+    });
+  });
+
+  await check(
+    'ollama generate: a signal rides in the axios config',
+    async () => {
+      const posts = [];
+      const controller = new AbortController();
+      await ollamaTransport(
+        [{ data: ollamaData({ response: 'ok' }) }],
+        posts
+      ).generate(
+        'hello',
+        { signal: controller.signal },
+        { responseTokens: 300, numCtx: 2048 }
+      );
+      assert.strictEqual(posts[0].requestConfig.signal, controller.signal);
+    }
+  );
+
+  await check(
+    'ollama generate: reasoning false overrules OLLAMA_THINK',
+    async () => {
+      const posts = [];
+      const previousThink = config.ollama.think;
+      config.ollama.think = true;
+      try {
+        await ollamaTransport(
+          [{ data: ollamaData({ response: 'ok' }) }],
+          posts
+        ).generate(
+          'hello',
+          { reasoning: false },
+          { responseTokens: 300, numCtx: 2048 }
+        );
+      } finally {
+        config.ollama.think = previousThink;
+      }
+      assert.strictEqual(posts[0].body.think, false);
+    }
+  );
+
+  await check(
+    'Custom: an empty generated answer says what came back',
+    async () => {
+      customService.client = fakeChatClient([], async () =>
+        completion('', 'stop')
+      );
+      await assert.rejects(
+        () => customService.generateText('hello'),
+        (error) =>
+          error.message.startsWith(
+            'Invalid API response structure: the answer carried no text (finish_reason stop; the response begins {"choices"'
+          )
+      );
+    }
+  );
+
+  /* --- every provider's generateText() goes through its transport ---------- */
+
+  for (const [label, service] of [
+    ['OpenAI', openaiService],
+    ['Azure', azureService],
+    ['Custom', customService],
+    ['Ollama', ollamaService],
+  ]) {
+    await check(
+      `${label}: generateText() is the transport's generate()`,
+      async () => {
+        const original = service.transport.generate;
+        const seen = [];
+        service.transport.generate = async function (...args) {
+          seen.push(args);
+          this.lastGenerateTextUsage = { totalTokens: 42 };
+          return 'from the transport';
+        };
+        try {
+          const text = await service.generateText('hello', { temperature: 0 });
+          assert.strictEqual(text, 'from the transport');
+          assert.strictEqual(seen.length, 1);
+          assert.strictEqual(seen[0][0], 'hello');
+          assert.deepStrictEqual(seen[0][1], { temperature: 0 });
+          assert.deepStrictEqual(service.lastGenerateTextUsage, {
+            totalTokens: 42,
+          });
+        } finally {
+          service.transport.generate = original;
+        }
+      }
+    );
+  }
+
+  await check(
+    "Ollama: generateText() hands the service's numbers on",
+    async () => {
+      const original = ollamaService.transport.generate;
+      let budget;
+      ollamaService.transport.generate = async (prompt, options, numbers) => {
+        budget = numbers;
+        return 'ok';
+      };
+      try {
+        Object.assign(config, { tokenLimit: 1000, responseTokens: 400 });
+        await ollamaService.generateText('x'.repeat(2000), { maxTokens: 250 });
+      } finally {
+        ollamaService.transport.generate = original;
+        Object.assign(config, { tokenLimit: 128000, responseTokens: 1000 });
+      }
+      assert.deepStrictEqual(budget, { responseTokens: 250, numCtx: 1000 });
+    }
+  );
+
   await fs.rm(getThumbnailCachePath(DOCUMENT_ID), { force: true });
 
   if (failed > 0) {

@@ -2,22 +2,13 @@ const {
   calculateTokens,
   truncateToTokenLimit,
   writePromptToFile,
-  extractChatMessageContent,
-  assertCompletionNotTruncated,
 } = require('./serviceUtils');
 const {
-  abortSignal,
-  abortedGenerationError,
   hasNumber,
   hasSystemPrompt,
-  isAbortError,
   modelOverride,
-  progressHandler,
-  readCompletionUsage,
   reasoningEffortForOpenAi,
   reasoningEnabled,
-  runChatCompletionStream,
-  stripReasoningText,
 } = require('./aiGenerateOptions');
 const axios = require('axios');
 const AzureOpenAI = require('openai').AzureOpenAI;
@@ -78,6 +69,15 @@ class AzureOpenAIService {
   constructor() {
     this.transport = new ChatCompletionsTransport({
       label: 'AzureOpenAI',
+      generation: {
+        notReadyMessage: 'AzureOpenAI client not initialized - missing API key',
+        remedy: TRUNCATION_REMEDY,
+        buildRequest: (prompt, options) =>
+          this._buildGenerationRequest(prompt, options),
+        // Only where the configured API version takes it; an older one would
+        // answer 400 instead of streaming, so that deployment estimates.
+        streamUsage: () => supportsStreamOptions(config.azure.apiVersion),
+      },
       createClient: () =>
         config.aiProvider === 'azure'
           ? new AzureOpenAI({
@@ -97,6 +97,15 @@ class AzureOpenAIService {
 
   set client(client) {
     this.transport.client = client;
+  }
+
+  /** Usage of the last generateText() call; read by the AI review features. */
+  get lastGenerateTextUsage() {
+    return this.transport.lastGenerateTextUsage;
+  }
+
+  set lastGenerateTextUsage(usage) {
+    this.transport.lastGenerateTextUsage = usage;
   }
 
   initialize() {
@@ -269,110 +278,45 @@ class AzureOpenAIService {
    * @returns {Promise<string>} - The generated text
    */
   async generateText(prompt, options = {}) {
-    // Read before the try so the catch can tell a stopped request from a
-    // failed one.
-    const signal = abortSignal(options);
-    const onProgress = progressHandler(options);
+    return this.transport.generate(prompt, options);
+  }
 
-    try {
-      this.initialize();
-
-      if (!this.client) {
-        throw new Error('AzureOpenAI client not initialized - missing API key');
-      }
-
-      // Azure addresses a deployment rather than a model, so an override
-      // names the deployment to send this one request to.
-      const model = modelOverride(options) || process.env.AZURE_DEPLOYMENT_NAME;
-      const messages = [];
-      if (hasSystemPrompt(options)) {
-        messages.push({ role: 'system', content: options.systemPrompt });
-      }
-      messages.push({ role: 'user', content: prompt });
-
-      const request = {
-        model: model,
-        messages,
-        temperature: hasNumber(options.temperature) ? options.temperature : 0.7,
-        // Was a hardcoded 1000, which quarrelled with the setting the same way
-        // Ollama's num_predict did — the reservation followed the operator,
-        // the limit did not.
-        max_tokens:
-          hasNumber(options.maxTokens) && options.maxTokens > 0
-            ? Math.floor(options.maxTokens)
-            : Number(config.responseTokens),
-      };
-      // As on OpenAI: the reasoning deployments take reasoning_effort, every
-      // other one answers 400 for it, so it is sent for those names only and
-      // only when the caller asked for no thinking.
-      if (reasoningEnabled(options) === false) {
-        const effort = reasoningEffortForOpenAi(model);
-        if (effort) request.reasoning_effort = effort;
-      }
-
-      this.lastGenerateTextUsage = null;
-      // The second argument is the SDK's request option bag; a caller that
-      // brought no signal gets the call it always got.
-      const requestOptions = signal ? { signal } : null;
-
-      if (onProgress) {
-        const streamRequest = { ...request, stream: true };
-        // Only where the configured API version takes it; an older one would
-        // answer 400 instead of streaming, so that deployment estimates.
-        if (supportsStreamOptions(config.azure.apiVersion)) {
-          streamRequest.stream_options = { include_usage: true };
-        }
-        return await runChatCompletionStream({
-          client: this.client,
-          request: streamRequest,
-          requestOptions,
-          signal,
-          onProgress,
-          provider: 'AzureOpenAI',
-          remedy: TRUNCATION_REMEDY,
-          onUsage: (usage) => {
-            this.lastGenerateTextUsage = usage;
-          },
-        });
-      }
-
-      const response = requestOptions
-        ? await this.client.chat.completions.create(request, requestOptions)
-        : await this.client.chat.completions.create(request);
-      this.lastGenerateTextUsage = readCompletionUsage(response);
-
-      const message = response?.choices?.[0]?.message;
-      // Reasoning is no part of the answer, and a block the cut-off left
-      // open is no part of it either.
-      const generatedText = extractChatMessageContent(
-        { ...message, content: stripReasoningText(message?.content) },
-        'AzureOpenAI'
-      );
-
-      // After the text is in hand: a cut-off answer is still a failure, but
-      // the caller can keep the prefix instead of paying for it twice.
-      assertCompletionNotTruncated(response, 'AzureOpenAI', TRUNCATION_REMEDY, {
-        partialText: generatedText,
-      });
-
-      if (!generatedText) {
-        throw new Error('Invalid API response structure');
-      }
-
-      return generatedText;
-    } catch (error) {
-      // One name for a stopped request, whatever the client called it; an
-      // abort this service raised already carries its partial text.
-      const thrown =
-        isAbortError(error, signal) && error?.name !== 'AbortError'
-          ? abortedGenerationError(error, '')
-          : error;
-      console.error(
-        `Error generating text with AzureOpenAI: ${thrown.message}`
-      );
-      console.debug(thrown);
-      throw thrown;
+  /**
+   * This provider's generateText() request. The transport sends it, streams
+   * it and reads the answer; what differs between the providers is here.
+   * @param {string} prompt
+   * @param {object} options - see generateText()
+   * @returns {Object} The chat completions request
+   */
+  _buildGenerationRequest(prompt, options) {
+    const model = modelOverride(options) || process.env.AZURE_DEPLOYMENT_NAME;
+    const messages = [];
+    if (hasSystemPrompt(options)) {
+      messages.push({ role: 'system', content: options.systemPrompt });
     }
+    messages.push({ role: 'user', content: prompt });
+
+    const request = {
+      model: model,
+      messages,
+      temperature: hasNumber(options.temperature) ? options.temperature : 0.7,
+      // Was a hardcoded 1000, which quarrelled with the setting the same way
+      // Ollama's num_predict did — the reservation followed the operator,
+      // the limit did not.
+      max_tokens:
+        hasNumber(options.maxTokens) && options.maxTokens > 0
+          ? Math.floor(options.maxTokens)
+          : Number(config.responseTokens),
+    };
+    // As on OpenAI: the reasoning deployments take reasoning_effort, every
+    // other one answers 400 for it, so it is sent for those names only and
+    // only when the caller asked for no thinking.
+    if (reasoningEnabled(options) === false) {
+      const effort = reasoningEffortForOpenAi(model);
+      if (effort) request.reasoning_effort = effort;
+    }
+
+    return request;
   }
 
   async checkStatus() {

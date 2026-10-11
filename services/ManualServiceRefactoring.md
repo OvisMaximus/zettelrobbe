@@ -556,7 +556,27 @@ reservedTokens, availableTokens }` and `fit(content, availableTokens)`; the char
      them. `num_ctx` is still computed by the service and handed in; moving it behind the
      transport is step 6. `llm-transport-request-mapping` (31 cases) pins both transports with
      fake clients and every provider's analysis request; six mutations each fail a case.
-   - **5b — `generateText()`** through the same transports. `checkStatus()` (row g) moves with it.
+   - ~~**5b — `generateText()`**~~ **Done.** The chat transport's `generate()` holds what the
+     three `generateText()` copies shared: abort and progress handling, the streamed and the plain
+     call, `lastGenerateTextUsage`, reasoning stripping, the cut-off check with `partialText`, and
+     the abort normalization. What differs stays with the provider, as one
+     `_buildGenerationRequest()` each — moved verbatim: OpenAI caps `max_tokens` only on request;
+     Azure always caps at RESPONSE_TOKENS and defaults to temperature 0.7; Custom clamps to the
+     context window and speaks three reasoning dialects (Qwen's `/no_think`,
+     `chat_template_kwargs`, `reasoning_effort`). Hooks: `streamUsage()` (Azure's API-version
+     gate for `stream_options`) and `describeEmptyText()` (Custom's "the answer carried no
+     text …"). Ollama's `generate()` and its NDJSON stream reader moved into
+     `ollamaGenerateTransport.js` verbatim; the service still sizes `num_predict`/`num_ctx`
+     through `_calculatePromptTokenCount()`/`_calculateNumCtx()` and hands them in.
+     `lastGenerateTextUsage` is an accessor onto the transport on all four services.
+     `llm-transport-request-mapping` grew to 48 cases. Of eight mutations on the generation path,
+     three survived the existing suite — Custom's empty-answer message, Ollama's `reasoning`
+     override of OLLAMA_THINK, and Ollama's abort signal — and are pinned now.
+
+     **Not moved: `checkStatus()`** (row g). Nothing in the repository calls it — no route, no
+     view, no service, no test. It stays in the four services untouched; step 6 decides whether the
+     composition roots expose it at all or whether it is dropped with the dead branches of step 8.
+
 6. **Introduce `documentAnalyzer.js`** and the four composition roots. Reduce
    `services/{openai,azure,custom,ollama}Service.js` to re-export shims. Add `llm-provider-parity`.
    Fix Finding 7a here (Azure temperature) with its test.
