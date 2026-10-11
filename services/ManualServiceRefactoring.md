@@ -580,6 +580,38 @@ reservedTokens, availableTokens }` and `fit(content, availableTokens)`; the char
 6. **Introduce `documentAnalyzer.js`** and the four composition roots. Reduce
    `services/{openai,azure,custom,ollama}Service.js` to re-export shims. Add `llm-provider-parity`.
    Fix Finding 7a here (Azure temperature) with its test.
+
+   **Decisions, taken by the maintainer on 2026-10-11** — these are the behaviour changes of this
+   step; each needs its own test that fails before and passes after:
+   - **7a — Azure temperature follows the config on both paths.** Analysis sends
+     `config.aiTemperatureAnalysis` (was a hardcoded 0.3); `generateText()` defaults to
+     `config.aiTemperatureGeneration` (was a hardcoded 0.7). Planned test:
+     `llm-azure-temperature-wiring`. Update the case in `llm-transport-request-mapping` that pins
+     0.3 ("Azure: analysis still sends 0.3").
+   - **7k — an answer without assignable metadata is a failure on all four.** Ollama adopts
+     `assertAssignableMetadata()` and so the OCR fallback. Order matters: the check runs on the
+     **parsed answer, before** `withDocumentDefaults()` — the defaults turn a missing `tags` into
+     `[]` and would make every answer pass. Note what the check really is: `tags` must be an array
+     and `correspondent` a string or null; `{ tags: [], correspondent: null }` passes on all four,
+     as it does on the chat providers today. The pinned drift case in
+     `llm-analysis-result-contract` ("NOT reported as a failure (known drift)") flips to the
+     failure assertion and Ollama joins the loop above it; in `llm-ocr-fallback-phrases` Ollama joins the "an answer without metadata routes to OCR" loop it is filtered out of today.
+   - **Field defaults for all four.** `withDocumentDefaults()` shapes every success: the seven
+     fields (`tags` an array, the rest a value or null), unknown fields dropped. Safe for the
+     write-back: `documentProcessingService.buildUpdateData()` falls back to the document's own
+     title/date and skips a null correspondent, type, language and custom fields. The chat cases in
+     `llm-analysis-result-contract`, `llm-response-parser` (`sameDocument()`) and
+     `llm-token-budget` that compare the document exactly need the defaults in their expectation.
+   - **7c — refusal detection for all four.** OpenAI's "i'm sorry" / "i cannot" / "insufficient"
+     check after a failed parse, with `buildInsufficientContent()`, moves into the analyzer. The OCR
+     reason for those documents changes from the invalid-JSON reason to "insufficient content" on
+     azure, custom and Ollama. Check that `llm-response-parser`'s unreadable answers contain none
+     of the three phrases (they do not today), and extend the OpenAI-only refusal case of `llm-ocr-fallback-phrases` (reason `ai_insufficient_content`) to all four.
+   - **Row g — `checkStatus()`** has no caller. The composition roots delegate it unchanged; whether
+     it goes is decided with step 8.
+   - **Not decided, keep as is:** row e/m (timeout normalization only on Custom), row l ("No
+     response data from Ollama API" matches no OCR marker), Ollama's `CONTENT_MAX_LENGTH` cut.
+
 7. **Delete `services/manualService.js`** and repoint `POST /manual/analyze`
    (`routes/setup.js:7477`) at `AIServiceFactory.getService()`, collapsing its four-way switch.
    Clean up what used to trigger Finding 7j while here: all four branches pass `id || []`
@@ -599,6 +631,35 @@ reservedTokens, availableTokens }` and `fit(content, availableTokens)`; the char
    of `/manual/analyze` and a scan cycle against a real provider, since no test exercises a live API.
 
 ---
+
+## Handoff notes for step 6 onwards
+
+Written when steps 1-5 were done (tag `refactor-step-5-done`), for whoever continues — human or
+agent.
+
+- **Read first:** `/CLAUDE.md`, this plan (Findings, Target Architecture, the done notes of steps
+  1-5), `services/llm/` (`promptBuilder`, `responseParser`, `analysisResult`, `tokenBudget/`,
+  `transports/`) and one provider service, e.g. `services/azureService.js`.
+- **Seams the tests rely on — keep them on the four exported singletons:** `service.client` is
+  replaced directly by many tests; `lastGenerateTextUsage` is read and set; Ollama's `apiUrl`,
+  `model`, `documentAnalysisSchema`, `_buildPrompt()`, `_callOllamaAPI(prompt, system, numCtx,
+schema)`, `_extractOllamaMetrics()`, `_calculatePromptTokenCount()` and `_calculateNumCtx()`
+  are called or stubbed. `ollama-temperature-wiring` mocks axios through `require.cache` for
+  `services/ollamaService.js`, so the axios client must still be created by that module.
+  `ollama-upstream-error` patches the global `setTimeout` for the retry delay.
+- **Rules:** TDD; new tests are plain node scripts in `tests/`, registered in `TESTS` and an
+  `AREAS` entry of `scripts/run-tests.js`; ESLint and Prettier clean on every touched file; one
+  green commit per sub-step, commit body with Background / Changes / Testing / Impact / Upstream
+  Status; English only in the repo.
+- **Verify like this:** `node scripts/run-tests.js --all` takes about five minutes. Some tests
+  fail for reasons unrelated to the code, depending on the machine (native modules, file
+  permissions, line endings in the working copy, a changelog/version mismatch inherited from
+  upstream). Never judge a run by its count: run the suite on the parent commit as well and compare
+  the lists of failed tests — the change is fine when the lists are identical apart from tests it
+  added. Back every new test with a mutation check: break the code it guards, see it fail, restore.
+- **Done means:** the four services are re-export shims of `services/llm/providers/*`; the tests
+  above pass unmodified except where a decision of step 6 says otherwise; `llm-provider-parity`
+  shows byte-identical `document` objects for the same payload on all four.
 
 ## Out of Scope / Follow-ups
 
