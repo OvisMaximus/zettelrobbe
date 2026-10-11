@@ -27,6 +27,9 @@ const { cacheThumbnail } = require('./thumbnailCache');
 const { buildAnalysisPrompt } = require('./llm/promptBuilder');
 const tiktokenBudget = require('./llm/tokenBudget/tiktokenBudget');
 const {
+  ChatCompletionsTransport,
+} = require('./llm/transports/chatCompletionsTransport');
+const {
   buildSuccess,
   buildFailure,
   buildInsufficientContent,
@@ -48,29 +51,44 @@ const TRUNCATION_REMEDY =
 
 class OpenAIService {
   constructor() {
-    this.client = null;
+    this.transport = new ChatCompletionsTransport({
+      label: 'OpenAI',
+      createClient: () => {
+        if (config.aiProvider === 'ollama') {
+          return new OpenAI({
+            baseURL: config.ollama.apiUrl + '/v1',
+            // Ollama ignores the key unless the endpoint enforces auth (e.g. a
+            // reverse proxy); the OpenAI SDK requires a non-empty value.
+            apiKey: config.ollama.apiKey || 'ollama',
+          });
+        }
+        if (config.aiProvider === 'custom') {
+          return new OpenAI({
+            baseURL: config.custom.apiUrl,
+            apiKey: config.custom.apiKey,
+          });
+        }
+        if (config.aiProvider === 'openai' && config.openai.apiKey) {
+          return new OpenAI({
+            apiKey: config.openai.apiKey,
+          });
+        }
+        return null;
+      },
+    });
+  }
+
+  /** The SDK client. It lives on the transport; tests replace it here. */
+  get client() {
+    return this.transport.client;
+  }
+
+  set client(client) {
+    this.transport.client = client;
   }
 
   initialize() {
-    if (!this.client && config.aiProvider === 'ollama') {
-      this.client = new OpenAI({
-        baseURL: config.ollama.apiUrl + '/v1',
-        // Ollama ignores the key unless the endpoint enforces auth (e.g. a
-        // reverse proxy); the OpenAI SDK requires a non-empty value.
-        apiKey: config.ollama.apiKey || 'ollama',
-      });
-    } else if (!this.client && config.aiProvider === 'custom') {
-      this.client = new OpenAI({
-        baseURL: config.custom.apiUrl,
-        apiKey: config.custom.apiKey,
-      });
-    } else if (!this.client && config.aiProvider === 'openai') {
-      if (!this.client && config.openai.apiKey) {
-        this.client = new OpenAI({
-          apiKey: config.openai.apiKey,
-        });
-      }
-    }
+    this.transport.initialize();
   }
 
   async analyzeDocument(
@@ -84,11 +102,6 @@ class OpenAIService {
   ) {
     try {
       this.initialize();
-      const now = new Date();
-      const timestamp = now.toLocaleString('de-DE', {
-        dateStyle: 'short',
-        timeStyle: 'short',
-      });
 
       if (!this.client) {
         throw new Error('OpenAI client not initialized');
@@ -150,45 +163,15 @@ class OpenAIService {
 
       await writePromptToFile(systemPrompt, truncatedContent);
 
-      const response = await this.client.chat.completions.create({
-        model: model,
-        messages: [
-          {
-            role: 'system',
-            content: systemPrompt,
-          },
-          {
-            role: 'user',
-            content: truncatedContent,
-          },
-        ],
-        ...(model !== 'o3-mini' && {
-          temperature: config.aiTemperatureAnalysis,
-        }),
+      const { payload, metrics: mappedUsage } = await this.transport.complete({
+        systemPrompt,
+        userContent: truncatedContent,
+        model,
+        // o3-mini rejects the parameter.
+        temperature:
+          model !== 'o3-mini' ? config.aiTemperatureAnalysis : undefined,
       });
-
-      assertCompletionNotTruncated(
-        response,
-        'OpenAI',
-        'Reduce the number of custom fields the prompt asks for, or use a model with a larger completion limit.'
-      );
-      const message = response?.choices?.[0]?.message;
-      let jsonContent = extractChatMessageContent(message, 'OpenAI');
-      if (!jsonContent) {
-        throw new Error('Invalid API response structure');
-      }
-
-      console.log(`[DEBUG] [${timestamp}] OpenAI request sent`);
-      console.log(
-        `[DEBUG] [${timestamp}] Total tokens: ${response.usage.total_tokens}`
-      );
-
-      const usage = response.usage;
-      const mappedUsage = {
-        promptTokens: usage.prompt_tokens,
-        completionTokens: usage.completion_tokens,
-        totalTokens: usage.total_tokens,
-      };
+      let jsonContent = payload;
 
       let parsedResponse;
       try {

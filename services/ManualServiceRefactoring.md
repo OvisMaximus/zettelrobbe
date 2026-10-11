@@ -538,8 +538,25 @@ reservedTokens, availableTokens }` and `fit(content, availableTokens)`; the char
 
 5. **Introduce the transports.** `chatCompletionsTransport.js` covering openai/azure/custom, and
    `ollamaGenerateTransport.js` carrying the retry, `format`, `num_ctx`/`num_predict` and
-   `done_reason` truncation check moved verbatim from `ollamaService.js:811-922`. Cover with
-   `llm-transport-request-mapping`.
+   `done_reason` truncation check moved verbatim from `ollamaService.js`. Cover with
+   `llm-transport-request-mapping`. Landed in two commits, because `generateText()` brings
+   streaming, abort, three reasoning dialects and per-provider defaults the analysis call has
+   none of:
+   - ~~**5a — the analysis request.**~~ **Done.** Each service owns a `transport`; `client`
+     (and Ollama's `apiUrl`/`model`) are accessors onto it, so the many tests that replace
+     `service.client` keep working unchanged. The chat transport takes a `createClient()`
+     factory — OpenAI's still carries the unreachable branches of row h, removed in step 8 — and
+     an optional `describeMissingContent()`, which is how Custom keeps its detailed
+     "Invalid API response structure: missing choices[0]." (355ac29). Per-provider temperature
+     stays with the provider: OpenAI passes `undefined` for o3-mini, which the transport omits;
+     Azure still passes 0.3 and is pinned as such until step 6 (row a). The Ollama transport gets
+     the axios client handed in, because `ollama-temperature-wiring` mocks axios for the service
+     module; `_callOllamaAPI()`, `_assertNotTruncated()`, `_extractOllamaMetrics()` and
+     `_buildRequestHeaders()` are one-line delegations, the first and third because tests call
+     them. `num_ctx` is still computed by the service and handed in; moving it behind the
+     transport is step 6. `llm-transport-request-mapping` (31 cases) pins both transports with
+     fake clients and every provider's analysis request; six mutations each fail a case.
+   - **5b — `generateText()`** through the same transports. `checkStatus()` (row g) moves with it.
 6. **Introduce `documentAnalyzer.js`** and the four composition roots. Reduce
    `services/{openai,azure,custom,ollama}Service.js` to re-export shims. Add `llm-provider-parity`.
    Fix Finding 7a here (Azure temperature) with its test.

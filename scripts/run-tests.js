@@ -102,6 +102,7 @@ const TESTS = {
   'llm-prompt-builder': 'test-llm-prompt-builder.js',
   'llm-response-parser': 'test-llm-response-parser.js',
   'llm-token-budget': 'test-llm-token-budget.js',
+  'llm-transport-request-mapping': 'test-llm-transport-request-mapping.js',
   'custom-field-longtext': 'test-custom-field-longtext.js',
   'document-processing-service': 'test-document-processing-service.js',
   'settings-custom-field-type-conflict':
@@ -240,6 +241,7 @@ const AREAS = {
     'llm-analysis-result-contract',
     'llm-ocr-fallback-phrases',
     'llm-response-parser',
+    'llm-transport-request-mapping',
     'rescan-fetch-before-delete',
   ],
   prompts: [

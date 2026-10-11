@@ -28,6 +28,9 @@ const { cacheThumbnail } = require('./thumbnailCache');
 const { buildAnalysisPrompt } = require('./llm/promptBuilder');
 const tiktokenBudget = require('./llm/tokenBudget/tiktokenBudget');
 const {
+  ChatCompletionsTransport,
+} = require('./llm/transports/chatCompletionsTransport');
+const {
   buildSuccess,
   buildFailure,
   assertAssignableMetadata,
@@ -56,18 +59,48 @@ const QWEN_MODEL_PATTERN = /qwen/i;
 
 class CustomOpenAIService {
   constructor() {
-    this.client = null;
+    this.transport = new ChatCompletionsTransport({
+      label: 'Custom OpenAI',
+      createClient: () =>
+        config.aiProvider === 'custom'
+          ? new OpenAI({
+              baseURL: config.custom.apiUrl,
+              // OpenAI-compatible SDKs require an apiKey value even when auth is disabled.
+              apiKey: config.custom.apiKey || CUSTOM_PROVIDER_FALLBACK_API_KEY,
+            })
+          : null,
+      // Every message keeps the "Invalid API response structure" prefix:
+      // shouldQueueForOcrOnAiError() matches on that phrase, and without it
+      // the document no longer reaches the OCR fallback.
+      describeMissingContent: (response, message) => {
+        const missing = !response
+          ? 'the response is empty'
+          : !response.choices
+            ? 'missing choices'
+            : !response.choices[0]
+              ? 'missing choices[0]'
+              : !response.choices[0].message
+                ? 'missing choices[0].message'
+                : !response.choices[0].message.content
+                  ? 'missing choices[0].message.content'
+                  : `unusable content ${message?.content}`;
+        return `Invalid API response structure: ${missing}.`;
+      },
+    });
     this.tokenizer = null;
   }
 
+  /** The SDK client. It lives on the transport; tests replace it here. */
+  get client() {
+    return this.transport.client;
+  }
+
+  set client(client) {
+    this.transport.client = client;
+  }
+
   initialize() {
-    if (!this.client && config.aiProvider === 'custom') {
-      this.client = new OpenAI({
-        baseURL: config.custom.apiUrl,
-        // OpenAI-compatible SDKs require an apiKey value even when auth is disabled.
-        apiKey: config.custom.apiKey || CUSTOM_PROVIDER_FALLBACK_API_KEY,
-      });
-    }
+    this.transport.initialize();
   }
 
   async analyzeDocument(
@@ -81,11 +114,6 @@ class CustomOpenAIService {
   ) {
     try {
       this.initialize();
-      const now = new Date();
-      const timestamp = now.toLocaleString('de-DE', {
-        dateStyle: 'short',
-        timeStyle: 'short',
-      });
 
       if (!this.client) {
         throw new Error('Custom OpenAI client not initialized');
@@ -154,60 +182,13 @@ class CustomOpenAIService {
       // console.log(`[DEBUG] External API data: ${validatedExternalApiData}`);
       // console.log('######################################################################');
 
-      const response = await this.client.chat.completions.create({
-        model: model,
-        messages: [
-          {
-            role: 'system',
-            content: systemPrompt,
-          },
-          {
-            role: 'user',
-            content: truncatedContent,
-          },
-        ],
+      const { payload, metrics: mappedUsage } = await this.transport.complete({
+        systemPrompt,
+        userContent: truncatedContent,
+        model,
         temperature: config.aiTemperatureAnalysis,
       });
-
-      // Handle response
-      //console.log(`MESSAGE: ${response?.choices?.[0]?.message?.content}`);
-      assertCompletionNotTruncated(
-        response,
-        'Custom OpenAI',
-        'Reduce the number of custom fields the prompt asks for, or use a model with a larger completion limit.'
-      );
-      const message = response?.choices?.[0]?.message;
-      let jsonContent = extractChatMessageContent(message, 'Custom OpenAI');
-      if (!jsonContent) {
-        // Every message keeps the "Invalid API response structure" prefix:
-        // shouldQueueForOcrOnAiError() matches on that phrase, and without it
-        // the document no longer reaches the OCR fallback.
-        const missing = !response
-          ? 'the response is empty'
-          : !response.choices
-            ? 'missing choices'
-            : !response.choices[0]
-              ? 'missing choices[0]'
-              : !response.choices[0].message
-                ? 'missing choices[0].message'
-                : !response.choices[0].message.content
-                  ? 'missing choices[0].message.content'
-                  : `unusable content ${message?.content}`;
-        throw new Error(`Invalid API response structure: ${missing}.`);
-      }
-
-      // Log token usage
-      console.log(`[DEBUG] [${timestamp}] Custom OpenAI request sent`);
-      console.log(
-        `[DEBUG] [${timestamp}] Total tokens: ${response.usage.total_tokens}`
-      );
-
-      const usage = response.usage;
-      const mappedUsage = {
-        promptTokens: usage.prompt_tokens,
-        completionTokens: usage.completion_tokens,
-        totalTokens: usage.total_tokens,
-      };
+      let jsonContent = payload;
 
       let parsedResponse;
       try {

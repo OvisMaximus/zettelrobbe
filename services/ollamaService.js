@@ -18,6 +18,9 @@ const { buildAnalysisPrompt } = require('./llm/promptBuilder');
 const { parseAnalysisResponse } = require('./llm/responseParser');
 const charBudget = require('./llm/tokenBudget/charBudget');
 const {
+  OllamaGenerateTransport,
+} = require('./llm/transports/ollamaGenerateTransport');
+const {
   buildSuccess,
   buildFailure,
   withDocumentDefaults,
@@ -32,10 +35,12 @@ class OllamaService {
    * Initialize the Ollama service
    */
   constructor() {
-    this.apiUrl = config.ollama.apiUrl;
-    this.model = config.ollama.model;
-    this.client = axios.create({
-      timeout: 1800000, // 30 minutes timeout
+    this.transport = new OllamaGenerateTransport({
+      client: axios.create({
+        timeout: 1800000, // 30 minutes timeout
+      }),
+      apiUrl: config.ollama.apiUrl,
+      model: config.ollama.model,
     });
 
     // JSON schema for document analysis output
@@ -65,6 +70,31 @@ class OllamaService {
         'language',
       ],
     };
+  }
+
+  /** The axios client. It lives on the transport; tests replace it here. */
+  get client() {
+    return this.transport.client;
+  }
+
+  set client(client) {
+    this.transport.client = client;
+  }
+
+  get apiUrl() {
+    return this.transport.apiUrl;
+  }
+
+  set apiUrl(apiUrl) {
+    this.transport.apiUrl = apiUrl;
+  }
+
+  get model() {
+    return this.transport.model;
+  }
+
+  set model(model) {
+    this.transport.model = model;
   }
 
   /**
@@ -378,208 +408,38 @@ class OllamaService {
     return numCtx;
   }
 
-  /**
-   * Build request headers, adding bearer auth when an API key is set.
-   * The key is read at request time, so runtime config changes apply
-   * without re-instantiating the singleton.
-   * @returns {Object} Headers object
-   */
+  /** Request headers, with bearer auth when an API key is set. */
   _buildRequestHeaders() {
-    const headers = { 'Content-Type': 'application/json' };
-    const apiKey = process.env.OLLAMA_API_KEY || config.ollama.apiKey || '';
-    if (apiKey) {
-      headers.Authorization = `Bearer ${apiKey}`;
-    }
-    return headers;
+    return this.transport.buildHeaders();
   }
 
   /**
-   * Call Ollama API
+   * Send the analysis request.
    * @param {string} prompt - Prompt text
    * @param {string} systemPrompt - System prompt
    * @param {number} numCtx - Context window size
    * @param {Object} schema - Response schema
-   * @returns {Object} Ollama API response
+   * @returns {Promise<Object>} The raw /api/generate response data
    */
-  /**
-   * Extract the cause an Ollama (or its inference backend) reported in a
-   * non-2xx response body. Ollama wraps backend failures — its runner closing
-   * the connection on an oversized prompt, for example — into
-   * `{ error: 'Post "http://…/v1/completions": EOF' }`; without this the
-   * operator only ever sees "Request failed with status code 500" and cannot
-   * tell an Ollama problem from a model-backend problem.
-   *
-   * @param {Object} axiosError
-   * @returns {string|null}
-   */
-  _extractUpstreamErrorMessage(axiosError) {
-    const data = axiosError?.response?.data;
-    if (!data) return null;
-    if (typeof data === 'string') {
-      const trimmed = data.trim();
-      try {
-        return JSON.parse(trimmed)?.error || trimmed || null;
-      } catch {
-        return trimmed || null;
-      }
-    }
-    return data.error || data.message || null;
-  }
-
-  /**
-   * True for failures worth one more attempt: the connection dropped or the
-   * server answered 5xx. A 4xx is a request problem and will fail again.
-   *
-   * @param {Object} axiosError
-   * @returns {boolean}
-   */
-  _isTransientOllamaFailure(axiosError) {
-    if (!axiosError.response) {
-      // No response at all: connection refused/reset/timeout.
-      return true;
-    }
-    return axiosError.response.status >= 500;
-  }
-
-  /**
-   * Wrap an axios failure with the upstream detail attached.
-   *
-   * @param {Object} axiosError - The axios error being wrapped
-   * @param {number} attempt - Which attempt failed (1-based)
-   * @returns {Error}
-   */
-  _wrapOllamaRequestError(axiosError, attempt) {
-    const upstream = this._extractUpstreamErrorMessage(axiosError);
-    const status = axiosError?.response?.status;
-    const detail = upstream ? `: ${upstream}` : '';
-    const wrapped = new Error(
-      `Ollama request failed (HTTP ${status || 'no response'}, attempt ${attempt})${detail}`,
-      { cause: axiosError }
-    );
-    // Keep the axios code so the scan-loop classification (OCR fallback,
-    // failure reasons) keeps working unchanged.
-    wrapped.code = axiosError.code;
-    return wrapped;
-  }
-
   async _callOllamaAPI(prompt, systemPrompt, numCtx, schema) {
-    // The same number _calculateNumCtx() already reserved room for. It used to
-    // be a hardcoded 256 while the reservation followed the setting, so the
-    // context held space for an answer the model was then forbidden to write.
-    const numPredict = Number(config.responseTokens);
-    const requestBody = {
-      model: this.model,
-      prompt: prompt,
-      system: systemPrompt,
-      stream: false,
-      format: schema,
-      options: {
-        temperature: config.aiTemperatureAnalysis,
-        top_p: 0.9,
-        repeat_penalty: 1.1,
-        top_k: 7,
-        num_predict: numPredict,
-        num_ctx: numCtx,
-      },
-    };
-
-    // Disable thinking for reasoning models (e.g. Qwen3, DeepSeek-R1)
-    // unless explicitly enabled via OLLAMA_THINK=true
-    if (!config.ollama.think) {
-      requestBody.think = false;
-    }
-
-    // One bounded retry for transient failures (backend EOF, 5xx). The
-    // field report behind this: an MLX runner closed its connection once
-    // under memory pressure; the immediate second attempt succeeded.
-    const MAX_ATTEMPTS = 2;
-    let response;
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-      try {
-        response = await this.client.post(
-          `${this.apiUrl}/api/generate`,
-          requestBody,
-          {
-            headers: this._buildRequestHeaders(),
-          }
-        );
-        break;
-      } catch (error) {
-        const wrapped = this._wrapOllamaRequestError(error, attempt);
-        console.error(`[ERROR] ${wrapped.message}`);
-        if (attempt >= MAX_ATTEMPTS || !this._isTransientOllamaFailure(error)) {
-          throw wrapped;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      }
-    }
-
-    if (!response?.data) {
-      throw new Error('Invalid response from Ollama API');
-    }
-
-    this._assertNotTruncated(response.data, numPredict, numCtx);
-    return response.data;
+    const { raw } = await this.transport.complete({
+      systemPrompt,
+      userContent: prompt,
+      temperature: config.aiTemperatureAnalysis,
+      // The same number _calculateNumCtx() already reserved room for. It used
+      // to be a hardcoded 256 while the reservation followed the setting, so
+      // the context held space for an answer the model was then forbidden to
+      // write.
+      maxResponseTokens: Number(config.responseTokens),
+      numCtx,
+      schema,
+    });
+    return raw;
   }
 
-  /**
-   * A generation Ollama had to cut short comes back with done_reason "length".
-   * What it returns is a prefix, and for structured output that means JSON
-   * without its closing braces — which no amount of sanitizing recovers, so
-   * there is nothing to do with it but say so.
-   *
-   * Two different limits produce the same done_reason and want opposite fixes:
-   * num_predict is the response budget, but the context window can leave less
-   * room than that, and then raising Response Tokens changes nothing. The
-   * message names whichever one actually bit.
-   *
-   * @param {Object} responseData - Ollama /api/generate response
-   * @param {number} numPredict - response token limit that was sent
-   * @param {number} numCtx - context window that was sent
-   * @param {Object} [extra] - what the caller salvaged from the cut-off answer
-   * @param {string} [extra.partialText] - the text that did arrive, reasoning
-   *   stripped; put on the error as `partialText` the way the OpenAI-compatible
-   *   providers do, so a caller can keep it instead of asking twice
-   */
+  /** See OllamaGenerateTransport.assertNotTruncated(). */
   _assertNotTruncated(responseData, numPredict, numCtx, extra) {
-    const evalCount = Number(responseData?.eval_count) || 0;
-    const promptEvalCount = Number(responseData?.prompt_eval_count) || 0;
-
-    // done_reason is the direct signal. Reaching the limit exactly is the
-    // fallback for an Ollama old enough not to send one.
-    const stoppedOnLength =
-      responseData?.done_reason === 'length' ||
-      (!responseData?.done_reason && numPredict > 0 && evalCount >= numPredict);
-
-    if (!stoppedOnLength) {
-      return;
-    }
-
-    /* Which limit bit is read off the count itself rather than guessed from
-       the context arithmetic: reaching num_predict exactly is the response
-       budget, stopping short of it means the context filled up first. The
-       arithmetic route was tried and got it backwards — _calculateNumCtx sizes
-       the window from an estimate of the prompt (length / 4), so comparing it
-       against the real prompt_eval_count blames the context for a run that
-       generated its full budget. */
-    const error =
-      evalCount >= numPredict
-        ? new Error(
-            `Ollama stopped generating after ${evalCount} tokens, which is the configured response limit. Raise Response Tokens (RESPONSE_TOKENS) above ${numPredict}.`
-          )
-        : new Error(
-            `Ollama stopped generating after ${evalCount} of ${numPredict} response tokens: the ${numCtx}-token context window was full, ${promptEvalCount} of it prompt. Raise Token Limit (TOKEN_LIMIT) or shorten the document.`
-          );
-
-    /* Carried as a code rather than matched out of the message later. The
-       phrase-matching in serviceUtils classifies errors that arrive from
-       elsewhere and have no better handle; this one is raised right here, so
-       rewording it should not silently reclassify the failure. */
-    error.code = 'ai_response_truncated';
-    if (typeof extra?.partialText === 'string') {
-      error.partialText = extra.partialText;
-    }
-    throw error;
+    this.transport.assertNotTruncated(responseData, numPredict, numCtx, extra);
   }
 
   /**
@@ -614,14 +474,7 @@ class OllamaService {
    * @returns {{promptTokens:number, completionTokens:number, totalTokens:number}}
    */
   _extractOllamaMetrics(responseData) {
-    const promptTokens = Number(responseData?.prompt_eval_count) || 0;
-    const completionTokens = Number(responseData?.eval_count) || 0;
-
-    return {
-      promptTokens,
-      completionTokens,
-      totalTokens: promptTokens + completionTokens,
-    };
+    return this.transport.extractMetrics(responseData);
   }
 
   /**

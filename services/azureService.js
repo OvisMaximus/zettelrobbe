@@ -28,6 +28,9 @@ const { cacheThumbnail } = require('./thumbnailCache');
 const { buildAnalysisPrompt } = require('./llm/promptBuilder');
 const tiktokenBudget = require('./llm/tokenBudget/tiktokenBudget');
 const {
+  ChatCompletionsTransport,
+} = require('./llm/transports/chatCompletionsTransport');
+const {
   buildSuccess,
   buildFailure,
   assertAssignableMetadata,
@@ -73,18 +76,31 @@ function supportsStreamOptions(apiVersion) {
 
 class AzureOpenAIService {
   constructor() {
-    this.client = null;
+    this.transport = new ChatCompletionsTransport({
+      label: 'AzureOpenAI',
+      createClient: () =>
+        config.aiProvider === 'azure'
+          ? new AzureOpenAI({
+              apiKey: config.azure.apiKey,
+              endpoint: config.azure.endpoint,
+              deploymentName: config.azure.deploymentName,
+              apiVersion: config.azure.apiVersion,
+            })
+          : null,
+    });
+  }
+
+  /** The SDK client. It lives on the transport; tests replace it here. */
+  get client() {
+    return this.transport.client;
+  }
+
+  set client(client) {
+    this.transport.client = client;
   }
 
   initialize() {
-    if (!this.client && config.aiProvider === 'azure') {
-      this.client = new AzureOpenAI({
-        apiKey: config.azure.apiKey,
-        endpoint: config.azure.endpoint,
-        deploymentName: config.azure.deploymentName,
-        apiVersion: config.azure.apiVersion,
-      });
-    }
+    this.transport.initialize();
   }
 
   async analyzeDocument(
@@ -98,11 +114,6 @@ class AzureOpenAIService {
   ) {
     try {
       this.initialize();
-      const now = new Date();
-      const timestamp = now.toLocaleString('de-DE', {
-        dateStyle: 'short',
-        timeStyle: 'short',
-      });
 
       if (!this.client) {
         throw new Error('AzureOpenAI client not initialized');
@@ -164,43 +175,14 @@ class AzureOpenAIService {
 
       await writePromptToFile(systemPrompt, truncatedContent);
 
-      const response = await this.client.chat.completions.create({
-        model: model,
-        messages: [
-          {
-            role: 'system',
-            content: systemPrompt,
-          },
-          {
-            role: 'user',
-            content: truncatedContent,
-          },
-        ],
+      const { payload, metrics: mappedUsage } = await this.transport.complete({
+        systemPrompt,
+        userContent: truncatedContent,
+        model,
+        // Hardcoded unlike the other two (Finding 7a); fixed in step 6.
         temperature: 0.3,
       });
-
-      assertCompletionNotTruncated(
-        response,
-        'AzureOpenAI',
-        'Reduce the number of custom fields the prompt asks for, or use a model with a larger completion limit.'
-      );
-      const message = response?.choices?.[0]?.message;
-      let jsonContent = extractChatMessageContent(message, 'AzureOpenAI');
-      if (!jsonContent) {
-        throw new Error('Invalid API response structure');
-      }
-
-      console.log(`[DEBUG] [${timestamp}] AzureOpenAI request sent`);
-      console.log(
-        `[DEBUG] [${timestamp}] Total tokens: ${response.usage.total_tokens}`
-      );
-
-      const usage = response.usage;
-      const mappedUsage = {
-        promptTokens: usage.prompt_tokens,
-        completionTokens: usage.completion_tokens,
-        totalTokens: usage.total_tokens,
-      };
+      let jsonContent = payload;
 
       let parsedResponse;
       try {
