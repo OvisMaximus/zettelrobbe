@@ -100,6 +100,7 @@ const TESTS = {
   'llm-analysis-result-contract': 'test-llm-analysis-result-contract.js',
   'llm-ocr-fallback-phrases': 'test-llm-ocr-fallback-phrases.js',
   'llm-prompt-builder': 'test-llm-prompt-builder.js',
+  'llm-response-parser': 'test-llm-response-parser.js',
   'custom-field-longtext': 'test-custom-field-longtext.js',
   'document-processing-service': 'test-document-processing-service.js',
   'settings-custom-field-type-conflict':
@@ -237,6 +238,7 @@ const AREAS = {
     'settings-paperless-url-fallback',
     'llm-analysis-result-contract',
     'llm-ocr-fallback-phrases',
+    'llm-response-parser',
     'rescan-fetch-before-delete',
   ],
   prompts: [

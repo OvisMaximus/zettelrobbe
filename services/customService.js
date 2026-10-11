@@ -27,6 +27,7 @@ const fs = require('fs').promises;
 const path = require('path');
 const { cacheThumbnail } = require('./thumbnailCache');
 const { buildAnalysisPrompt } = require('./llm/promptBuilder');
+const { parseAnalysisResponse } = require('./llm/responseParser');
 const responseLogPath = path.join(
   process.cwd(),
   'data',
@@ -52,99 +53,6 @@ class CustomOpenAIService {
   constructor() {
     this.client = null;
     this.tokenizer = null;
-  }
-
-  _extractFirstJsonValue(text) {
-    if (!text) {
-      return null;
-    }
-
-    const starts = [];
-    const firstObject = text.indexOf('{');
-    const firstArray = text.indexOf('[');
-
-    if (firstObject !== -1) {
-      starts.push(firstObject);
-    }
-    if (firstArray !== -1) {
-      starts.push(firstArray);
-    }
-
-    if (starts.length === 0) {
-      return null;
-    }
-
-    const startIndex = Math.min(...starts);
-    const opening = text[startIndex];
-    const closing = opening === '{' ? '}' : ']';
-
-    let depth = 0;
-    let inString = false;
-    let escaping = false;
-
-    for (let i = startIndex; i < text.length; i += 1) {
-      const char = text[i];
-
-      if (inString) {
-        if (escaping) {
-          escaping = false;
-        } else if (char === '\\') {
-          escaping = true;
-        } else if (char === '"') {
-          inString = false;
-        }
-        continue;
-      }
-
-      if (char === '"') {
-        inString = true;
-        continue;
-      }
-
-      if (char === opening) {
-        depth += 1;
-      } else if (char === closing) {
-        depth -= 1;
-        if (depth === 0) {
-          return text.slice(startIndex, i + 1);
-        }
-      }
-    }
-
-    return null;
-  }
-
-  _parseJsonResponse(rawContent) {
-    const sanitizedContent = String(rawContent || '')
-      .replace(/<think>[\s\S]*?<\/think>/g, '')
-      .replace(/```json\n?/gi, '')
-      .replace(/```\n?/g, '')
-      .trim();
-
-    try {
-      return {
-        parsed: JSON.parse(sanitizedContent),
-        normalized: sanitizedContent,
-      };
-    } catch (directParseError) {
-      const extractedJson = this._extractFirstJsonValue(sanitizedContent);
-      if (!extractedJson) {
-        throw new Error('Invalid JSON response from API', {
-          cause: directParseError,
-        });
-      }
-
-      try {
-        return {
-          parsed: JSON.parse(extractedJson),
-          normalized: extractedJson,
-        };
-      } catch (extractedParseError) {
-        throw new Error('Invalid JSON response from API', {
-          cause: extractedParseError,
-        });
-      }
-    }
   }
 
   initialize() {
@@ -318,7 +226,7 @@ class CustomOpenAIService {
 
       let parsedResponse;
       try {
-        const parsedResult = this._parseJsonResponse(jsonContent);
+        const parsedResult = parseAnalysisResponse(jsonContent);
         parsedResponse = parsedResult.parsed;
         jsonContent = parsedResult.normalized;
       } catch (error) {

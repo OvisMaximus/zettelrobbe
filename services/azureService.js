@@ -27,6 +27,7 @@ const fs = require('fs').promises;
 const path = require('path');
 const { cacheThumbnail } = require('./thumbnailCache');
 const { buildAnalysisPrompt } = require('./llm/promptBuilder');
+const { parseAnalysisResponse } = require('./llm/responseParser');
 const responseLogPath = path.join(
   process.cwd(),
   'data',
@@ -216,20 +217,15 @@ class AzureOpenAIService {
         totalTokens: usage.total_tokens,
       };
 
-      // Strip <think>...</think> reasoning tags from models like Qwen3, DeepSeek-R1
-      jsonContent = jsonContent.replace(/<think>[\s\S]*?<\/think>/g, '');
-      jsonContent = jsonContent
-        .replace(/```json\n?/g, '')
-        .replace(/```\n?/g, '')
-        .trim();
-
       let parsedResponse;
       try {
-        parsedResponse = JSON.parse(jsonContent);
+        const parsedResult = parseAnalysisResponse(jsonContent);
+        parsedResponse = parsedResult.parsed;
+        jsonContent = parsedResult.normalized;
       } catch (error) {
         console.error(`Failed to parse JSON response: ${error.message}`);
         console.debug(error);
-        throw new Error('Invalid JSON response from API', { cause: error });
+        throw error;
       }
 
       try {

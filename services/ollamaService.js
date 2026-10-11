@@ -15,6 +15,7 @@ const axios = require('axios');
 const config = require('../config/config');
 const { cacheThumbnail } = require('./thumbnailCache');
 const { buildAnalysisPrompt } = require('./llm/promptBuilder');
+const { parseAnalysisResponse } = require('./llm/responseParser');
 const { buildCustomFieldsBlock } = require('./llm/customFieldsTemplate');
 
 /**
@@ -638,28 +639,35 @@ class OllamaService {
 
   /**
    * Process Ollama API response
+   *
+   * The answer arrives as an object when Ollama applied the format schema,
+   * and as text otherwise; responseParser handles both. Every exit either
+   * returns something the caller can use or throws. Handing back
+   * { tags: [], correspondent: null } for an unreadable answer is
+   * indistinguishable from a model that genuinely found nothing, so the
+   * document would be written back untouched and marked processed.
+   *
    * @param {Object} responseData - Ollama API response data
    * @returns {Object} Parsed response
    */
   _processOllamaResponse(responseData) {
-    if (responseData.response && typeof responseData.response === 'object') {
-      console.log('Using response JS object directly');
-      return {
-        tags: Array.isArray(responseData.response.tags)
-          ? responseData.response.tags
-          : [],
-        correspondent: responseData.response.correspondent || null,
-        title: responseData.response.title || null,
-        document_date: responseData.response.document_date || null,
-        document_type: responseData.response.document_type || null,
-        language: responseData.response.language || null,
-        custom_fields: responseData.response.custom_fields || null,
-      };
-    } else if (responseData.response) {
-      console.log('No JS object yet, parsing JSON');
-      return this._parseResponse(responseData.response);
-    } else {
+    if (!responseData.response) {
       throw new Error('No response data from Ollama API');
+    }
+    try {
+      const { parsed } = parseAnalysisResponse(responseData.response);
+      return {
+        tags: Array.isArray(parsed.tags) ? parsed.tags : [],
+        correspondent: parsed.correspondent || null,
+        title: parsed.title || null,
+        document_date: parsed.document_date || null,
+        document_type: parsed.document_type || null,
+        language: parsed.language || null,
+        custom_fields: parsed.custom_fields || null,
+      };
+    } catch (error) {
+      console.error('Error parsing Ollama response:', error.message);
+      throw error;
     }
   }
 
@@ -677,94 +685,6 @@ class OllamaService {
       completionTokens,
       totalTokens: promptTokens + completionTokens,
     };
-  }
-
-  /**
-   * Parse text response to extract JSON
-   * @param {string} response - Response text
-   * @returns {Object} Parsed object
-   */
-  /* Every exit from here either returns something the caller can use or
-     throws. It used to hand back { tags: [], correspondent: null } on each of
-     its three failure paths, which is indistinguishable from a model that
-     genuinely found nothing — so a document whose answer could not be read at
-     all was written back untouched and then marked processed, never to be
-     looked at again. openaiService has thrown at the same point all along. */ _parseResponse(
-    response
-  ) {
-    try {
-      // Find JSON in response using regex
-      const jsonMatch = response.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        /* Worded to carry the marker serviceUtils already classifies, so a
-           document whose answer was unreadable takes the same OCR fallback it
-           takes under OpenAI. Truncation deliberately does not — see
-           _assertNotTruncated, where a second pass cannot help. */
-        throw new Error(
-          'Invalid JSON response from API: no JSON object in the answer'
-        );
-      }
-
-      let jsonStr = jsonMatch[0];
-      console.log('Extracted JSON String:', jsonStr);
-
-      try {
-        // Attempt to parse the JSON
-        const result = JSON.parse(jsonStr);
-
-        // Validate and return the result
-        return {
-          tags: Array.isArray(result.tags) ? result.tags : [],
-          correspondent: result.correspondent || null,
-          title: result.title || null,
-          document_date: result.document_date || null,
-          document_type: result.document_type || null,
-          language: result.language || null,
-          custom_fields: result.custom_fields || null,
-        };
-      } catch (jsonError) {
-        console.warn('Error parsing JSON from response:', jsonError.message);
-        console.warn('Attempting to sanitize the JSON...');
-
-        // Sanitize the JSON
-        jsonStr = this._sanitizeJsonString(jsonStr);
-
-        try {
-          const sanitizedResult = JSON.parse(jsonStr);
-          return {
-            tags: Array.isArray(sanitizedResult.tags)
-              ? sanitizedResult.tags
-              : [],
-            correspondent: sanitizedResult.correspondent || null,
-            title: sanitizedResult.title || null,
-            document_date: sanitizedResult.document_date || null,
-            language: sanitizedResult.language || null,
-          };
-        } catch {
-          console.error(
-            'Final JSON parsing failed after sanitization. This happens when the JSON structure is too complex or invalid. That indicates an issue with the generated JSON string by Ollama. Switch to OpenAI for better results or fine tune your prompt.'
-          );
-          throw new Error(
-            `Invalid JSON response from API, unreadable even after sanitizing: ${jsonError.message}`
-          );
-        }
-      }
-    } catch (error) {
-      console.error('Error parsing Ollama response:', error.message);
-      throw error;
-    }
-  }
-
-  /**
-   * Sanitize a JSON string
-   * @param {string} jsonStr - JSON string to sanitize
-   * @returns {string} Sanitized JSON string
-   */
-  _sanitizeJsonString(jsonStr) {
-    return jsonStr
-      .replace(/,\s*}/g, '}') // Remove trailing commas before closing braces
-      .replace(/,\s*]/g, ']') // Remove trailing commas before closing brackets
-      .replace(/(['"])?([a-zA-Z0-9_]+)(['"])?\s*:/g, '"$2":'); // Ensure property names are quoted
   }
 
   /**

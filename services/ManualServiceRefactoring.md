@@ -184,7 +184,7 @@ today. These are the actual bugs the work will surface:
 | a   | Azure hardcodes `temperature: 0.3` while openai/custom use `config.aiTemperatureAnalysis`                                   | `azureService.js:286`                                                                                                                                                            | Use the config value. Fixes a real bug; `test-ai-temperature-config.js` only covers config parsing, not the Azure wiring, so add a wiring test.                                                                                                             |
 | b   | ~~`return;` (undefined!) when a thumbnail is missing — callers then read `.document` of `undefined`~~ **resolved**          | was `openaiService.js:87`, `azureService.js:76`, `customService.js:171`                                                                                                          | Fixed ahead of the refactor together with row j — same statement block, same root cause. See the note below the table.                                                                                                                                      |
 | c   | "Insufficient content" early return exists only in OpenAI                                                                   | `openaiService.js:310-332`                                                                                                                                                       | Keep, apply to all providers. The phrase feeds OCR fallback (Finding 4).                                                                                                                                                                                    |
-| d   | Three different JSON parsers                                                                                                | `customService.js:35-126` (brace-matched, strongest) vs. `openaiService.js:299-334` / `azureService.js:286-298` (naive strip) vs. `ollamaService.js:977-1053` (regex + sanitize) | One parser built from custom's `_extractFirstJsonValue` + `<think>` stripping + Ollama's sanitize fallback; keep Ollama's object passthrough as a pre-step.                                                                                                 |
+| d   | ~~Three different JSON parsers~~ **resolved**                                                                               | `customService.js:35-126` (brace-matched, strongest) vs. `openaiService.js:299-334` / `azureService.js:286-298` (naive strip) vs. `ollamaService.js:977-1053` (regex + sanitize) | Done in step 3: `services/llm/responseParser.js` — custom's brace matcher, `<think>` stripping, Ollama's repair and object passthrough.                                                                                                                     |
 | e   | Only custom normalizes timeouts                                                                                             | `customService.js:428-436`                                                                                                                                                       | Apply `isTimeoutError`/`buildTimeoutErrorMessage` for all providers.                                                                                                                                                                                        |
 | f   | `generateText` option handling — **mostly resolved upstream**                                                               | `services/aiGenerateOptions.js`, used by all four `generateText()` implementations                                                                                               | Upstream unified how options are read (completion cap, temperature, system prompt, model, abort, reasoning, progress). Keep `aiGenerateOptions.js` as the shared reader; the transports only map the result onto their own knobs.                           |
 | g   | `checkStatus` differs by nature                                                                                             | openai/custom `models.list()`; Azure REST GET; `ollamaService.js:1210` `/api/ps`                                                                                                 | Stays in the transport. Not business logic.                                                                                                                                                                                                                 |
@@ -485,9 +485,30 @@ carry no behavioral risk; the risk starts at step 4.
    Ollama still ignores `PROMPT_TAGS` as user content; the chat providers only use it for the
    token count.
 
-3. **Extract `responseParser.js`** (custom's brace matcher + `<think>` stripping + Ollama's sanitize
-   fallback + Ollama's object passthrough) with `llm-response-parser`, and route all four services
-   through it. Resolves Finding 7d.
+3. ~~**Extract `responseParser.js`**~~ **Done.** `services/llm/responseParser.js`
+   (`parseAnalysisResponse()` → `{ parsed, normalized }`, plus `stripResponseWrapping()`) replaces
+   custom's `_extractFirstJsonValue`/`_parseJsonResponse`, the inline strip-and-parse of openai and
+   azure, and Ollama's `_parseResponse`/`_sanitizeJsonString`. Order: an object passes through,
+   `<think>` blocks and fences (any case) are stripped, the text is parsed as it stands, then each
+   **top-level** `{...}` is tried as written and repaired. An unreadable object is skipped whole, so
+   a nested `custom_fields` entry is never mistaken for the answer — on Ollama that would have been
+   a silent success (row k). Every failure starts with "Invalid JSON response from API".
+   `llm-response-parser` (57 cases) sends seven readable and three unreadable answers through the
+   parser and through all four providers.
+
+   Against the services before this step 12 provider cases failed, which is Finding 7d measured:
+   OpenAI and Azure could not read an upper-case fence, prose around the object, a trailing comma
+   or prose plus braces in a string; Custom could not read a trailing comma; Ollama could not read
+   a `<think>` block or prose after the object, and its repair branch **dropped `document_type`
+   and `custom_fields`** from an answer it did repair. All of those now read the same everywhere.
+
+   Deliberately not moved: the field defaults Ollama applies (`tags` → `[]`, the rest → `null`)
+   stay in `_processOllamaResponse()`, now for both the object and the text path. They are result
+   shaping and belong to `analysisResult.js` in step 4, so the parser returns the object as read
+   rather than the "document object" the target architecture lists. OpenAI's "insufficient
+   content" early return still runs only on a failed parse, on the stripped text. Row l ("No
+   response data from Ollama API") is untouched and still pinned as drift.
+
 4. **Extract `analysisResult.js`** and the two `tokenBudget` strategies with `llm-token-budget`.
    Findings 7b/7j are already fixed; `services/thumbnailCache.js` is the collaborator the
    composition roots inject in step 6, and `thumbnail-optional-analysis` must stay green throughout.
