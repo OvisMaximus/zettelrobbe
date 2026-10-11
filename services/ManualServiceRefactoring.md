@@ -300,8 +300,8 @@ Written as JSDoc typedefs in `services/llm/contracts.js`; enforced by tests, not
 
 /**
  * @typedef {Object} TokenBudget
- * @property {(systemPrompt:string, extraPrompts:string[], model:string) => Promise<{totalPromptTokens:number, availableTokens:number}>} reserve
- * @property {(content:string, availableTokens:number, model:string) => Promise<string>} fit
+ * @property {(systemPrompt:string, extraPrompts?:string[], model?:string) => Promise<{totalPromptTokens:number, reservedTokens:number, availableTokens:number}>} reserve
+ * @property {(content:string, availableTokens:number, model?:string) => Promise<string>} fit
  */
 ```
 
@@ -509,9 +509,33 @@ carry no behavioral risk; the risk starts at step 4.
    content" early return still runs only on a failed parse, on the stripped text. Row l ("No
    response data from Ollama API") is untouched and still pinned as drift.
 
-4. **Extract `analysisResult.js`** and the two `tokenBudget` strategies with `llm-token-budget`.
-   Findings 7b/7j are already fixed; `services/thumbnailCache.js` is the collaborator the
-   composition roots inject in step 6, and `thumbnail-optional-analysis` must stay green throughout.
+4. ~~**Extract `analysisResult.js`** and the two `tokenBudget` strategies~~ **Done.**
+   `services/llm/tokenBudget/tiktokenBudget.js` replaces the reserve-then-truncate block that was
+   byte-identical in openai, azure and custom. `services/llm/tokenBudget/charBudget.js` holds
+   Ollama's arithmetic (Finding 5): `estimateTokens()` with the `/2` divisor, `numCtx()` as
+   `min(prompt + answer, TOKEN_LIMIT)`, and `reserve()`/`fit()` in place of
+   `_fitContentToContext()`, which is gone. Both budgets expose `reserve()` → `{ totalPromptTokens,
+reservedTokens, availableTokens }` and `fit(content, availableTokens)`; the char budget's
+   `reserve()` takes the prompt prefix alone, since it has no model and no extra messages to count.
+   `_calculatePromptTokenCount()`/`_calculateNumCtx()` stay as one-line wrappers because
+   `ollama-temperature-wiring` stubs them; `generateText()` reaches the char budget through them.
+
+   `services/llm/analysisResult.js` is the one place the result shape lives: `buildSuccess()`,
+   `buildFailure(error, message?)` (Custom passes its normalized timeout text),
+   `buildInsufficientContent()` (OpenAI only, row c), `assertAssignableMetadata()` (the three chat
+   providers; Ollama's row k is untouched and still pinned) and `withDocumentDefaults()` (Ollama's
+   field defaults; whether the chat providers adopt them is the parity decision of step 6).
+
+   `llm-token-budget` (23 cases) pins both budgets and that every provider spends the one it was
+   given. Its provider half was green against the services before this step, which is the
+   point of a pure extraction. `llm-analysis-result-contract` gained a case for OpenAI's
+   insufficient-content placeholder, which was pinned nowhere before. Mutation-checked:
+   divisor `/4`, a dropped answer reservation, a provider that fits to a larger budget, a dropped
+   `errorCode`, a dropped placeholder field and a dropped `custom_fields` default each fail a case.
+
+   One log fixed on the way: Ollama's "exceeds the context budget" debug line was written in single
+   quotes and printed `${text.length}` literally.
+
 5. **Introduce the transports.** `chatCompletionsTransport.js` covering openai/azure/custom, and
    `ollamaGenerateTransport.js` carrying the retry, `format`, `num_ctx`/`num_predict` and
    `done_reason` truncation check moved verbatim from `ollamaService.js:811-922`. Cover with

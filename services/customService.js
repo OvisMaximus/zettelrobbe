@@ -1,6 +1,5 @@
 const {
   calculateTokens,
-  calculateTotalPromptTokens,
   truncateToTokenLimit,
   extractChatMessageContent,
   assertCompletionNotTruncated,
@@ -27,6 +26,12 @@ const fs = require('fs').promises;
 const path = require('path');
 const { cacheThumbnail } = require('./thumbnailCache');
 const { buildAnalysisPrompt } = require('./llm/promptBuilder');
+const tiktokenBudget = require('./llm/tokenBudget/tiktokenBudget');
+const {
+  buildSuccess,
+  buildFailure,
+  assertAssignableMetadata,
+} = require('./llm/analysisResult');
 const { parseAnalysisResponse } = require('./llm/responseParser');
 const responseLogPath = path.join(
   process.cwd(),
@@ -120,30 +125,10 @@ class CustomOpenAIService {
       }
 
       // Calculate tokens AFTER all prompt modifications are complete
-      const totalPromptTokens = await calculateTotalPromptTokens(
+      const { availableTokens } = await tiktokenBudget.reserve(
         systemPrompt,
         process.env.USE_PROMPT_TAGS === 'yes' ? [promptTags] : [],
         model
-      );
-
-      const maxTokens = Number(config.tokenLimit);
-      const reservedTokens = totalPromptTokens + Number(config.responseTokens);
-      const availableTokens = maxTokens - reservedTokens;
-
-      // Validate that we have positive available tokens. A non-finite budget
-      // is the same failure: it slips past a bare `<= 0` and truncates the
-      // document down to nothing instead of stopping.
-      if (!Number.isFinite(availableTokens) || availableTokens <= 0) {
-        console.warn(
-          `[WARNING] No available tokens for content. Reserved: ${reservedTokens}, Max: ${maxTokens}`
-        );
-        throw new Error(
-          'Token limit exceeded: prompt too large for available token limit'
-        );
-      }
-
-      console.log(
-        `[DEBUG] Token calculation - Prompt: ${totalPromptTokens}, Reserved: ${reservedTokens}, Available: ${availableTokens}`
       );
       console.log(
         `[DEBUG] Use existing data: ${config.useExistingData}, Restrictions applied based on useExistingData setting`
@@ -152,7 +137,7 @@ class CustomOpenAIService {
         `[DEBUG] External API data: ${validatedExternalApiData ? 'included' : 'none'}`
       );
 
-      const truncatedContent = await truncateToTokenLimit(
+      const truncatedContent = await tiktokenBudget.fit(
         content,
         availableTokens,
         model
@@ -242,23 +227,13 @@ class CustomOpenAIService {
         console.warn('Failed to write AI response log:', logError.message);
       }
 
-      // Validate response structure
-      if (
-        !parsedResponse ||
-        !Array.isArray(parsedResponse.tags) ||
-        (typeof parsedResponse.correspondent !== 'string' &&
-          parsedResponse.correspondent !== null)
-      ) {
-        throw new Error(
-          'AI could not determine assignable metadata: no tags or correspondent found'
-        );
-      }
+      assertAssignableMetadata(parsedResponse);
 
-      return {
-        document: parsedResponse,
-        metrics: mappedUsage,
-        truncated: truncatedContent.length < content.length,
-      };
+      return buildSuccess(
+        parsedResponse,
+        mappedUsage,
+        truncatedContent.length < content.length
+      );
     } catch (error) {
       const normalizedMessage = isTimeoutError(error)
         ? buildTimeoutErrorMessage('AI')
@@ -272,14 +247,7 @@ class CustomOpenAIService {
 
       console.error(`Failed to analyze document: ${normalizedMessage}`);
       console.debug(error);
-      return {
-        document: { tags: [], correspondent: null },
-        metrics: null,
-        error: normalizedMessage,
-        // Undefined for everything that is not one of ours; the scan loop
-        // falls back to its generic reason then.
-        errorCode: error.code,
-      };
+      return buildFailure(error, normalizedMessage);
     }
   }
 

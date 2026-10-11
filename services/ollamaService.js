@@ -16,6 +16,12 @@ const config = require('../config/config');
 const { cacheThumbnail } = require('./thumbnailCache');
 const { buildAnalysisPrompt } = require('./llm/promptBuilder');
 const { parseAnalysisResponse } = require('./llm/responseParser');
+const charBudget = require('./llm/tokenBudget/charBudget');
+const {
+  buildSuccess,
+  buildFailure,
+  withDocumentDefaults,
+} = require('./llm/analysisResult');
 const { buildCustomFieldsBlock } = require('./llm/customFieldsTemplate');
 
 /**
@@ -129,9 +135,16 @@ class OllamaService {
         console.log('[DEBUG] Ollama Service started with custom prompt');
       }
 
-      // Fit the document into what is left of the context window
+      // Fit the document into what is left of the context window. Without
+      // this an oversized prompt silently changed the meaning of the request:
+      // Ollama clamps num_ctx to the model's real limit, the long document
+      // filled the window, and the answer was cut off mid-JSON — reported as
+      // ai_response_truncated on exactly the long documents. With the content
+      // fitted, prompt + reserved answer always fit the configured
+      // TOKEN_LIMIT.
       const originalContentLength = String(content).length;
-      content = this._fitContentToContext(content, promptPrefix.length);
+      const { availableTokens } = await charBudget.reserve(promptPrefix);
+      content = await charBudget.fit(content, availableTokens);
 
       if (!customPrompt) {
         prompt = this._buildPrompt(
@@ -193,22 +206,11 @@ class OllamaService {
       await this._logPromptAndResponse(systemPrompt, prompt, parsedResponse);
 
       // Return results in consistent format
-      return {
-        document: parsedResponse,
-        metrics,
-        truncated: contentWasTruncated,
-      };
+      return buildSuccess(parsedResponse, metrics, contentWasTruncated);
     } catch (error) {
       console.error(`Error analyzing document with Ollama: ${error.message}`);
       console.debug(error);
-      return {
-        document: { tags: [], correspondent: null },
-        metrics: null,
-        error: error.message,
-        // Undefined for everything that is not one of ours; the scan loop
-        // falls back to its generic reason then.
-        errorCode: error.code,
-      };
+      return buildFailure(error);
     }
   }
 
@@ -231,57 +233,6 @@ class OllamaService {
       console.debug(error);
     }
     return content;
-  }
-
-  /**
-   * Fit the document content into what is left of the context window once
-   * the fixed prompt parts and the reserved answer have taken their share.
-   *
-   * Without this an oversized prompt silently changed the meaning of the
-   * request: Ollama clamps num_ctx to the model's real limit, the long
-   * document filled the window, and the answer was cut off mid-JSON —
-   * reported as ai_response_truncated on exactly the long documents. With
-   * the content fitted, prompt + reserved answer always fit the configured
-   * TOKEN_LIMIT, so setting that to the model's true context removes the
-   * silent clamp entirely.
-   *
-   * Uses the same conservative 2-chars-per-token estimate as
-   * _calculatePromptTokenCount(), so the numbers agree by construction.
-   *
-   * @param {string} content - Document content
-   * @param {number} prefixChars - Length of the fully built prompt without the content tail
-   * @returns {string} Content shortened to the remaining budget when needed
-   */
-  _fitContentToContext(content, prefixChars) {
-    const maxWindow = Number(config.tokenLimit);
-    const responseTokens = Number(config.responseTokens);
-    if (!Number.isFinite(maxWindow) || !Number.isFinite(responseTokens)) {
-      return content;
-    }
-
-    const text =
-      typeof content === 'string' ? content : JSON.stringify(content);
-    const overheadTokens = Math.ceil(prefixChars / 2);
-    const availableTokens = maxWindow - responseTokens - overheadTokens;
-
-    if (availableTokens <= 0) {
-      throw new Error(
-        'Token limit exceeded: the prompt alone does not fit the configured ' +
-          'TOKEN_LIMIT. Raise TOKEN_LIMIT or shorten the system prompt.'
-      );
-    }
-
-    const maxChars = availableTokens * 2;
-    if (text.length <= maxChars) {
-      return content;
-    }
-
-    console.log(
-      '[DEBUG] Document content (${text.length} chars) exceeds the context ' +
-        'budget (${maxChars} chars for a ${maxWindow}-token window minus prompt' +
-        ' and ${responseTokens} reserved answer tokens); truncating'
-    );
-    return text.substring(0, maxChars);
   }
 
   /**
@@ -408,10 +359,7 @@ class OllamaService {
    * @returns {number} Estimated token count
    */
   _calculatePromptTokenCount(prompt) {
-    // Use conservative 2 chars/token estimate to avoid truncation
-    // with non-English models (CJK, German, etc.) where tokenization
-    // produces roughly 2 chars per token instead of ~4 for English
-    return Math.ceil(prompt.length / 2);
+    return charBudget.estimateTokens(prompt);
   }
 
   /**
@@ -421,10 +369,7 @@ class OllamaService {
    * @returns {number} Context window size
    */
   _calculateNumCtx(promptTokenCount, expectedResponseTokens) {
-    const totalTokenUsage = promptTokenCount + expectedResponseTokens;
-    const maxCtxLimit = Number(config.tokenLimit);
-
-    const numCtx = Math.min(totalTokenUsage, maxCtxLimit);
+    const numCtx = charBudget.numCtx(promptTokenCount, expectedResponseTokens);
 
     console.log('Prompt Token Count:', promptTokenCount);
     console.log('Expected Response Tokens:', expectedResponseTokens);
@@ -656,15 +601,7 @@ class OllamaService {
     }
     try {
       const { parsed } = parseAnalysisResponse(responseData.response);
-      return {
-        tags: Array.isArray(parsed.tags) ? parsed.tags : [],
-        correspondent: parsed.correspondent || null,
-        title: parsed.title || null,
-        document_date: parsed.document_date || null,
-        document_type: parsed.document_type || null,
-        language: parsed.language || null,
-        custom_fields: parsed.custom_fields || null,
-      };
+      return withDocumentDefaults(parsed);
     } catch (error) {
       console.error('Error parsing Ollama response:', error.message);
       throw error;

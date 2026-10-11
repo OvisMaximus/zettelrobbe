@@ -1,6 +1,5 @@
 const {
   calculateTokens,
-  calculateTotalPromptTokens,
   truncateToTokenLimit,
   writePromptToFile,
   extractChatMessageContent,
@@ -26,6 +25,13 @@ const fs = require('fs').promises;
 const path = require('path');
 const { cacheThumbnail } = require('./thumbnailCache');
 const { buildAnalysisPrompt } = require('./llm/promptBuilder');
+const tiktokenBudget = require('./llm/tokenBudget/tiktokenBudget');
+const {
+  buildSuccess,
+  buildFailure,
+  buildInsufficientContent,
+  assertAssignableMetadata,
+} = require('./llm/analysisResult');
 const {
   parseAnalysisResponse,
   stripResponseWrapping,
@@ -124,30 +130,10 @@ class OpenAIService {
       }
 
       // Calculate tokens AFTER all prompt modifications are complete
-      const totalPromptTokens = await calculateTotalPromptTokens(
+      const { availableTokens } = await tiktokenBudget.reserve(
         systemPrompt,
         process.env.USE_PROMPT_TAGS === 'yes' ? [promptTags] : [],
         model
-      );
-
-      const maxTokens = Number(config.tokenLimit);
-      const reservedTokens = totalPromptTokens + Number(config.responseTokens);
-      const availableTokens = maxTokens - reservedTokens;
-
-      // Validate that we have positive available tokens. A non-finite budget
-      // is the same failure: it slips past a bare `<= 0` and truncates the
-      // document down to nothing instead of stopping.
-      if (!Number.isFinite(availableTokens) || availableTokens <= 0) {
-        console.warn(
-          `[WARNING] No available tokens for content. Reserved: ${reservedTokens}, Max: ${maxTokens}`
-        );
-        throw new Error(
-          'Token limit exceeded: prompt too large for available token limit'
-        );
-      }
-
-      console.log(
-        `[DEBUG] Token calculation - Prompt: ${totalPromptTokens}, Reserved: ${reservedTokens}, Available: ${availableTokens}`
       );
       console.log(
         `[DEBUG] Use existing data: ${config.useExistingData}, Restrictions applied based on useExistingData setting`
@@ -156,7 +142,7 @@ class OpenAIService {
         `[DEBUG] External API data: ${validatedExternalApiData ? 'included' : 'none'}`
       );
 
-      const truncatedContent = await truncateToTokenLimit(
+      const truncatedContent = await tiktokenBudget.fit(
         content,
         availableTokens,
         model
@@ -222,19 +208,7 @@ class OpenAIService {
         ) {
           console.warn(`Document ${id} has insufficient content for analysis`);
           // Return a default structure instead of throwing to prevent retry loops
-          return {
-            document: {
-              tags: [],
-              correspondent: 'Unknown',
-              title: `Document ${id}`,
-              document_date: new Date().toISOString().split('T')[0],
-              document_type: 'Document',
-              language: 'und',
-            },
-            metrics: mappedUsage,
-            truncated: false,
-            error: 'Insufficient content for AI analysis',
-          };
+          return buildInsufficientContent(id, mappedUsage);
         }
         throw error;
       }
@@ -246,33 +220,17 @@ class OpenAIService {
         console.warn('Failed to write AI response log:', logError.message);
       }
 
-      if (
-        !parsedResponse ||
-        !Array.isArray(parsedResponse.tags) ||
-        (typeof parsedResponse.correspondent !== 'string' &&
-          parsedResponse.correspondent !== null)
-      ) {
-        throw new Error(
-          'AI could not determine assignable metadata: no tags or correspondent found'
-        );
-      }
+      assertAssignableMetadata(parsedResponse);
 
-      return {
-        document: parsedResponse,
-        metrics: mappedUsage,
-        truncated: truncatedContent.length < content.length,
-      };
+      return buildSuccess(
+        parsedResponse,
+        mappedUsage,
+        truncatedContent.length < content.length
+      );
     } catch (error) {
       console.error(`Failed to analyze document: ${error.message}`);
       console.debug(error);
-      return {
-        document: { tags: [], correspondent: null },
-        metrics: null,
-        error: error.message,
-        // Undefined for everything that is not one of ours; the scan loop
-        // falls back to its generic reason then.
-        errorCode: error.code,
-      };
+      return buildFailure(error);
     }
   }
 

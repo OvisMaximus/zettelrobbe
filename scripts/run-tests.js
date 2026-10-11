@@ -101,6 +101,7 @@ const TESTS = {
   'llm-ocr-fallback-phrases': 'test-llm-ocr-fallback-phrases.js',
   'llm-prompt-builder': 'test-llm-prompt-builder.js',
   'llm-response-parser': 'test-llm-response-parser.js',
+  'llm-token-budget': 'test-llm-token-budget.js',
   'custom-field-longtext': 'test-custom-field-longtext.js',
   'document-processing-service': 'test-document-processing-service.js',
   'settings-custom-field-type-conflict':
@@ -247,6 +248,7 @@ const AREAS = {
     'prompt-existing-data-serialization',
     'restricted-document-types-placeholder',
     'llm-prompt-builder',
+    'llm-token-budget',
     'token-limit-config',
     'truncate-returns-string',
   ],
