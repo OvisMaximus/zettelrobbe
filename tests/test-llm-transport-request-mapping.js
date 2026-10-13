@@ -492,13 +492,16 @@ const ANALYSIS_REQUEST = {
     }
   );
 
-  await check('Azure: analysis sends AI_TEMPERATURE_ANALYSIS (7a)', async () => {
-    const requests = [];
-    azureService.client = fakeChatClient(requests);
-    await analyse(azureService);
-    assert.strictEqual(requests[0].model, 'test-deployment');
-    assert.strictEqual(requests[0].temperature, config.aiTemperatureAnalysis);
-  });
+  await check(
+    'Azure: analysis sends AI_TEMPERATURE_ANALYSIS (7a)',
+    async () => {
+      const requests = [];
+      azureService.client = fakeChatClient(requests);
+      await analyse(azureService);
+      assert.strictEqual(requests[0].model, 'test-deployment');
+      assert.strictEqual(requests[0].temperature, config.aiTemperatureAnalysis);
+    }
+  );
 
   await check('Custom: analysis sends AI_TEMPERATURE_ANALYSIS', async () => {
     const requests = [];

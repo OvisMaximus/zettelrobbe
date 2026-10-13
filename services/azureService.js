@@ -188,8 +188,10 @@ class AzureOpenAIService {
         systemPrompt,
         userContent: truncatedContent,
         model,
-        // Hardcoded unlike the other two (Finding 7a); fixed in step 6.
-        temperature: 0.3,
+        // Finding 7a: the hardcoded 0.3 is gone — analysis follows the
+        // config like the other providers. The generateText() default
+        // below is the same fix on the second path.
+        temperature: config.aiTemperatureAnalysis,
       });
       let jsonContent = payload;
 
@@ -267,7 +269,8 @@ class AzureOpenAIService {
    * @param {string} prompt - The prompt to generate text from
    * @param {object} [options] - Optional overrides for this one call
    * @param {string} [options.systemPrompt] - Sent as the system message
-   * @param {number} [options.temperature] - Overrides the default of 0.7
+   * @param {number} [options.temperature] - Overrides
+   *   config.aiTemperatureGeneration (Finding 7a, step 6)
    * @param {number} [options.maxTokens] - Overrides RESPONSE_TOKENS
    * @param {AbortSignal} [options.signal] - Cancels the request in flight
    * @param {Function} [options.onProgress] - Streams the answer and reports it
@@ -299,7 +302,9 @@ class AzureOpenAIService {
     const request = {
       model: model,
       messages,
-      temperature: hasNumber(options.temperature) ? options.temperature : 0.7,
+      temperature: hasNumber(options.temperature)
+        ? options.temperature
+        : config.aiTemperatureGeneration, // Finding 7a: was a hardcoded 0.7
       // Was a hardcoded 1000, which quarrelled with the setting the same way
       // Ollama's num_predict did — the reservation followed the operator,
       // the limit did not.
