@@ -25,7 +25,7 @@ function run() {
   console.log('\n=== Native Install Log Path Checks ===');
 
   const filesUsingResponseLogPath = [
-    'services/openaiService.js',
+    'services/llm/documentAnalyzer.js',
     'services/customService.js',
     'services/azureService.js',
   ];

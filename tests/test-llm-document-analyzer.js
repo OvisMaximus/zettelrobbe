@@ -169,20 +169,17 @@ const fakeChatClient = (requests, respond = async () => CHAT_ANSWER) => ({
   await check(
     'a refusal is the insufficient-content placeholder, not a throw',
     async () => {
-      openaiProvider.client = fakeChatClient(
-        [],
-        async () => ({
-          ...CHAT_ANSWER,
-          choices: [
-            {
-              message: {
-                content: "I'm sorry, I cannot analyse this document.",
-              },
-              finish_reason: 'stop',
+      openaiProvider.client = fakeChatClient([], async () => ({
+        ...CHAT_ANSWER,
+        choices: [
+          {
+            message: {
+              content: "I'm sorry, I cannot analyse this document.",
             },
-          ],
-        })
-      );
+            finish_reason: 'stop',
+          },
+        ],
+      }));
       const analysis = await analyse(openaiProvider);
 
       assert.strictEqual(
@@ -198,10 +195,7 @@ const fakeChatClient = (requests, respond = async () => CHAT_ANSWER) => ({
   await check(
     'a missing usable message is a failure record, never a throw',
     async () => {
-      openaiProvider.client = fakeChatClient(
-        [],
-        async () => ({ choices: [] })
-      );
+      openaiProvider.client = fakeChatClient([], async () => ({ choices: [] }));
       const analysis = await analyse(openaiProvider);
 
       assert.ok(analysis, 'analyzeDocument returned nothing at all');
@@ -222,33 +216,28 @@ const fakeChatClient = (requests, respond = async () => CHAT_ANSWER) => ({
   await check(
     'a note without tags or correspondent records a failure',
     async () => {
-      openaiProvider.client = fakeChatClient(
-        [],
-        async () => ({
-          ...CHAT_ANSWER,
-          choices: [
-            { message: { content: '{"note": "nothing usable here"}' } },
-          ],
-        })
-      );
+      openaiProvider.client = fakeChatClient([], async () => ({
+        ...CHAT_ANSWER,
+        choices: [{ message: { content: '{"note": "nothing usable here"}' } }],
+      }));
       const analysis = await analyse(openaiProvider);
 
       assert.ok(analysis, 'analyzeDocument returned nothing at all');
       assert.strictEqual(analysis.metrics, null);
-      assert.match(
-        analysis.error,
-        /could not determine assignable metadata/i
-      );
+      assert.match(analysis.error, /could not determine assignable metadata/i);
     }
   );
 
   /* --- checkStatus delegates to the transport's probe ------------------- */
 
-  await check('checkStatus reports ok through the transport probe', async () => {
-    openaiProvider.client = { models: { list: async () => ({ data: [] }) } };
-    const status = await openaiProvider.checkStatus();
-    assert.deepStrictEqual(status, { status: 'ok', model: 'gpt-4' });
-  });
+  await check(
+    'checkStatus reports ok through the transport probe',
+    async () => {
+      openaiProvider.client = { models: { list: async () => ({ data: [] }) } };
+      const status = await openaiProvider.checkStatus();
+      assert.deepStrictEqual(status, { status: 'ok', model: 'gpt-4' });
+    }
+  );
 
   await check(
     'checkStatus without a ready client reports the not-ready error',
@@ -275,10 +264,7 @@ const fakeChatClient = (requests, respond = async () => CHAT_ANSWER) => ({
     const text = await openaiProvider.generateText('hello');
     assert.strictEqual(text, 'hello answer');
     assert.strictEqual(requests[0].model, 'gpt-4');
-    assert.strictEqual(
-      requests[0].temperature,
-      config.aiTemperatureGeneration
-    );
+    assert.strictEqual(requests[0].temperature, config.aiTemperatureGeneration);
     assert.deepStrictEqual(requests[0].messages, [
       { role: 'user', content: 'hello' },
     ]);
