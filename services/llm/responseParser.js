@@ -23,6 +23,15 @@
 
 const INVALID_JSON = 'Invalid JSON response from API';
 
+/**
+ * The phrases a model writes when it declines the document as too thin to
+ * analyse. A refusal is an unparseable *answer*, not an unparseable *parse*
+ * — it must not be reported as "Invalid JSON", it must be recognised as
+ * "insufficient content" so it routes to OCR under that reason and does not
+ * loop a retry asking the model again.
+ */
+const INSUFFICIENT_CONTENT_MARKERS = ["i'm sorry", 'i cannot', 'insufficient'];
+
 /** Drop reasoning blocks and code fences around the answer. */
 function stripResponseWrapping(text) {
   return String(text ?? '')
@@ -30,6 +39,24 @@ function stripResponseWrapping(text) {
     .replace(/```json\n?/gi, '')
     .replace(/```\n?/g, '')
     .trim();
+}
+
+/**
+ * Whether a model answer is a refusal — an apology or a statement that the
+ * content is thin, rather than JSON. Shared by every provider's
+ * analyzeDocument(): when the answer does not parse and it is one of these,
+ * that provider returns buildInsufficientContent() instead of failing with
+ * "Invalid JSON".
+ *
+ * @param {string} raw - The model's answer
+ * @returns {boolean} True when the answer reads like a refusal
+ */
+function isInsufficientContentAnswer(raw) {
+  const text = stripResponseWrapping(raw).toLowerCase();
+  if (!text) {
+    return false;
+  }
+  return INSUFFICIENT_CONTENT_MARKERS.some((marker) => text.includes(marker));
 }
 
 /**
@@ -163,4 +190,5 @@ function parseAnalysisResponse(raw) {
 module.exports = {
   parseAnalysisResponse,
   stripResponseWrapping,
+  isInsufficientContentAnswer,
 };

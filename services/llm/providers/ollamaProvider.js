@@ -4,7 +4,6 @@ const axios = require('axios');
 const config = require('../../../config/config');
 const { cacheThumbnail } = require('../../thumbnailCache');
 const { buildAnalysisPrompt } = require('../promptBuilder');
-const { parseAnalysisResponse } = require('../responseParser');
 const charBudget = require('../tokenBudget/charBudget');
 const {
   OllamaGenerateTransport,
@@ -12,9 +11,14 @@ const {
 const {
   buildSuccess,
   buildFailure,
+  buildInsufficientContent,
   assertAssignableMetadata,
   withDocumentDefaults,
 } = require('../analysisResult');
+const {
+  parseAnalysisResponse,
+  isInsufficientContentAnswer,
+} = require('../responseParser');
 const { buildCustomFieldsBlock } = require('../customFieldsTemplate');
 
 /**
@@ -216,13 +220,13 @@ class OllamaService {
         numCtx,
         this.documentAnalysisSchema
       );
+      const metrics = this._extractOllamaMetrics(response);
 
       // Process response — shape the document, and fail an answer the model
       // never assigned tags or a correspondent in (Finding 7k). The metadata
       // check runs inside _processOllamaResponse() on the parsed answer,
       // before withDocumentDefaults() would mask it.
       const document = this._processOllamaResponse(response);
-      const metrics = this._extractOllamaMetrics(response);
 
       // Log the prompt and response
       await this._logPromptAndResponse(systemPrompt, prompt, document);
@@ -230,6 +234,16 @@ class OllamaService {
       // Return results in consistent format
       return buildSuccess(document, metrics, contentWasTruncated);
     } catch (error) {
+      // A refusal is an answer the model declined, not a broken one: return
+      // the insufficient-content placeholder so the retry loop does not ask
+      // again and the document still reaches OCR (Finding 7c).
+      if (error.insufficientContent) {
+        console.warn(`Document ${id} has insufficient content for analysis`);
+        return buildInsufficientContent(
+          id,
+          this._extractOllamaMetrics(error.ollamaResponse)
+        );
+      }
       console.error(`Error analyzing document with Ollama: ${error.message}`);
       console.debug(error);
       return buildFailure(error);
@@ -461,6 +475,21 @@ class OllamaService {
       assertAssignableMetadata(parsed);
       return withDocumentDefaults(parsed);
     } catch (error) {
+      // A refusal failed to parse (Finding 7c): route it as insufficient
+      // content rather than "Invalid JSON", so the document reaches OCR under
+      // that reason and the retry loop does not ask again. The raw response
+      // rides with the tagged error so the caller can record the tokens the
+      // refusal cost. A parse that succeeded but found no metadata is the 7k
+      // failure, and any other parse error keeps its message — both rethrow.
+      if (
+        isInsufficientContentAnswer(responseData.response) &&
+        error.message.startsWith('Invalid JSON response from API')
+      ) {
+        const refusal = new Error('Insufficient content for AI analysis');
+        refusal.insufficientContent = true;
+        refusal.ollamaResponse = responseData;
+        throw refusal;
+      }
       console.error('Error parsing Ollama response:', error.message);
       throw error;
     }

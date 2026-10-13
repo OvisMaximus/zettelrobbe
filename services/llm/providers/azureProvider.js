@@ -24,10 +24,14 @@ const {
 const {
   buildSuccess,
   buildFailure,
+  buildInsufficientContent,
   assertAssignableMetadata,
   withDocumentDefaults,
 } = require('../analysisResult');
-const { parseAnalysisResponse } = require('../responseParser');
+const {
+  parseAnalysisResponse,
+  isInsufficientContentAnswer,
+} = require('../responseParser');
 const responseLogPath = path.join(
   process.cwd(),
   'data',
@@ -204,6 +208,13 @@ class AzureOpenAIService {
       } catch (error) {
         console.error(`Failed to parse JSON response: ${error.message}`);
         console.debug(error);
+        // A refusal is an answer the model declined, not a parse failure:
+        // return the insufficient-content placeholder so the retry loop does
+        // not ask again and the document still reaches OCR (Finding 7c).
+        if (isInsufficientContentAnswer(payload)) {
+          console.warn(`Document ${id} has insufficient content for analysis`);
+          return buildInsufficientContent(id, mappedUsage);
+        }
         throw error;
       }
 
