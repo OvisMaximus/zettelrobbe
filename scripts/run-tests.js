@@ -98,6 +98,7 @@ const TESTS = {
   'custom-field-monetary-normalization':
     'test-custom-field-monetary-normalization.js',
   'llm-analysis-result-contract': 'test-llm-analysis-result-contract.js',
+  'llm-document-analyzer': 'test-llm-document-analyzer.js',
   'llm-ocr-fallback-phrases': 'test-llm-ocr-fallback-phrases.js',
   'llm-prompt-builder': 'test-llm-prompt-builder.js',
   'llm-response-parser': 'test-llm-response-parser.js',
@@ -239,6 +240,7 @@ const AREAS = {
     'reconciliation-service',
     'settings-paperless-url-fallback',
     'llm-analysis-result-contract',
+    'llm-document-analyzer',
     'llm-ocr-fallback-phrases',
     'llm-response-parser',
     'llm-transport-request-mapping',
