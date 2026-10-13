@@ -275,13 +275,10 @@ const assertRoutesToOcr = (analysis, expectedReason) => {
     }
   );
 
-  /* The three OpenAI-compatible services raise "could not determine
-     assignable metadata"; Ollama returns an all-null document with no error
-     at all, so it never reaches OCR. See test-llm-analysis-result-contract.js,
-     where that drift is pinned. */
-  for (const { label, service, answer } of PROVIDERS.filter(
-    (p) => p.label !== 'Ollama'
-  )) {
+  /* All four providers raise "could not determine assignable metadata",
+     so every one of them routes the document to OCR as an invalid
+     response structure. */
+  for (const { label, service, answer } of PROVIDERS) {
     await check(
       `${label}: an answer without metadata routes to OCR`,
       async () => {
