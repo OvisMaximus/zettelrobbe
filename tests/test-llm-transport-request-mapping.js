@@ -11,9 +11,9 @@
  * The first half pins each transport on its own with a fake client. The
  * second half checks that every provider's analysis request goes through its
  * transport and is mapped the way it was before: OpenAI omits the
- * temperature for o3-mini, Azure still hardcodes 0.3 (Finding 7a, fixed in
- * step 6), Ollama sends format, num_ctx, num_predict and think:false unless
- * OLLAMA_THINK is set.
+ * temperature for o3-mini, Azure sends the configured analysis
+ * temperature (Finding 7a, step 6), Ollama sends format, num_ctx,
+ * num_predict and think:false unless OLLAMA_THINK is set.
  */
 
 const assert = require('assert');
@@ -492,16 +492,13 @@ const ANALYSIS_REQUEST = {
     }
   );
 
-  await check(
-    'Azure: analysis still sends 0.3 (Finding 7a, step 6)',
-    async () => {
-      const requests = [];
-      azureService.client = fakeChatClient(requests);
-      await analyse(azureService);
-      assert.strictEqual(requests[0].model, 'test-deployment');
-      assert.strictEqual(requests[0].temperature, 0.3);
-    }
-  );
+  await check('Azure: analysis sends AI_TEMPERATURE_ANALYSIS (7a)', async () => {
+    const requests = [];
+    azureService.client = fakeChatClient(requests);
+    await analyse(azureService);
+    assert.strictEqual(requests[0].model, 'test-deployment');
+    assert.strictEqual(requests[0].temperature, config.aiTemperatureAnalysis);
+  });
 
   await check('Custom: analysis sends AI_TEMPERATURE_ANALYSIS', async () => {
     const requests = [];
