@@ -24,10 +24,15 @@ function assertMatches(content, regex, message) {
 function run() {
   console.log('\n=== Native Install Log Path Checks ===');
 
+  // Step-6 structural relocation: services/{custom,azure}Service.js are now
+  // one-line re-export shims over services/llm/providers/*; the response-log
+  // path built here moved with the business logic into the composition roots,
+  // so this guard sniffs the new locations (same invariant: cwd-relative, no
+  // hardcoded '/app').
   const filesUsingResponseLogPath = [
     'services/llm/documentAnalyzer.js',
-    'services/customService.js',
-    'services/azureService.js',
+    'services/llm/providers/customProvider.js',
+    'services/llm/providers/azureProvider.js',
   ];
 
   filesUsingResponseLogPath.forEach((relativePath) => {

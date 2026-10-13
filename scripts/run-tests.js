@@ -105,6 +105,7 @@ const TESTS = {
   'llm-token-budget': 'test-llm-token-budget.js',
   'llm-transport-request-mapping': 'test-llm-transport-request-mapping.js',
   'llm-azure-temperature-wiring': 'test-llm-azure-temperature-wiring.js',
+  'llm-provider-parity': 'llm-provider-parity.js',
   'custom-field-longtext': 'test-custom-field-longtext.js',
   'document-processing-service': 'test-document-processing-service.js',
   'settings-custom-field-type-conflict':
@@ -246,6 +247,7 @@ const AREAS = {
     'llm-response-parser',
     'llm-transport-request-mapping',
     'llm-azure-temperature-wiring',
+    'llm-provider-parity',
     'rescan-fetch-before-delete',
   ],
   prompts: [

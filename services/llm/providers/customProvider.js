@@ -1,0 +1,400 @@
+const {
+  calculateTokens,
+  truncateToTokenLimit,
+  isTimeoutError,
+  buildTimeoutErrorMessage,
+} = require('../../serviceUtils');
+const {
+  hasNumber,
+  hasSystemPrompt,
+  modelOverride,
+  reasoningEffortForCompatible,
+  reasoningEnabled,
+} = require('../../aiGenerateOptions');
+const OpenAI = require('openai');
+const config = require('../../../config/config');
+const fs = require('fs').promises;
+const path = require('path');
+const { cacheThumbnail } = require('../../thumbnailCache');
+const { buildAnalysisPrompt } = require('../promptBuilder');
+const tiktokenBudget = require('../tokenBudget/tiktokenBudget');
+const {
+  ChatCompletionsTransport,
+} = require('../transports/chatCompletionsTransport');
+const {
+  buildSuccess,
+  buildFailure,
+  assertAssignableMetadata,
+} = require('../analysisResult');
+const { parseAnalysisResponse } = require('../responseParser');
+const responseLogPath = path.join(
+  process.cwd(),
+  'data',
+  'logs',
+  'response.txt'
+);
+const CUSTOM_PROVIDER_FALLBACK_API_KEY = 'no-auth-required';
+/** What an operator can do about an answer that hit the completion cap. */
+const TRUNCATION_REMEDY = 'Raise Response Tokens (RESPONSE_TOKENS).';
+/**
+ * The soft switch the Qwen family reads out of the prompt itself.
+ *
+ * `chat_template_kwargs` only reaches a server that applies the model's chat
+ * template; a gateway that forwards the messages and drops the rest leaves the
+ * model thinking anyway. Qwen understands the same wish written into the last
+ * line of the user message, so both are sent and whichever arrives wins.
+ */
+const QWEN_NO_THINK_SWITCH = '/no_think';
+/** Models that understand the line above. */
+const QWEN_MODEL_PATTERN = /qwen/i;
+
+class CustomOpenAIService {
+  constructor() {
+    this.transport = new ChatCompletionsTransport({
+      label: 'Custom OpenAI',
+      generation: {
+        notReadyMessage:
+          'Custom OpenAI client not initialized - missing API key',
+        remedy: TRUNCATION_REMEDY,
+        buildRequest: (prompt, options) =>
+          this._buildGenerationRequest(prompt, options),
+        // Say what came back: a gateway that timed out behind a 200, a
+        // model that stopped after its reasoning without an answer, or an
+        // empty choices array all end here and need telling apart.
+        describeEmptyText: (response) => {
+          const finishReason =
+            response?.choices?.[0]?.finish_reason ?? 'unknown';
+          const head = JSON.stringify(response ?? null).slice(0, 200);
+          return `Invalid API response structure: the answer carried no text (finish_reason ${finishReason}; the response begins ${head})`;
+        },
+      },
+      createClient: () =>
+        config.aiProvider === 'custom'
+          ? new OpenAI({
+              baseURL: config.custom.apiUrl,
+              // OpenAI-compatible SDKs require an apiKey value even when auth is disabled.
+              apiKey: config.custom.apiKey || CUSTOM_PROVIDER_FALLBACK_API_KEY,
+            })
+          : null,
+      // Every message keeps the "Invalid API response structure" prefix:
+      // shouldQueueForOcrOnAiError() matches on that phrase, and without it
+      // the document no longer reaches the OCR fallback.
+      describeMissingContent: (response, message) => {
+        const missing = !response
+          ? 'the response is empty'
+          : !response.choices
+            ? 'missing choices'
+            : !response.choices[0]
+              ? 'missing choices[0]'
+              : !response.choices[0].message
+                ? 'missing choices[0].message'
+                : !response.choices[0].message.content
+                  ? 'missing choices[0].message.content'
+                  : `unusable content ${message?.content}`;
+        return `Invalid API response structure: ${missing}.`;
+      },
+    });
+    this.tokenizer = null;
+  }
+
+  /** The SDK client. It lives on the transport; tests replace it here. */
+  get client() {
+    return this.transport.client;
+  }
+
+  set client(client) {
+    this.transport.client = client;
+  }
+
+  /** Usage of the last generateText() call; read by the AI review features. */
+  get lastGenerateTextUsage() {
+    return this.transport.lastGenerateTextUsage;
+  }
+
+  set lastGenerateTextUsage(usage) {
+    this.transport.lastGenerateTextUsage = usage;
+  }
+
+  initialize() {
+    this.transport.initialize();
+  }
+
+  async analyzeDocument(
+    content,
+    existingTags = [],
+    existingCorrespondentList = [],
+    existingDocumentTypesList = [],
+    id,
+    customPrompt = null,
+    options = {}
+  ) {
+    try {
+      this.initialize();
+
+      if (!this.client) {
+        throw new Error('Custom OpenAI client not initialized');
+      }
+
+      // Cache the thumbnail for the UI; never let it affect the analysis.
+      await cacheThumbnail(id);
+
+      // Get external API data if available and validate it
+      let externalApiData = options.externalApiData || null;
+      let validatedExternalApiData = null;
+
+      if (externalApiData) {
+        try {
+          validatedExternalApiData =
+            await this._validateAndTruncateExternalApiData(externalApiData);
+          console.log('[DEBUG] External API data validated and included');
+        } catch (error) {
+          console.warn(
+            '[WARNING] External API data validation failed:',
+            error.message
+          );
+          validatedExternalApiData = null;
+        }
+      }
+
+      const model = config.custom.model;
+      const { systemPrompt, promptTags } = buildAnalysisPrompt({
+        existingTags,
+        existingCorrespondentList,
+        existingDocumentTypesList,
+        externalApiData: validatedExternalApiData,
+        customPrompt,
+      });
+      if (customPrompt) {
+        console.log('[DEBUG] Replace system prompt with custom prompt');
+      }
+
+      // Calculate tokens AFTER all prompt modifications are complete
+      const { availableTokens } = await tiktokenBudget.reserve(
+        systemPrompt,
+        process.env.USE_PROMPT_TAGS === 'yes' ? [promptTags] : [],
+        model
+      );
+      console.log(
+        `[DEBUG] Use existing data: ${config.useExistingData}, Restrictions applied based on useExistingData setting`
+      );
+      console.log(
+        `[DEBUG] External API data: ${validatedExternalApiData ? 'included' : 'none'}`
+      );
+
+      const truncatedContent = await tiktokenBudget.fit(
+        content,
+        availableTokens,
+        model
+      );
+
+      // console.log('######################################################################');
+      // console.log(`[DEBUG] Content length: ${content.length}, Truncated content length: ${truncatedContent.length}`);
+      // console.log(`[DEBUG] Truncated content: ${truncatedContent}`);
+      // console.log(`[DEBUG] System prompt: ${systemPrompt}`);
+      // console.log(`[DEBUG] Prompt tags: ${promptTags}`);
+      // console.log(`[DEBUG] Model: ${model}`);
+      // console.log(`[DEBUG] Custom fields: ${customFieldsStr}`);
+      // console.log(`[DEBUG] Custom prompt: ${customPrompt}`);
+      // console.log(`[DEBUG] External API data: ${validatedExternalApiData}`);
+      // console.log('######################################################################');
+
+      const { payload, metrics: mappedUsage } = await this.transport.complete({
+        systemPrompt,
+        userContent: truncatedContent,
+        model,
+        temperature: config.aiTemperatureAnalysis,
+      });
+      let jsonContent = payload;
+
+      let parsedResponse;
+      try {
+        const parsedResult = parseAnalysisResponse(jsonContent);
+        parsedResponse = parsedResult.parsed;
+        jsonContent = parsedResult.normalized;
+      } catch (error) {
+        console.log(`[ERROR] Failed to parse JSON response: ${error.message}`);
+        console.debug(error);
+        throw error;
+      }
+
+      try {
+        await fs.mkdir(path.dirname(responseLogPath), { recursive: true });
+        await fs.appendFile(responseLogPath, `${jsonContent}\n`);
+      } catch (logError) {
+        console.warn('Failed to write AI response log:', logError.message);
+      }
+
+      assertAssignableMetadata(parsedResponse);
+
+      return buildSuccess(
+        parsedResponse,
+        mappedUsage,
+        truncatedContent.length < content.length
+      );
+    } catch (error) {
+      const normalizedMessage = isTimeoutError(error)
+        ? buildTimeoutErrorMessage('AI')
+        : error.message;
+
+      if (isTimeoutError(error)) {
+        console.error(
+          `[TIMEOUT][AI] Custom provider request timed out: ${error.message}`
+        );
+      }
+
+      console.error(`Failed to analyze document: ${normalizedMessage}`);
+      console.debug(error);
+      return buildFailure(error, normalizedMessage);
+    }
+  }
+
+  /**
+   * Validate and truncate external API data to prevent token overflow
+   * @param {any} apiData - The external API data to validate
+   * @param {number} maxTokens - Maximum tokens allowed for external data (default: 500)
+   * @returns {string} - Validated and potentially truncated data string
+   */
+  async _validateAndTruncateExternalApiData(apiData, maxTokens = 500) {
+    if (!apiData) {
+      return null;
+    }
+
+    const dataString =
+      typeof apiData === 'object'
+        ? JSON.stringify(apiData, null, 2)
+        : String(apiData);
+
+    // Calculate tokens for the data
+    const dataTokens = await calculateTokens(dataString, config.custom.model);
+
+    if (dataTokens > maxTokens) {
+      console.warn(
+        `[WARNING] External API data (${dataTokens} tokens) exceeds limit (${maxTokens}), truncating`
+      );
+      return await truncateToTokenLimit(
+        dataString,
+        maxTokens,
+        config.custom.model
+      );
+    }
+
+    console.log(`[DEBUG] External API data validated: ${dataTokens} tokens`);
+    return dataString;
+  }
+
+  /**
+   * Generate text based on a prompt
+   * @param {string} prompt - The prompt to generate text from
+   * @param {object} [options] - Optional overrides for this one call
+   * @param {string} [options.systemPrompt] - Sent as the system message
+   * @param {number} [options.temperature] - Overrides AI_TEMPERATURE_GENERATION
+   * @param {number} [options.maxTokens] - Overrides RESPONSE_TOKENS, still clamped
+   * @param {AbortSignal} [options.signal] - Cancels the request in flight
+   * @param {Function} [options.onProgress] - Streams the answer and reports it
+   *   as it grows; see GenerateTextProgress in aiGenerateOptions
+   * @param {boolean} [options.reasoning] - Switches the model's thinking off
+   *   or on for this one call; nothing new is sent when the caller says
+   *   nothing. Off also sends reasoning_effort where the model family takes it
+   * @returns {Promise<string>} - The generated text
+   */
+  async generateText(prompt, options = {}) {
+    return this.transport.generate(prompt, options);
+  }
+
+  /**
+   * This provider's generateText() request. The transport sends it, streams
+   * it and reads the answer; what differs between the providers is here.
+   * @param {string} prompt
+   * @param {object} options - see generateText()
+   * @returns {Promise<Object>} The chat completions request
+   */
+  async _buildGenerationRequest(prompt, options) {
+    const model = modelOverride(options) || config.custom.model;
+    const maxContextTokens = Number(config.tokenLimit) || 128000;
+    const desiredCompletionTokens =
+      hasNumber(options.maxTokens) && options.maxTokens > 0
+        ? Math.floor(options.maxTokens)
+        : Number(config.responseTokens) || 1000;
+    const promptTokens = await calculateTokens(prompt, model);
+    const availableCompletionTokens = Math.max(
+      1,
+      maxContextTokens - promptTokens - 64
+    );
+    const maxCompletionTokens = Math.max(
+      1,
+      Math.min(desiredCompletionTokens, availableCompletionTokens)
+    );
+
+    if (maxCompletionTokens < desiredCompletionTokens) {
+      console.log(
+        `[DEBUG] Clamped max_tokens for custom generateText from ${desiredCompletionTokens} to ${maxCompletionTokens} ` +
+          `(context limit: ${maxContextTokens}, prompt tokens: ${promptTokens})`
+      );
+    }
+
+    const reasoning = reasoningEnabled(options);
+    const messages = [];
+    if (hasSystemPrompt(options)) {
+      messages.push({ role: 'system', content: options.systemPrompt });
+    }
+    messages.push({
+      role: 'user',
+      content:
+        reasoning === false && QWEN_MODEL_PATTERN.test(model)
+          ? `${prompt}\n${QWEN_NO_THINK_SWITCH}`
+          : prompt,
+    });
+
+    const request = {
+      model: model,
+      messages,
+      temperature: hasNumber(options.temperature)
+        ? options.temperature
+        : config.aiTemperatureGeneration,
+      max_tokens: maxCompletionTokens,
+    };
+    // The key every OpenAI-compatible server that applies a chat template
+    // understands; one that does not know it passes it through and the
+    // model decides for itself, as it did before.
+    if (reasoning !== null) {
+      request.chat_template_kwargs = { enable_thinking: reasoning };
+    }
+    // A hosted reasoning model reads neither of the two above and thinks
+    // anyway; the families that take reasoning_effort are told in their own
+    // dialect. Only when the caller asked for no thinking, and only for
+    // those names — another model answers 400 for the field.
+    if (reasoning === false) {
+      const effort = reasoningEffortForCompatible(model);
+      if (effort) request.reasoning_effort = effort;
+    }
+
+    return request;
+  }
+
+  async checkStatus() {
+    try {
+      this.initialize();
+
+      if (!this.client) {
+        throw new Error(
+          'Custom OpenAI client not initialized - missing API key'
+        );
+      }
+
+      const model = config.custom.model;
+
+      // Use token-free endpoint where supported by OpenAI-compatible providers.
+      await this.client.models.list();
+
+      return { status: 'ok', model: model };
+    } catch (error) {
+      console.error(
+        `Error generating text with Custom OpenAI: ${error.message}`
+      );
+      console.debug(error);
+      return { status: 'error', error: error.message };
+    }
+  }
+}
+
+module.exports = new CustomOpenAIService();
