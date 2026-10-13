@@ -323,10 +323,10 @@ function sameDocument(label, actual, expected) {
           shouldQueueForOcrOnAiError(analysis.error),
           `the failure routes to OCR: ${analysis.error}`
         );
-        assert.deepStrictEqual(
-          analysis.document,
-          { tags: [], correspondent: null }
-        );
+        assert.deepStrictEqual(analysis.document, {
+          tags: [],
+          correspondent: null,
+        });
         assert.strictEqual(analysis.metrics, null);
       }
     );

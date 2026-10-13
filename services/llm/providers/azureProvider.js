@@ -25,6 +25,7 @@ const {
   buildSuccess,
   buildFailure,
   assertAssignableMetadata,
+  withDocumentDefaults,
 } = require('../analysisResult');
 const { parseAnalysisResponse } = require('../responseParser');
 const responseLogPath = path.join(
@@ -216,7 +217,7 @@ class AzureOpenAIService {
       assertAssignableMetadata(parsedResponse);
 
       return buildSuccess(
-        parsedResponse,
+        withDocumentDefaults(parsedResponse),
         mappedUsage,
         truncatedContent.length < content.length
       );

@@ -24,6 +24,7 @@ const {
   buildFailure,
   buildInsufficientContent,
   assertAssignableMetadata,
+  withDocumentDefaults,
 } = require('./analysisResult');
 
 class DocumentAnalyzer {
@@ -225,7 +226,7 @@ class DocumentAnalyzer {
       assertAssignableMetadata(parsedResponse);
 
       return buildSuccess(
-        parsedResponse,
+        withDocumentDefaults(parsedResponse),
         mappedUsage,
         truncatedContent.length < content.length
       );

@@ -12,6 +12,7 @@ const {
 const {
   buildSuccess,
   buildFailure,
+  assertAssignableMetadata,
   withDocumentDefaults,
 } = require('../analysisResult');
 const { buildCustomFieldsBlock } = require('../customFieldsTemplate');
@@ -216,25 +217,18 @@ class OllamaService {
         this.documentAnalysisSchema
       );
 
-      // Process response
-      const parsedResponse = this._processOllamaResponse(response);
+      // Process response — shape the document, and fail an answer the model
+      // never assigned tags or a correspondent in (Finding 7k). The metadata
+      // check runs inside _processOllamaResponse() on the parsed answer,
+      // before withDocumentDefaults() would mask it.
+      const document = this._processOllamaResponse(response);
       const metrics = this._extractOllamaMetrics(response);
 
-      // Check for missing data
-      if (
-        parsedResponse.tags.length === 0 &&
-        parsedResponse.correspondent === null
-      ) {
-        console.warn(
-          'No tags or correspondent found in response from Ollama for Document. Please review your prompt or switch to OpenAI for better results.'
-        );
-      }
-
       // Log the prompt and response
-      await this._logPromptAndResponse(systemPrompt, prompt, parsedResponse);
+      await this._logPromptAndResponse(systemPrompt, prompt, document);
 
       // Return results in consistent format
-      return buildSuccess(parsedResponse, metrics, contentWasTruncated);
+      return buildSuccess(document, metrics, contentWasTruncated);
     } catch (error) {
       console.error(`Error analyzing document with Ollama: ${error.message}`);
       console.debug(error);
@@ -459,6 +453,12 @@ class OllamaService {
     }
     try {
       const { parsed } = parseAnalysisResponse(responseData.response);
+      // Finding 7k: the metadata check runs on the parsed answer, BEFORE
+      // withDocumentDefaults() — the defaults turn a missing `tags` into []
+      // and a missing correspondent into null, which would make the check
+      // pass for every answer. Fail an answer the model never assigned tags
+      // or a correspondent in.
+      assertAssignableMetadata(parsed);
       return withDocumentDefaults(parsed);
     } catch (error) {
       console.error('Error parsing Ollama response:', error.message);
