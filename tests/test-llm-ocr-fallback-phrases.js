@@ -267,10 +267,7 @@ const assertRoutesToOcr = (analysis, expectedReason) => {
       `${label}: a refusal routes to OCR as insufficient content`,
       async () => {
         answer("I'm sorry, there is insufficient text to analyse.");
-        assertRoutesToOcr(
-          await analyse(service),
-          'ai_insufficient_content'
-        );
+        assertRoutesToOcr(await analyse(service), 'ai_insufficient_content');
       }
     );
   }
