@@ -24,11 +24,8 @@ function assertMatches(content, regex, message) {
 function run() {
   console.log('\n=== Native Install Log Path Checks ===');
 
-  // The chat providers share the response log of the DocumentAnalyzer.
-  const filesUsingResponseLogPath = [
-    'services/llm/documentAnalyzer.js',
-    'services/customService.js',
-  ];
+  // Every provider writes the response log through the DocumentAnalyzer.
+  const filesUsingResponseLogPath = ['services/llm/documentAnalyzer.js'];
 
   filesUsingResponseLogPath.forEach((relativePath) => {
     const fullPath = path.join(process.cwd(), relativePath);
