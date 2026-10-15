@@ -12,6 +12,7 @@ const {
 const {
   buildSuccess,
   buildFailure,
+  assertAssignableMetadata,
   withDocumentDefaults,
 } = require('./llm/analysisResult');
 const { buildCustomFieldsBlock } = require('./llm/customFieldsTemplate');
@@ -219,16 +220,6 @@ class OllamaService {
       // Process response
       const parsedResponse = this._processOllamaResponse(response);
       const metrics = this._extractOllamaMetrics(response);
-
-      // Check for missing data
-      if (
-        parsedResponse.tags.length === 0 &&
-        parsedResponse.correspondent === null
-      ) {
-        console.warn(
-          'No tags or correspondent found in response from Ollama for Document. Please review your prompt or switch to OpenAI for better results.'
-        );
-      }
 
       // Log the prompt and response
       await this._logPromptAndResponse(systemPrompt, prompt, parsedResponse);
@@ -459,6 +450,9 @@ class OllamaService {
     }
     try {
       const { parsed } = parseAnalysisResponse(responseData.response);
+      // On the parsed answer: the defaults would turn a missing `tags` into
+      // [] and let every answer pass.
+      assertAssignableMetadata(parsed);
       return withDocumentDefaults(parsed);
     } catch (error) {
       console.error('Error parsing Ollama response:', error.message);

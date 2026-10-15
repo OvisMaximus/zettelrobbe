@@ -293,18 +293,17 @@ const assertFailureRecord = (analysis) => {
     );
   }
 
-  /* --- an answer with no usable metadata: the providers disagree --------- */
+  /* --- an answer with no usable metadata is a failure on all four -------- */
 
-  /* OpenAI, Azure and Custom raise "AI could not determine assignable
-     metadata: no tags or correspondent found", which is one of the phrases
-     shouldQueueForOcrOnAiError() matches, so the document reaches the OCR
-     queue. Ollama only logs and returns an all-null document as a *success*:
-     no error, metrics populated. The scan loop therefore writes nulls back to
-     Paperless and never falls back to OCR. */
+  /* Finding 7k, decided 2026-10-11: all four providers raise "AI could not
+     determine assignable metadata: no tags or correspondent found", which is
+     one of the phrases shouldQueueForOcrOnAiError() matches, so the document
+     reaches the OCR queue. The check runs on the parsed answer, before
+     withDocumentDefaults() would turn a missing `tags` into [] and make
+     every answer pass. { tags: [], correspondent: null } still passes on
+     all four — a model that found nothing is not a broken answer. */
 
-  for (const { label, service, arrangeAnswer } of PROVIDERS.filter(
-    (p) => p.label !== 'Ollama'
-  )) {
+  for (const { label, service, arrangeAnswer } of PROVIDERS) {
     await check(
       `${label}: an answer without usable metadata is a failure`,
       async () => {
@@ -320,34 +319,47 @@ const assertFailureRecord = (analysis) => {
     );
   }
 
-  /* Pinned as it is today so the divergence is visible rather than absent.
-     When the refactor unifies this path (Finding 7c/7k), this case will start
-     failing — that is the point. Replace it with the assertion above and drop
-     the Ollama exclusion from the loop overhead. */
-  await check(
-    'Ollama: an answer without usable metadata is NOT reported as a failure (known drift)',
-    async () => {
-      const ollama = PROVIDERS.find((p) => p.label === 'Ollama');
-      ollama.arrangeAnswer(JSON.stringify({ note: 'nothing usable here' }));
-      const analysis = await analyse(ollama.service);
+  /* --- field defaults shape every success -------------------------------- */
 
-      assert.strictEqual(
-        analysis.error,
-        undefined,
-        'Ollama has started reporting this as an error — unify it and update this case'
-      );
-      assert.deepStrictEqual(analysis.document, {
-        tags: [],
-        correspondent: null,
-        title: null,
-        document_date: null,
-        document_type: null,
-        language: null,
-        custom_fields: null,
-      });
-      assert.ok(analysis.metrics, 'the drift includes reporting metrics');
-    }
-  );
+  /* Field defaults for all four (step 6, decided 2026-10-11):
+     withDocumentDefaults() shapes every provider's success to the seven document fields — present values
+     survive, missing ones come back as null (tags as an empty array),
+     unknown fields are dropped. The answer is complete enough to pass
+     assertAssignableMetadata, so this pins only the shaping. The chat
+     providers used to return the parsed answer untouched, missing fields
+     and all. */
+
+  const PARTIAL_ANSWER = {
+    title: 'Telekom',
+    correspondent: 'Telekom Deutschland GmbH',
+    tags: ['invoice'],
+    unknown_field: 'dropped',
+  };
+
+  for (const { label, service, arrangeAnswer } of PROVIDERS) {
+    await check(
+      `${label}: a partial answer comes back default-shaped`,
+      async () => {
+        arrangeAnswer(JSON.stringify(PARTIAL_ANSWER));
+        const analysis = await analyse(service);
+
+        assert.strictEqual(
+          analysis.error,
+          undefined,
+          `unexpected error: ${analysis.error}`
+        );
+        assert.deepStrictEqual(analysis.document, {
+          tags: PARTIAL_ANSWER.tags,
+          correspondent: PARTIAL_ANSWER.correspondent,
+          title: PARTIAL_ANSWER.title,
+          document_date: null,
+          document_type: null,
+          language: null,
+          custom_fields: null,
+        });
+      }
+    );
+  }
 
   /* OpenAI alone (Finding 7c) answers a refusal with a placeholder document
      instead of the failure record, so the retry loop does not ask again. The

@@ -95,10 +95,39 @@ const READABLE_ANSWERS = [
 
 /** The object a READABLE_ANSWERS entry stands for. */
 function expectedFor(name) {
+  if (name === 'partial answer') {
+    /* PARTIAL_ANSWER passed through withDocumentDefaults(): the three
+       assigned fields survive, the missing ones come back as null, and
+       the invented field is dropped. */
+    return {
+      tags: PARTIAL_ANSWER.tags,
+      correspondent: PARTIAL_ANSWER.correspondent,
+      title: PARTIAL_ANSWER.title,
+      document_date: null,
+      document_type: null,
+      language: null,
+      custom_fields: null,
+    };
+  }
+  /* The title ends in "}"; the object's real closing brace is the one
+     after the string. */
   return name === 'braces inside a string value'
     ? { ...RESULT, title: 'Invoice {July} }' }
     : RESULT;
 }
+
+/**
+ * A parseable answer the model leaves incomplete: it assigns tags and a
+ * correspondent, so it passes assertAssignableMetadata, but omits every
+ * other field. Field defaults for all four (step 6) must bring the missing
+ * ones back as null and drop whatever the model invented.
+ */
+const PARTIAL_ANSWER = {
+  tags: ['invoice'],
+  correspondent: 'Telekom Deutschland GmbH',
+  title: 'Telekom',
+  unknown_field: 'invented by the model',
+};
 
 /** Answers no provider can read; none of them may count as a success. */
 const UNREADABLE_ANSWERS = [
@@ -155,15 +184,22 @@ async function analyze(service, answerWith, answer) {
   );
 }
 
-/** Ollama fills the fields a model left out; the chat providers pass them on. */
+/** Every provider shapes its success with withDocumentDefaults(). */
 function sameDocument(label, actual, expected) {
-  if (label !== 'Ollama') {
-    assert.deepStrictEqual(actual, expected);
-    return;
-  }
-  for (const [key, value] of Object.entries(expected)) {
-    assert.deepStrictEqual(actual[key], value, key);
-  }
+  label; // the signature keeps the call sites; the check is one for all four
+  assert.deepStrictEqual(
+    actual,
+    {
+      tags: expected.tags,
+      correspondent: expected.correspondent,
+      title: expected.title,
+      document_date: expected.document_date,
+      document_type: expected.document_type,
+      language: expected.language,
+      custom_fields: expected.custom_fields,
+    },
+    'every provider returns the seven default-shaped document fields'
+  );
 }
 
 (async () => {
@@ -259,6 +295,60 @@ function sameDocument(label, actual, expected) {
         assert.ok(shouldQueueForOcrOnAiError(analysis.error), analysis.error);
       });
     }
+  }
+
+  /* --- Finding 7k: an answer with no usable metadata -------------------- */
+
+  /* Decided 2026-10-11: all four providers fail the answer the same way.
+     Ollama used to log and return the defaults as a *success* (no tags, no
+     correspondent — the document landed in Paperless all null). The check
+     raises on the parsed answer, before withDocumentDefaults() would fill
+     in the missing fields and mask it. */
+  for (const [label, service, answerWith] of PROVIDERS) {
+    await check(
+      `${label}: an answer without tags or correspondent fails`,
+      async () => {
+        const analysis = await analyze(
+          service,
+          answerWith,
+          JSON.stringify({ note: 'nothing assignable here' })
+        );
+        assert.match(
+          analysis.error || '',
+          /could not determine assignable metadata/i
+        );
+        assert.ok(
+          shouldQueueForOcrOnAiError(analysis.error),
+          `the failure routes to OCR: ${analysis.error}`
+        );
+        assert.deepStrictEqual(analysis.document, {
+          tags: [],
+          correspondent: null,
+        });
+        assert.strictEqual(analysis.metrics, null);
+      }
+    );
+  }
+
+  /* --- field defaults: every success comes back default-shaped ---------- */
+
+  /* Decided 2026-10-11: withDocumentDefaults() shapes every provider's
+     success to the seven document fields, present values surviving and
+     the invented ones dropped. Before, only Ollama did this; the three
+     chat providers passed the parsed answer on untouched. */
+  for (const [label, service, answerWith] of PROVIDERS) {
+    await check(
+      `${label}: a partial answer comes back default-shaped`,
+      async () => {
+        const analysis = await analyze(
+          service,
+          answerWith,
+          JSON.stringify(PARTIAL_ANSWER)
+        );
+        assert.strictEqual(analysis.error, undefined, analysis.error);
+        sameDocument(label, analysis.document, expectedFor('partial answer'));
+      }
+    );
   }
 
   await check('Ollama: an answer object is used as it is', async () => {

@@ -82,7 +82,8 @@ function assertAssignableMetadata(parsed) {
 
 /**
  * Every document field present: tags an array, everything else a value or
- * null. Ollama's shaping; the chat providers pass the answer on as parsed.
+ * null; fields the model invented are dropped. Shapes every provider's
+ * success, after assertAssignableMetadata() has seen the parsed answer.
  *
  * @param {Object} parsed - The parsed answer
  */

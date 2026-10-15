@@ -74,6 +74,26 @@ const ANSWER = JSON.stringify({
   language: 'de',
 });
 
+/** The success document every provider shapes to the seven fields. */
+const DEFAULT_DOCUMENT = {
+  tags: ['invoice'],
+  correspondent: 'Telekom Deutschland GmbH',
+  title: 'Telekom invoice July',
+  document_date: '2026-09-03',
+  document_type: 'Rechnung',
+  language: 'de',
+  custom_fields: null,
+};
+
+/** Field defaults for all four (step 6): the success comes back default-shaped. */
+function assertDefaultDocument(analysis) {
+  assert.deepStrictEqual(
+    analysis.document,
+    DEFAULT_DOCUMENT,
+    'the success document carries the seven default-shaped fields'
+  );
+}
+
 /** Long enough that every limit below has to cut it. */
 const LONG_CONTENT = 'Invoice from Telekom Deutschland GmbH, July. '.repeat(
   400
@@ -297,6 +317,7 @@ async function analyzeRecorded(service, content, record) {
           )
         );
         assert.strictEqual(analysis.truncated, true);
+        assertDefaultDocument(analysis);
       }
     );
 
@@ -310,6 +331,7 @@ async function analyzeRecorded(service, content, record) {
       const user = requests[0].messages.find((m) => m.role === 'user');
       assert.strictEqual(user.content, 'Short invoice.');
       assert.strictEqual(analysis.truncated, false);
+      assertDefaultDocument(analysis);
     });
 
     await check(`${label}: no room left fails before any request`, async () => {

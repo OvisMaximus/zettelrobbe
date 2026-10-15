@@ -25,6 +25,7 @@ const {
   buildFailure,
   buildInsufficientContent,
   assertAssignableMetadata,
+  withDocumentDefaults,
 } = require('./llm/analysisResult');
 const {
   parseAnalysisResponse,
@@ -212,7 +213,7 @@ class OpenAIService {
       assertAssignableMetadata(parsedResponse);
 
       return buildSuccess(
-        parsedResponse,
+        withDocumentDefaults(parsedResponse),
         mappedUsage,
         truncatedContent.length < content.length
       );
