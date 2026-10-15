@@ -61,7 +61,7 @@ Further evidence that `manualService.js` was abandoned rather than maintained:
 - Its Ollama path never sends the document content at all — `prompt` is just
   `process.env.SYSTEM_PROMPT` (`manualService.js:218`).
 
-**Decision:** delete `services/manualService.js` as part of this work and point
+**Decision (carried out in step 7):** delete `services/manualService.js` as part of this work and point
 `POST /manual/analyze` at `AIServiceFactory.getService()`. Do not port its behavior — it is worse
 than the dedicated services on every axis: no token budgeting, no content truncation, no restriction
 placeholders, no structured output, no retry, no metrics.
@@ -188,7 +188,7 @@ today. These are the actual bugs the work will surface:
 | e   | Only custom normalizes timeouts                                                                                                  | `customService.js:428-436`                                                                                                                                                       | Apply `isTimeoutError`/`buildTimeoutErrorMessage` for all providers.                                                                                                                                                              |
 | f   | `generateText` option handling — **mostly resolved upstream**                                                                    | `services/aiGenerateOptions.js`, used by all four `generateText()` implementations                                                                                               | Upstream unified how options are read (completion cap, temperature, system prompt, model, abort, reasoning, progress). Keep `aiGenerateOptions.js` as the shared reader; the transports only map the result onto their own knobs. |
 | g   | `checkStatus` differs by nature                                                                                                  | openai/custom `models.list()`; Azure REST GET; `ollamaService.js:1210` `/api/ps`                                                                                                 | Not business logic. Each composition root hands its probe to the analyzer unchanged (step 6); nothing calls it, so step 8 decides whether it stays.                                                                               |
-| h   | Unreachable branches in `openaiService.initialize()` for providers `ollama` and `custom`                                         | `openaiService.js:46-60`                                                                                                                                                         | `aiServiceFactory` never routes those providers here and both direct call sites in `routes/setup.js` are guarded by `AI_PROVIDER === 'openai'`. Verify, then drop.                                                                |
+| h   | Unreachable branches in `openaiService.initialize()` for providers `ollama` and `custom`                                         | `openaiService.js:46-60`                                                                                                                                                         | `aiServiceFactory` never routes those providers here. Since step 7 the factory is the only module that requires `openaiService` outside the tests. Verify, then drop.                                                             |
 | i   | Thumbnail caching sits inside `analyzeDocument` although the thumbnail never enters the prompt                                   | all four                                                                                                                                                                         | Still out of scope as a _placement_ question, but the four copies are now one call to `services/thumbnailCache.js`. Moving it out of `analyzeDocument` is a one-line change once a caller wants it.                               |
 | j   | ~~`getThumbnailCachePath(id)` runs **outside** the try block, so an invalid id makes `analyzeDocument` throw~~ **resolved**      | was `openaiService.js:63`, `azureService.js:52`, `customService.js:147`                                                                                                          | Fixed ahead of the refactor. See the note below the table.                                                                                                                                                                        |
 | k   | ~~An answer with neither tags nor a correspondent is a **failure** on three providers and a **success** on Ollama~~ **resolved** | was `ollamaService.js:223`                                                                                                                                                       | Done in step 6: the analyzer runs `assertAssignableMetadata()` on the parsed answer, before `withDocumentDefaults()`, for all four.                                                                                               |
@@ -624,29 +624,33 @@ reservedTokens, availableTokens }` and `fit(content, availableTokens)`; the char
      and the refusal helper. Its analyzer covered OpenAI only and its parity test compared method
      signatures, so neither was taken over.
 
-7. **Delete `services/manualService.js`** and repoint `POST /manual/analyze`
-   (`routes/setup.js:8273` after the v2026.10.01 merge) at `AIServiceFactory.getService()`,
-   collapsing its provider switch — five branches since upstream added Anthropic, whose branch
-   already goes through the factory and is the template. Clean up what used to trigger Finding 7j
-   while here: every branch passes `id || []`, and `String([])` is `''`, which
-   `getThumbnailCachePath()` rejects. That no longer costs the analysis — the request succeeds with
-   a warning — but `id || []` is still a nonsense default.
+7. ~~**Delete `services/manualService.js`** and repoint `POST /manual/analyze` at
+   `AIServiceFactory.getService()`~~ **Done**, in two commits:
+   - **The route.** The five-branch switch on `process.env.AI_PROVIDER` is one call to
+     `AIServiceFactory.getService().analyzeDocument()` with the `id` as sent (no `|| []`). As decided
+     by the maintainer on 2026-10-15, `documentModel.addOpenAIMetrics()` runs for every provider
+     whenever the analysis returned `metrics` and the request carried an `id` — the Anthropic
+     branch's rule — and the API is unchanged: `id` stays optional, no new field, no new status.
+     That guard also removes the OpenAI branch's unguarded `metrics.promptTokens`, so a failed
+     analysis answers 200 with its failure record instead of a 500 TypeError. The four provider
+     imports of `routes/setup.js` were unused afterwards and are gone.
 
-   **Decisions, taken by the maintainer on 2026-10-15:**
-   - **Metrics for every provider.** `documentModel.addOpenAIMetrics()` is called for every
-     provider, not only OpenAI — when the analysis returned `metrics` and the request carried an
-     `id`, as the Anthropic branch does today. Without an id there is no document to record them
-     against.
-   - **No API change.** `id` stays optional and is passed through as it is (no `|| []`); no new
-     required field, no new status code.
+     One consequence that was not a decision of its own: the provider is now picked as the scan
+     loop picks it (`config.aiProvider`, OpenAI when unset or unknown), so the old 500 "AI provider
+     not configured" no longer exists. The swagger block was corrected to what the route returns:
+     the 200 references `AnalysisResult` (`schemas.js`, previously unreferenced; it gained
+     `truncated` and `errorCode`, and `metrics`/`correspondent` are nullable), `existingTags` is
+     documented as accepted but not read — the route takes all three lists from Paperless-ngx —
+     and the 500 text no longer names the removed branch. `OPENAPI/openapi.json` regenerated.
 
-   Also fix on the way: the OpenAI branch reads `analyzeDocument.metrics.promptTokens` without a
-   guard, so a failed analysis (`metrics: null`) answers 500 with a TypeError instead of returning
-   the failure record; the guard above removes it. The `@swagger` JSDoc of the route describes the
-   response wrongly — flat `correspondent`/`title`/`tags`/`documentType` and metrics "when using
-   OpenAI", while the route returns the AnalysisResult `{ document, metrics, truncated }` (plus
-   `error`/`errorCode` on failure). Correcting the text to what the route already returns is no API
-   change; run `node scripts/regen-openapi.js` afterwards (the CI drift check fails otherwise).
+     `manual-analyze-route` (9 cases) mounts the real router (`tests/helpers/mount-router`) and
+     replaces only each provider's `analyzeDocument()` and the metrics store. Four cases failed
+     before the change; restoring `id || []`, dropping the metrics guard or the id guard each
+     fails one. On Windows the test ends red after its cases pass, because the harness cannot
+     remove its temp directory (EPERM), like `duplicates-endpoints`.
+
+   - **The dead file.** `services/manualService.js` (284 lines) is deleted; `git grep manualService`
+     finds only this plan.
 
 8. **Verify Finding 7h** (unreachable `initialize()` branches in the former `openaiService`) and drop
    the dead branches.
@@ -656,11 +660,12 @@ reservedTokens, availableTokens }` and `fit(content, availableTokens)`; the char
 
 ---
 
-## Handoff notes for step 7 onwards
+## Handoff notes for step 8 onwards
 
-Written when step 6 was done (tag `refactor-step-6-done`), for whoever continues — human or agent.
+Written when step 6 was done (tag `refactor-step-6-done`) and updated after step 7, for whoever
+continues — human or agent.
 
-- **Read first:** `/CLAUDE.md`, this plan (Findings, the done notes of steps 1-6),
+- **Read first:** `/CLAUDE.md`, this plan (Findings, the done notes of steps 1-7),
   `services/llm/documentAnalyzer.js`, `services/llm/promptLayout.js` and one composition root,
   e.g. `services/llm/providers/azureProvider.js`.
 - **Seams the tests rely on — keep them on the four exported singletons:** `service.client` is
@@ -680,9 +685,13 @@ Written when step 6 was done (tag `refactor-step-6-done`), for whoever continues
   permissions, line endings, environment variables of the shell). Never judge a run by its count:
   run the suite on the parent commit as well and compare the lists of failed tests. Back every new
   test with a mutation check: break the code it guards, see it fail, restore.
-- **Step 7 can now use the factory:** every provider has the same `analyzeDocument()` signature
-  and result, so `/manual/analyze` can call `AIServiceFactory.getService()` without a switch. The
-  decisions it needs are recorded under step 7.
+- **After step 7** no route switches on the provider any more: `POST /manual/analyze` goes through
+  the factory like the scan loop, and `aiServiceFactory.js` is the only non-test module that
+  requires the provider singletons. Step 8 (row h) can therefore reason about
+  `openaiService.initialize()` from the factory alone.
+- **Router tests:** `tests/helpers/mount-router.js` mounts the real `routes/setup.js` on a throwaway
+  database; `tests/test-manual-analyze-route.js` is the smallest example. On Windows its `close()`
+  fails with EPERM on the temp directory — expected there; the cases themselves pass.
 
 ## Out of Scope / Follow-ups
 
