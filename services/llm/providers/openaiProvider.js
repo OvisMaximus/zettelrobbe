@@ -27,21 +27,11 @@ const { chatPromptLayout } = require('../promptLayout');
 const TRUNCATION_REMEDY =
   'Reduce the number of custom fields the prompt asks for, or use a model with a larger completion limit.';
 
+/**
+ * The factory hands this service out for the openai provider only (and as
+ * its default for an unknown one), so there is no client for any other.
+ */
 function createClient() {
-  if (config.aiProvider === 'ollama') {
-    return new OpenAI({
-      baseURL: config.ollama.apiUrl + '/v1',
-      // Ollama ignores the key unless the endpoint enforces auth (e.g. a
-      // reverse proxy); the OpenAI SDK requires a non-empty value.
-      apiKey: config.ollama.apiKey || 'ollama',
-    });
-  }
-  if (config.aiProvider === 'custom') {
-    return new OpenAI({
-      baseURL: config.custom.apiUrl,
-      apiKey: config.custom.apiKey,
-    });
-  }
   if (config.aiProvider === 'openai' && config.openai.apiKey) {
     return new OpenAI({
       apiKey: config.openai.apiKey,

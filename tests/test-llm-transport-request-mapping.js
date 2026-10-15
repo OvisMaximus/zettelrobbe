@@ -492,6 +492,31 @@ const ANALYSIS_REQUEST = {
     }
   );
 
+  // Finding 7h: the factory hands out openaiService for the openai provider
+  // (and as its default) only, so OpenAI builds no client for Ollama or
+  // Custom — those have composition roots of their own.
+  await check(
+    'OpenAI: builds an OpenAI client for the openai provider only (7h)',
+    () => {
+      const previousProvider = config.aiProvider;
+      const build = (provider) => {
+        config.aiProvider = provider;
+        openaiService.client = null;
+        openaiService.transport.initialize();
+        return openaiService.client;
+      };
+      try {
+        assert.match(build('openai').baseURL, /api\.openai\.com/);
+        for (const provider of ['ollama', 'custom', 'azure', 'unknown']) {
+          assert.strictEqual(build(provider), null, provider);
+        }
+      } finally {
+        config.aiProvider = previousProvider;
+        openaiService.client = null;
+      }
+    }
+  );
+
   await check(
     'Azure: analysis sends AI_TEMPERATURE_ANALYSIS (7a)',
     async () => {
