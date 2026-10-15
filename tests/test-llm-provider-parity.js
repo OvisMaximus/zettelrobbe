@@ -1,5 +1,6 @@
 /**
- * The same answer gives the same result on all four providers.
+ * The same answer gives the same result on all four providers, and the
+ * four are one DocumentAnalyzer each behind a re-export.
  *
  * Step 6 of the LLM service refactoring (services/ManualServiceRefactoring.md,
  * "Done means"): once the four providers share one DocumentAnalyzer, an
@@ -16,6 +17,7 @@
 
 const assert = require('assert');
 const fs = require('fs').promises;
+const path = require('path');
 
 process.env.AI_PROVIDER = 'openai';
 process.env.OPENAI_API_KEY = 'test-key';
@@ -36,11 +38,21 @@ const {
   getThumbnailCachePath,
 } = require('../services/thumbnailCachePaths');
 
+const { DocumentAnalyzer } = require('../services/llm/documentAnalyzer');
+
 const PROVIDERS = {
   OpenAI: require('../services/openaiService'),
   Azure: require('../services/azureService'),
   Custom: require('../services/customService'),
   Ollama: require('../services/ollamaService'),
+};
+
+/** The module each provider's legacy path re-exports. */
+const ROOTS = {
+  OpenAI: ['openaiService', 'openaiProvider'],
+  Azure: ['azureService', 'azureProvider'],
+  Custom: ['customService', 'customProvider'],
+  Ollama: ['ollamaService', 'ollamaProvider'],
 };
 
 /** Own id so the seeded thumbnail cannot collide with a real cached document. */
@@ -143,6 +155,27 @@ const check = async (label, fn) => {
     getThumbnailCachePath(DOCUMENT_ID),
     Buffer.from([0x89, 0x50, 0x4e, 0x47])
   );
+
+  /* The structure behind the parity: one analyzer, four composition roots,
+     and the old module paths as plain re-exports. */
+  for (const [label, [service, provider]] of Object.entries(ROOTS)) {
+    await check(`${label}: a DocumentAnalyzer behind a re-export`, async () => {
+      assert.ok(PROVIDERS[label] instanceof DocumentAnalyzer);
+      assert.strictEqual(
+        PROVIDERS[label],
+        require(`../services/llm/providers/${provider}`)
+      );
+      const source = await fs.readFile(
+        path.join(__dirname, '..', 'services', `${service}.js`),
+        'utf8'
+      );
+      const code = source.replace(/^\/\/.*$/gm, '').trim();
+      assert.strictEqual(
+        code,
+        `module.exports = require('./llm/providers/${provider}');`
+      );
+    });
+  }
 
   for (const [name, text] of ANSWERS) {
     await check(`${name}: byte-identical on all four`, async () => {

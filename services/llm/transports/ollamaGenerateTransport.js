@@ -205,6 +205,11 @@ class OllamaGenerateTransport {
     }
 
     this.assertNotTruncated(response.data, numPredict, numCtx);
+    // Worded unlike the chat providers' "Invalid API response structure", so
+    // it matches no OCR marker (row l, kept as it is).
+    if (!response.data.response) {
+      throw new Error('No response data from Ollama API');
+    }
     return {
       payload: response.data.response,
       metrics: this.extractMetrics(response.data),
