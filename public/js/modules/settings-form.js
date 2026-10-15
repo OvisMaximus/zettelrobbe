@@ -35,7 +35,9 @@ export default function settingsForm(root, { confirmDialog }) {
   // A field needs a restart when its own hint says so — the hints are the single
   // source of truth for that in this form.
   function needsRestart(field) {
-    const scope = field.closest('.zr-field, .zr-formgrid, .zr-row');
+    const scope = field.closest(
+      '.zr-field, .zr-switchrow, .zr-formgrid, .zr-row'
+    );
     return Boolean(scope && /restart required/i.test(scope.textContent || ''));
   }
 
@@ -54,6 +56,12 @@ export default function settingsForm(root, { confirmDialog }) {
       if (!row) return;
       row.toggleAttribute('data-dirty', dirty.includes(field));
     });
+
+    // The topic list marks the topics holding these, since only one topic is
+    // visible at a time (modules/settings-nav.js).
+    document.dispatchEvent(
+      new CustomEvent('zr:settings-dirty', { detail: { fields: dirty } })
+    );
   }
 
   form.addEventListener('input', sync);
@@ -76,14 +84,22 @@ export default function settingsForm(root, { confirmDialog }) {
     sync();
   });
 
-  // settings.js handles the request; once it succeeds the current values become
-  // the new baseline.
-  form.addEventListener('submit', () => {
-    setTimeout(() => {
-      fields.forEach((field) => initial.set(field, valueOf(field)));
-      sync();
-    }, 0);
+  // settings.js handles the request and announces a successful save; only then
+  // do the current values become the new baseline. A failed save keeps them
+  // counted as unsaved.
+  form.addEventListener('zr:settings-saved', () => {
+    fields.forEach((field) => initial.set(field, valueOf(field)));
+    sync();
   });
+
+  // Edits in any topic, visible or not, would be lost by leaving the page.
+  const warnOnLeave = (event) => {
+    if (!dirtyFields().length) return;
+    event.preventDefault();
+    // Older browsers only show the prompt when returnValue is set.
+    event.returnValue = '';
+  };
+  window.addEventListener('beforeunload', warnOnLeave);
 
   sync();
 }

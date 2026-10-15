@@ -44,6 +44,7 @@ const entityNameMatcher = require('../services/entityNameMatcher');
 const entityMatchAiService = require('../services/entityMatchAiService');
 const duplicateReviewJobService = require('../services/duplicateReviewJobService');
 const tagSimplifyService = require('../services/tagSimplifyService');
+const oidcService = require('../services/oidcService');
 const {
   THUMBNAIL_CACHE_DIR,
   getThumbnailCachePath,
@@ -51,6 +52,13 @@ const {
 const {
   sanitizeConfigForBootstrap,
 } = require('../services/bootstrapConfigSanitizer');
+const {
+  ANTHROPIC_DEFAULT_MODEL,
+  ANTHROPIC_SUGGESTED_MODELS,
+  ANTHROPIC_EFFORT_LEVELS,
+  ANTHROPIC_DEFAULT_MAX_TOKENS,
+  isConfiguredAnthropicHost,
+} = require('../services/anthropicSupport');
 const config = require('../config/config.js');
 require('dotenv').config({ path: '../data/.env' });
 
@@ -86,9 +94,11 @@ const SETTINGS_SECRET_FIELDS = [
   'OLLAMA_API_KEY',
   'CUSTOM_API_KEY',
   'AZURE_API_KEY',
+  'ANTHROPIC_API_KEY',
   'OCR_API_KEY',
   'MISTRAL_API_KEY',
   'API_KEY',
+  'OIDC_CLIENT_SECRET',
 ];
 
 function formatBytes(bytes) {
@@ -395,8 +405,17 @@ const loginLimiter = rateLimit({
  *           example: "#FF5733"
  */
 
-// Routes that don't require authentication
-let PUBLIC_ROUTES = ['/health', '/login', '/logout', '/setup', '/api/setup'];
+// Routes that don't require authentication. /auth/oidc is served by
+// routes/oidc.js, mounted ahead of this router; it is listed so the sign-in
+// callback stays reachable whatever the mount order.
+let PUBLIC_ROUTES = [
+  '/health',
+  '/login',
+  '/logout',
+  '/setup',
+  '/api/setup',
+  '/auth/oidc',
+];
 
 /**
  * Returns true if the incoming request originates from localhost.
@@ -580,6 +599,20 @@ function hasValidSession(req) {
 }
 
 /**
+ * True when a public route is called with a usable session or the API key.
+ * Like hasValidSession(), for routes the authentication guard lets through.
+ */
+function isAuthenticatedCaller(req) {
+  const currentApiKey = config.getApiKey();
+  const apiKey = req.headers['x-api-key'];
+  if (currentApiKey && apiKey && apiKey === currentApiKey) {
+    return true;
+  }
+
+  return hasValidSession(req);
+}
+
+/**
  * @swagger
  * /login:
  *   get:
@@ -712,18 +745,24 @@ function getAuthenticatedSettingsUsername(req) {
   return null;
 }
 
-function verifyTotpToken(secret, inputToken) {
+/**
+ * Returns the TOTP time step the code belongs to, or null when the code does
+ * not match any step inside the accepted window.
+ *
+ * @param {string} secret - base32 TOTP secret
+ * @param {string} inputToken - the code the user typed
+ * @returns {number|null}
+ */
+function findTotpStep(secret, inputToken) {
   const normalizedInput = String(inputToken || '').replace(/\s+/g, '');
   if (!/^\d{6,8}$/.test(normalizedInput)) {
-    return false;
+    return null;
   }
 
   const now = Math.floor(Date.now() / 1000);
   for (let offset = -TOTP_WINDOW; offset <= TOTP_WINDOW; offset += 1) {
-    const expected = generateTotpToken(
-      secret,
-      now + offset * TOTP_STEP_SECONDS
-    );
+    const unixTimeSeconds = now + offset * TOTP_STEP_SECONDS;
+    const expected = generateTotpToken(secret, unixTimeSeconds);
     if (!expected || expected.length !== normalizedInput.length) {
       continue;
     }
@@ -734,11 +773,47 @@ function verifyTotpToken(secret, inputToken) {
         Buffer.from(normalizedInput)
       )
     ) {
-      return true;
+      return Math.floor(unixTimeSeconds / TOTP_STEP_SECONDS);
     }
   }
 
-  return false;
+  return null;
+}
+
+function verifyTotpToken(secret, inputToken) {
+  return findTotpStep(secret, inputToken) !== null;
+}
+
+// Last accepted TOTP time step per username. RFC 6238 section 5.2: once a
+// code has been accepted, the verifier must not accept it again. Kept in
+// memory: a restart forgets it, and the window it protects is 90 seconds.
+const lastAcceptedTotpSteps = new Map();
+
+/**
+ * Verifies a TOTP code and consumes it, so the same code (or an older one)
+ * is refused for that user until a newer time step comes up. For actions a
+ * captured code must not be able to repeat: signing in, enabling and
+ * disabling MFA.
+ *
+ * @param {string} username - the account the code is for
+ * @param {string} secret - base32 TOTP secret
+ * @param {string} inputToken - the code the user typed
+ * @returns {boolean}
+ */
+function consumeTotpToken(username, secret, inputToken) {
+  const step = findTotpStep(secret, inputToken);
+  if (step === null) {
+    return false;
+  }
+
+  const key = String(username || '').toLowerCase();
+  const lastStep = lastAcceptedTotpSteps.get(key);
+  if (lastStep !== undefined && step <= lastStep) {
+    return false;
+  }
+
+  lastAcceptedTotpSteps.set(key, step);
+  return true;
 }
 
 function renderLoginView(res, options = {}) {
@@ -746,11 +821,54 @@ function renderLoginView(res, options = {}) {
     error: options.error || null,
     mfaRequired: Boolean(options.mfaRequired),
     username: options.username || '',
+    sso: oidcService.getLoginButton(),
   });
 }
 
 function isMfaEnabledForUser(user) {
   return Boolean(user && (user.mfa_enabled || user.mfaEnabled));
+}
+
+/* Cost the setup wizard hashes the administrator password with. */
+const ADMIN_PASSWORD_BCRYPT_ROUNDS = 15;
+const dummyPasswordHashes = new Map();
+
+/**
+ * Spends the same bcrypt work on a failed username lookup as on a real
+ * password check, so the response time no longer tells an attacker whether
+ * the username exists (CWE-208). The dummy hash uses the cost of the stored
+ * account when there is one, because the comparison time grows with it.
+ *
+ * @param {*} password - the submitted password
+ * @returns {Promise<void>}
+ */
+async function spendPasswordCheckTime(password) {
+  let rounds = ADMIN_PASSWORD_BCRYPT_ROUNDS;
+  try {
+    const users = await documentModel.getUsers();
+    const storedHash = users?.[0]?.password;
+    if (storedHash) {
+      rounds = bcrypt.getRounds(storedHash);
+    }
+  } catch {
+    // Keep the default cost.
+  }
+
+  if (!dummyPasswordHashes.has(rounds)) {
+    dummyPasswordHashes.set(
+      rounds,
+      bcrypt.hash(crypto.randomBytes(32).toString('hex'), rounds)
+    );
+  }
+
+  try {
+    await bcrypt.compare(
+      String(password ?? ''),
+      await dummyPasswordHashes.get(rounds)
+    );
+  } catch {
+    // Only the elapsed time matters here.
+  }
 }
 
 router.get('/login', (req, res) => {
@@ -875,7 +993,7 @@ router.post('/login', loginLimiter, async (req, res) => {
         });
       }
 
-      if (!verifyTotpToken(mfaSecret, mfaToken)) {
+      if (!consumeTotpToken(user.username, mfaSecret, mfaToken)) {
         return renderLoginView(res, {
           error: 'Invalid authentication code. Please try again.',
           mfaRequired: true,
@@ -907,6 +1025,7 @@ router.post('/login', loginLimiter, async (req, res) => {
     const user = await documentModel.getUser(username);
 
     if (!user || !user.password) {
+      await spendPasswordCheckTime(password);
       console.log('[FAILED LOGIN] User not found or invalid data:', username);
       return renderLoginView(res, { error: 'Invalid credentials', username });
     }
@@ -3343,7 +3462,32 @@ const DEFAULT_AI_PROVIDER_PRESETS = [
     model: 'meta-llama/llama-3.3-70b-instruct',
     tokenPlaceholder: 'ionos-api-key',
   },
+  {
+    // No URL: the SDK knows api.anthropic.com, and ANTHROPIC_API_URL is only
+    // for a proxy in front of it.
+    id: 'anthropic-default',
+    label: 'Anthropic (Claude)',
+    provider: 'anthropic',
+    apiUrl: '',
+    model: ANTHROPIC_DEFAULT_MODEL,
+    tokenPlaceholder: 'sk-ant-...',
+  },
 ];
+
+/* What the setup wizard and the settings page need to offer the Claude
+   models and effort levels without a request: the same constants the
+   provider itself runs with. */
+function getAnthropicFormOptions() {
+  return {
+    defaultModel: ANTHROPIC_DEFAULT_MODEL,
+    suggestedModels: ANTHROPIC_SUGGESTED_MODELS.map((entry) => ({
+      id: entry.id,
+      label: entry.label,
+    })),
+    effortLevels: ANTHROPIC_EFFORT_LEVELS.slice(),
+    defaultMaxTokens: ANTHROPIC_DEFAULT_MAX_TOKENS,
+  };
+}
 
 function cleanupExpiredSetupMfaChallenges() {
   const now = Date.now();
@@ -3505,6 +3649,13 @@ const ENV_EXPORT_GROUPS = [
       'AZURE_API_KEY',
       'AZURE_DEPLOYMENT_NAME',
       'AZURE_API_VERSION',
+      'ANTHROPIC_API_KEY',
+      'ANTHROPIC_API_URL',
+      'ANTHROPIC_MODEL',
+      'ANTHROPIC_EFFORT',
+      'ANTHROPIC_MAX_TOKENS',
+      'ANTHROPIC_STRUCTURED_OUTPUT',
+      'ANTHROPIC_PROMPT_CACHING',
     ],
   },
   {
@@ -3596,6 +3747,25 @@ const ENV_EXPORT_GROUPS = [
     ],
   },
   {
+    title: 'Single sign-on (OIDC)',
+    keys: [
+      'OIDC_ENABLED',
+      'OIDC_ISSUER_URL',
+      'OIDC_CLIENT_ID',
+      'OIDC_CLIENT_SECRET',
+      'OIDC_ADMIN_EMAIL',
+      'OIDC_REDIRECT_URI',
+      'OIDC_SCOPES',
+      'OIDC_EMAIL_CLAIM',
+      'OIDC_ALLOW_UNVERIFIED_EMAIL',
+      'OIDC_TOKEN_AUTH_METHOD',
+      'OIDC_BUTTON_TEXT',
+      'OIDC_BUTTON_ICON',
+      'OIDC_BUTTON_COLOR',
+      'OIDC_BUTTON_TEXT_COLOR',
+    ],
+  },
+  {
     title: 'Maintenance',
     keys: [
       'LOG_LEVEL',
@@ -3668,6 +3838,9 @@ function toEnvPreviewLines(config) {
     'AZURE_API_KEY',
     'AZURE_DEPLOYMENT_NAME',
     'AZURE_API_VERSION',
+    'ANTHROPIC_API_KEY',
+    'ANTHROPIC_API_URL',
+    'ANTHROPIC_MODEL',
     'MISTRAL_OCR_ENABLED',
     'OCR_PROVIDER',
     'OCR_API_URL',
@@ -3717,7 +3890,9 @@ async function loadAiProviderPresets() {
         ),
       }))
       .filter((item) =>
-        ['openai', 'ollama', 'custom', 'azure'].includes(item.provider)
+        ['openai', 'ollama', 'custom', 'azure', 'anthropic'].includes(
+          item.provider
+        )
       );
   } catch (error) {
     console.warn(
@@ -3739,12 +3914,21 @@ function resolveStoredAiToken(aiProvider) {
   if (provider === 'custom') return process.env.CUSTOM_API_KEY || '';
   if (provider === 'openai') return process.env.OPENAI_API_KEY || '';
   if (provider === 'azure') return process.env.AZURE_API_KEY || '';
+  if (provider === 'anthropic') return process.env.ANTHROPIC_API_KEY || '';
   return '';
 }
 
-function resolveSettingsAiToken(aiProvider, token) {
+function resolveSettingsAiToken(aiProvider, token, apiUrl) {
   const normalizedToken = String(token || '').trim();
-  return normalizedToken || resolveStoredAiToken(aiProvider);
+  if (normalizedToken) return normalizedToken;
+  // The saved Claude key only goes to a Claude endpoint already configured.
+  const provider = String(aiProvider || '')
+    .trim()
+    .toLowerCase();
+  if (provider === 'anthropic' && !isConfiguredAnthropicHost(apiUrl)) {
+    return '';
+  }
+  return resolveStoredAiToken(aiProvider);
 }
 
 /* Accepts what the row menu sends (one id) and what the bulk menu sends (a
@@ -3796,6 +3980,147 @@ function resolveSettingsQuickstartApiKey(baseUrl, apiKey) {
     : '';
 }
 
+/* Single sign-on fields of the settings page: form key -> OIDC_* key. */
+const OIDC_SETTINGS_FIELDS = {
+  oidcEnabled: 'OIDC_ENABLED',
+  oidcIssuerUrl: 'OIDC_ISSUER_URL',
+  oidcClientId: 'OIDC_CLIENT_ID',
+  oidcClientSecret: 'OIDC_CLIENT_SECRET',
+  oidcAdminEmail: 'OIDC_ADMIN_EMAIL',
+  oidcRedirectUri: 'OIDC_REDIRECT_URI',
+  oidcScopes: 'OIDC_SCOPES',
+  oidcEmailClaim: 'OIDC_EMAIL_CLAIM',
+  oidcAllowUnverifiedEmail: 'OIDC_ALLOW_UNVERIFIED_EMAIL',
+  oidcTokenAuthMethod: 'OIDC_TOKEN_AUTH_METHOD',
+  oidcButtonText: 'OIDC_BUTTON_TEXT',
+  oidcButtonIcon: 'OIDC_BUTTON_ICON',
+  oidcButtonColor: 'OIDC_BUTTON_COLOR',
+  oidcButtonTextColor: 'OIDC_BUTTON_TEXT_COLOR',
+};
+const OIDC_SWITCH_FIELDS = new Set(['oidcEnabled', 'oidcAllowUnverifiedEmail']);
+
+/* Turns the single sign-on fields of a settings save into OIDC_* values and
+   checks the result. A field the body does not carry keeps what is stored,
+   so a client that predates the section still saves. An empty client secret
+   keeps the stored one, like every other secret on the page.
+
+   The checks only run when single sign-on ends up switched on, and they look
+   at what will be in force after the save: a value injected by the container
+   wins over a typed one, because saveConfig() never writes over it. Switched
+   off, whatever was typed is saved, so a half-finished setup can be parked.
+
+   Returns { updates } or { error }. */
+function buildOidcSettingsUpdate(body) {
+  const updates = {};
+  for (const [field, envKey] of Object.entries(OIDC_SETTINGS_FIELDS)) {
+    const raw = body?.[field];
+    if (raw === undefined || raw === null) continue;
+    if (OIDC_SWITCH_FIELDS.has(field)) {
+      const normalized = String(raw).trim().toLowerCase();
+      if (['yes', 'on', 'true', '1'].includes(normalized)) {
+        updates[envKey] = 'yes';
+      } else if (['no', 'off', 'false', '0', ''].includes(normalized)) {
+        updates[envKey] = 'no';
+      }
+      continue;
+    }
+    if (field === 'oidcClientSecret') {
+      const secret = String(raw).trim();
+      if (secret) updates[envKey] = secret;
+      continue;
+    }
+    let value = String(raw).trim();
+    if (field === 'oidcScopes') value = value.split(/\s+/).join(' ');
+    if (field === 'oidcTokenAuthMethod') value = value.toLowerCase();
+    if (field === 'oidcButtonText') {
+      value = value.slice(0, oidcService.MAX_BUTTON_TEXT_LENGTH);
+    }
+    updates[envKey] = value;
+  }
+
+  const effective = (envKey) =>
+    String(
+      !configFile.isProtectedRuntimeEnvKey(envKey) && envKey in updates
+        ? updates[envKey]
+        : process.env[envKey] || ''
+    ).trim();
+
+  const enabled = ['yes', 'true', '1', 'on'].includes(
+    effective('OIDC_ENABLED').toLowerCase()
+  );
+  if (!enabled) {
+    return { updates };
+  }
+
+  const errors = oidcService.getConfigErrors({
+    enabled,
+    issuerUrl: effective('OIDC_ISSUER_URL'),
+    clientId: effective('OIDC_CLIENT_ID'),
+    redirectUri: effective('OIDC_REDIRECT_URI'),
+    adminEmail: effective('OIDC_ADMIN_EMAIL'),
+  });
+  const tokenAuthMethod = effective('OIDC_TOKEN_AUTH_METHOD').toLowerCase();
+  if (
+    tokenAuthMethod &&
+    !oidcService.TOKEN_AUTH_METHODS.includes(tokenAuthMethod)
+  ) {
+    errors.push(
+      `OIDC_TOKEN_AUTH_METHOD must be empty (automatic) or one of ${oidcService.TOKEN_AUTH_METHODS.join(', ')}`
+    );
+  }
+  const buttonIcon = effective('OIDC_BUTTON_ICON');
+  if (
+    buttonIcon &&
+    oidcService.resolveButtonIcon(buttonIcon).type === 'default'
+  ) {
+    errors.push(
+      'OIDC_BUTTON_ICON must be empty, "none", an https:// URL or a path starting with /'
+    );
+  }
+  for (const envKey of ['OIDC_BUTTON_COLOR', 'OIDC_BUTTON_TEXT_COLOR']) {
+    const color = effective(envKey);
+    if (color && !oidcService.isSafeCssColor(color)) {
+      errors.push(
+        `${envKey} must be a CSS colour such as #1f6feb, a colour name, or rgb()/hsl()`
+      );
+    }
+  }
+
+  if (errors.length > 0) {
+    return {
+      error: `Single sign-on is switched on but cannot work: ${errors.join('; ')}. Fix these or switch single sign-on off.`,
+    };
+  }
+  return { updates };
+}
+
+/* The origin (scheme, host and port) of a URL, or null. */
+function urlOrigin(value) {
+  try {
+    const parsed = new URL(String(value || '').trim());
+    return parsed.origin.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+/* The client secret for the single sign-on test. A typed secret is always
+   used. An empty field means "the stored one", but only for the provider it
+   was stored for: the page never shows the saved secret, and a test endpoint
+   that sent it to any issuer the caller names would hand it out again. */
+function resolveOidcTestClientSecret(issuerUrl, clientSecret) {
+  const typed = String(clientSecret || '').trim();
+  if (typed) return typed;
+
+  const requested = urlOrigin(oidcService.normalizeIssuerUrl(issuerUrl));
+  const configured = urlOrigin(
+    oidcService.normalizeIssuerUrl(process.env.OIDC_ISSUER_URL)
+  );
+  return requested && configured && requested === configured
+    ? String(process.env.OIDC_CLIENT_SECRET || '')
+    : '';
+}
+
 /* Compares the detection target with the configured AI server. The Quickstart
    field is written by hand and normalizeBaseUrls() strips /v1 and trailing
    slashes, so "http://host:1234/v1/" and "http://host:1234" are the same
@@ -3828,6 +4153,33 @@ function resolveOcrApiKey(apiKey) {
     process.env.MISTRAL_API_KEY ||
     ''
   );
+}
+
+/* resolveOcrApiKey() for a request that names its OCR provider. Claude OCR
+   must never receive a stored Mistral key: MISTRAL_API_KEY never belongs to
+   it, and OCR_API_KEY only when Claude is the OCR provider it was saved for.
+   An empty answer is fine — setupService falls back to the Anthropic AI key.
+   `apiUrl` is where the request goes; the stored key is withheld from any
+   host that is not already configured for Claude. */
+function resolveOcrApiKeyForProvider(provider, apiKey, apiUrl = '') {
+  const normalizedProvider = String(provider || '')
+    .trim()
+    .toLowerCase();
+  if (normalizedProvider !== 'anthropic') {
+    return resolveOcrApiKey(apiKey);
+  }
+
+  const normalizedApiKey = String(apiKey || '').trim();
+  if (normalizedApiKey) {
+    return normalizedApiKey;
+  }
+
+  const storedProvider = String(process.env.OCR_PROVIDER || '')
+    .trim()
+    .toLowerCase();
+  return storedProvider === 'anthropic' && isConfiguredAnthropicHost(apiUrl)
+    ? process.env.OCR_API_KEY || ''
+    : '';
 }
 
 async function validatePaperlessConnectionForSetup(
@@ -3897,7 +4249,7 @@ async function validateAiConnectionForSetup({
 
       if (
         !provider ||
-        !['openai', 'ollama', 'custom', 'azure'].includes(provider)
+        !['openai', 'ollama', 'custom', 'azure', 'anthropic'].includes(provider)
       ) {
         return {
           success: false,
@@ -3985,6 +4337,29 @@ async function validateAiConnectionForSetup({
         };
       }
 
+      if (provider === 'anthropic') {
+        if (!normalizedToken) {
+          return {
+            success: false,
+            message: 'An API key is required for Anthropic.',
+          };
+        }
+
+        // The URL stays optional: empty means api.anthropic.com.
+        const valid = await setupService.validateAnthropicConfig(
+          normalizedToken,
+          normalizedModel || ANTHROPIC_DEFAULT_MODEL,
+          normalizedApiUrl
+        );
+
+        return {
+          success: valid,
+          message: valid
+            ? 'Anthropic API key and model are valid.'
+            : 'Anthropic test failed. Check the API key, the model and, if set, the proxy URL.',
+        };
+      }
+
       if (!normalizedApiUrl || !normalizedModel) {
         return {
           success: false,
@@ -4031,6 +4406,9 @@ async function validateOcrConnectionForSetup({
   apiKey,
   model,
   setupOcrValidationTimeoutMs,
+  anthropicApiKey,
+  anthropicApiUrl,
+  anthropicModel,
 }) {
   return setupService.withTemporaryValidationTimeout(
     setupOcrValidationTimeoutMs,
@@ -4072,7 +4450,17 @@ async function validateOcrConnectionForSetup({
         provider: normalizedProvider,
         apiUrl: resolvedApiUrl,
         apiKey: String(apiKey || '').trim(),
-        model: String(model || '').trim() || 'mistral-ocr-latest',
+        // Claude OCR picks its own model when this one is not a Claude model
+        // (see setupService.resolveAnthropicOcrModel), so the Mistral default
+        // must not be filled in for it.
+        model:
+          String(model || '').trim() ||
+          (normalizedProvider === 'anthropic' ? '' : 'mistral-ocr-latest'),
+        // The Anthropic AI provider's key, URL and model, which Claude OCR
+        // falls back to; the environment covers them when they are saved.
+        anthropicApiKey,
+        anthropicApiUrl,
+        anthropicModel,
       });
 
       return {
@@ -4084,6 +4472,21 @@ async function validateOcrConnectionForSetup({
       };
     }
   );
+}
+
+/* The model-discovery answer for Anthropic. The list is never empty — it
+   falls back to the suggested models — so the message has to say which list
+   the picker now shows, or a refused key would look like a working one. */
+function describeAnthropicModelDiscovery(discovery, apiUrl) {
+  return {
+    success: true,
+    models: discovery.models,
+    live: discovery.live,
+    resolvedApiUrl: apiUrl,
+    message: discovery.live
+      ? `Discovered ${discovery.models.length} model(s).`
+      : `Could not load the live model list (${discovery.error}). Showing the suggested Claude models instead.`,
+  };
 }
 
 async function discoverAiModelsForSetup({
@@ -4100,6 +4503,16 @@ async function discoverAiModelsForSetup({
         .toLowerCase();
       const normalizedApiUrl = String(apiUrl || '').trim();
       const normalizedToken = String(token || '').trim();
+
+      if (provider === 'anthropic') {
+        return describeAnthropicModelDiscovery(
+          await setupService.discoverAnthropicModels({
+            apiKey: normalizedToken,
+            apiUrl: normalizedApiUrl,
+          }),
+          normalizedApiUrl
+        );
+      }
 
       // For local providers, classify models via quickstart detection so
       // embedding-only models are excluded from the AI model dropdown.
@@ -4162,6 +4575,9 @@ async function discoverOcrModelsForSetup({
   apiUrl,
   apiKey,
   setupOcrValidationTimeoutMs,
+  anthropicApiKey,
+  anthropicApiUrl,
+  anthropicModel,
 }) {
   return setupService.withTemporaryValidationTimeout(
     setupOcrValidationTimeoutMs,
@@ -4171,6 +4587,27 @@ async function discoverOcrModelsForSetup({
         .toLowerCase();
       const normalizedApiUrl = String(apiUrl || '').trim();
       const normalizedApiKey = String(apiKey || '').trim();
+
+      // Claude OCR lists the same models as the AI provider, reached with the
+      // OCR key or the AI key, and preselects the model OCR would run with.
+      if (normalizedProvider === 'anthropic') {
+        const connection = setupService.resolveAnthropicOcrConnection({
+          apiKey: normalizedApiKey,
+          apiUrl: normalizedApiUrl,
+          anthropicApiKey,
+          anthropicApiUrl,
+        });
+        return {
+          ...describeAnthropicModelDiscovery(
+            await setupService.discoverAnthropicModels(connection),
+            normalizedApiUrl
+          ),
+          suggestedModel: setupService.resolveAnthropicOcrModel(
+            '',
+            anthropicModel
+          ),
+        };
+      }
 
       // For local providers, classify models via quickstart detection so
       // embedding-only models are excluded from the OCR dropdown
@@ -4389,6 +4826,10 @@ router.get('/setup', async (req, res) => {
       AZURE_API_KEY: process.env.AZURE_API_KEY || '',
       AZURE_DEPLOYMENT_NAME: process.env.AZURE_DEPLOYMENT_NAME || '',
       AZURE_API_VERSION: process.env.AZURE_API_VERSION || '',
+      // The key is dropped by sanitizeConfigForBootstrap() before rendering.
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
+      ANTHROPIC_API_URL: process.env.ANTHROPIC_API_URL || '',
+      ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL || ANTHROPIC_DEFAULT_MODEL,
       MISTRAL_OCR_ENABLED: process.env.MISTRAL_OCR_ENABLED || 'no',
       OCR_PROVIDER: process.env.OCR_PROVIDER || 'mistral',
       OCR_API_URL: process.env.OCR_API_URL || '',
@@ -4462,6 +4903,7 @@ router.get('/setup', async (req, res) => {
       config: sanitizedConfig,
       success: successMessage,
       aiProviderPresets,
+      anthropicOptions: getAnthropicFormOptions(),
       defaults: {
         scanInterval: getDefaultScanInterval(),
       },
@@ -4473,6 +4915,7 @@ router.get('/setup', async (req, res) => {
       config: {},
       error: 'An error occurred while loading the setup page.',
       aiProviderPresets,
+      anthropicOptions: getAnthropicFormOptions(),
       defaults: {
         scanInterval: getDefaultScanInterval(),
       },
@@ -4853,6 +5296,9 @@ router.post('/api/setup/ocr/test', express.json(), async (req, res) => {
       setupOcrValidationTimeoutMs:
         req.body?.setupOcrValidationTimeoutMs ??
         req.body?.setupValidationTimeoutMs,
+      anthropicApiKey: req.body?.anthropicApiKey,
+      anthropicApiUrl: req.body?.anthropicApiUrl,
+      anthropicModel: req.body?.anthropicModel,
     });
 
     return res.json(validation);
@@ -4903,6 +5349,9 @@ router.post('/api/setup/ocr/test', express.json(), async (req, res) => {
  *                   type: string
  *                   nullable: true
  *                   description: Recommended default; absent for providers without model classification
+ *                 live:
+ *                   type: boolean
+ *                   description: anthropic only — false when the live list failed and the suggested Claude models are returned instead
  *                 resolvedApiUrl:
  *                   type: string
  *                 message:
@@ -4921,7 +5370,14 @@ router.post('/api/setup/ocr/models', express.json(), async (req, res) => {
       apiUrl: req.body?.apiUrl,
       // The wizard used to take the field at face value, so an operator whose
       // key already sat in the environment was told to supply one.
-      apiKey: resolveOcrApiKey(req.body?.apiKey),
+      apiKey: resolveOcrApiKeyForProvider(
+        req.body?.provider,
+        req.body?.apiKey,
+        req.body?.apiUrl || req.body?.anthropicApiUrl
+      ),
+      anthropicApiKey: req.body?.anthropicApiKey,
+      anthropicApiUrl: req.body?.anthropicApiUrl,
+      anthropicModel: req.body?.anthropicModel,
       // Same key mismatch as in /api/setup/ocr/test above: the discovery
       // helper takes setupOcrValidationTimeoutMs. It matters here because
       // classifying an Ollama catalogue costs one /api/show per model and
@@ -5017,13 +5473,16 @@ router.post(
  *             properties:
  *               aiProvider:
  *                 type: string
- *                 enum: [openai, ollama, custom, azure]
+ *                 enum: [openai, ollama, custom, azure, anthropic]
  *               apiUrl:
  *                 type: string
+ *                 description: Not needed for anthropic unless a proxy sits in front of api.anthropic.com
  *               token:
  *                 type: string
+ *                 description: Omit or leave empty to use the stored key of the selected provider
  *               model:
  *                 type: string
+ *                 description: For anthropic, checked with a models lookup that spends no tokens
  *               setupValidationTimeoutMs:
  *                 type: integer
  *     responses:
@@ -5041,7 +5500,11 @@ router.post(
       const validation = await validateAiConnectionForSetup({
         aiProvider: req.body?.aiProvider,
         apiUrl: req.body?.apiUrl,
-        token: resolveSettingsAiToken(req.body?.aiProvider, req.body?.token),
+        token: resolveSettingsAiToken(
+          req.body?.aiProvider,
+          req.body?.token,
+          req.body?.apiUrl
+        ),
         model: req.body?.model,
         azureApiVersion: req.body?.azureApiVersion,
         setupValidationTimeoutMs: req.body?.setupValidationTimeoutMs,
@@ -5058,6 +5521,60 @@ router.post(
   }
 );
 
+/**
+ * @swagger
+ * /api/settings/ocr/test:
+ *   post:
+ *     summary: Test OCR provider connectivity from the settings page
+ *     description: |
+ *       Runs one OCR request on a generated test image. For `anthropic` the
+ *       key is the OCR key when one is given or stored for Claude OCR, and
+ *       otherwise the Anthropic AI provider's key (`anthropicApiKey`, then
+ *       the stored ANTHROPIC_API_KEY).
+ *     tags:
+ *       - Settings
+ *     security:
+ *       - BearerAuth: []
+ *       - ApiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               enabled:
+ *                 type: string
+ *                 enum: ["yes", "no"]
+ *               provider:
+ *                 type: string
+ *                 enum: [mistral, custom, ollama, anthropic]
+ *               apiUrl:
+ *                 type: string
+ *                 description: Ignored for mistral. For anthropic an optional proxy URL; empty uses the Anthropic AI provider's URL, then api.anthropic.com
+ *               apiKey:
+ *                 type: string
+ *                 description: Omit or leave empty to use the stored key
+ *               model:
+ *                 type: string
+ *                 description: For anthropic, a Claude model; anything else falls back to the AI model
+ *               setupOcrValidationTimeoutMs:
+ *                 type: integer
+ *               anthropicApiKey:
+ *                 type: string
+ *                 description: Anthropic AI key typed but not saved yet; Claude OCR falls back to it
+ *               anthropicApiUrl:
+ *                 type: string
+ *                 description: Anthropic AI proxy URL typed but not saved yet
+ *               anthropicModel:
+ *                 type: string
+ *                 description: Anthropic AI model typed but not saved yet
+ *     responses:
+ *       200:
+ *         description: OCR connectivity result returned
+ *       401:
+ *         description: Unauthorized
+ */
 router.post(
   '/api/settings/ocr/test',
   isAuthenticated,
@@ -5068,11 +5585,20 @@ router.post(
         enabled: req.body?.enabled,
         provider: req.body?.provider,
         apiUrl: req.body?.apiUrl,
-        apiKey: resolveOcrApiKey(req.body?.apiKey),
+        apiKey: resolveOcrApiKeyForProvider(
+          req.body?.provider,
+          req.body?.apiKey,
+          req.body?.apiUrl || req.body?.anthropicApiUrl
+        ),
         model: req.body?.model,
         setupOcrValidationTimeoutMs:
           req.body?.setupOcrValidationTimeoutMs ??
           req.body?.setupValidationTimeoutMs,
+        // A key typed into the Anthropic AI fields but not saved yet; the
+        // stored one comes from the environment.
+        anthropicApiKey: req.body?.anthropicApiKey,
+        anthropicApiUrl: req.body?.anthropicApiUrl,
+        anthropicModel: req.body?.anthropicModel,
       });
 
       return res.json(validation);
@@ -5081,6 +5607,181 @@ router.post(
       return res.status(500).json({
         success: false,
         error: 'Could not test OCR connection.',
+      });
+    }
+  }
+);
+
+/**
+ * @swagger
+ * /api/settings/oidc/test:
+ *   post:
+ *     summary: Test a single sign-on provider from the settings page
+ *     description: |
+ *       Reads the provider's discovery document, picks the token endpoint auth
+ *       method the login would use, and checks the client credentials by
+ *       redeeming an authorization code that cannot exist: the provider
+ *       answers invalid_client for wrong credentials and invalid_grant for
+ *       right ones. Nobody is signed in and nothing is saved.
+ *
+ *       An empty `clientSecret` uses the stored OIDC_CLIENT_SECRET, but only
+ *       when the issuer has the same origin (scheme, host, port) as the
+ *       configured OIDC_ISSUER_URL; for any other issuer the test runs
+ *       without a secret. Private network addresses are allowed, since
+ *       identity providers usually run next to the application.
+ *     tags:
+ *       - Settings
+ *     security:
+ *       - BearerAuth: []
+ *       - ApiKeyAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - issuerUrl
+ *               - clientId
+ *             properties:
+ *               issuerUrl:
+ *                 type: string
+ *                 description: Issuer URL (http or https); a pasted discovery URL is accepted
+ *                 example: "https://auth.example.com/application/o/zettelrobbe/"
+ *               clientId:
+ *                 type: string
+ *                 example: "zettelrobbe"
+ *               clientSecret:
+ *                 type: string
+ *                 description: Omit or leave empty to use the stored secret (same issuer origin only)
+ *                 example: ""
+ *               tokenAuthMethod:
+ *                 type: string
+ *                 description: Empty picks the method automatically
+ *                 enum: ["", "client_secret_basic", "client_secret_post", "none"]
+ *                 example: ""
+ *     responses:
+ *       200:
+ *         description: |
+ *           Test result. success is false (still HTTP 200) when the provider
+ *           could not be reached, sent no usable discovery document, or refused
+ *           the client credentials; error then says which.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               oneOf:
+ *                 - type: object
+ *                   properties:
+ *                     success:
+ *                       type: boolean
+ *                       example: true
+ *                     data:
+ *                       type: object
+ *                       properties:
+ *                         issuer:
+ *                           type: string
+ *                           description: The issuer the provider advertises
+ *                           example: "https://auth.example.com/application/o/zettelrobbe/"
+ *                         tokenAuthMethods:
+ *                           type: array
+ *                           description: Token endpoint auth methods the provider advertises (empty when it lists none)
+ *                           items:
+ *                             type: string
+ *                           example: ["client_secret_basic", "client_secret_post"]
+ *                         chosenAuthMethod:
+ *                           type: string
+ *                           description: The method a login would use
+ *                           example: "client_secret_basic"
+ *                         pkce:
+ *                           type: boolean
+ *                           description: Whether the provider advertises PKCE with S256
+ *                           example: true
+ *                     message:
+ *                       type: string
+ *                       example: "The provider answered and accepted the client."
+ *                 - $ref: '#/components/schemas/Error'
+ *       400:
+ *         description: Invalid input (issuer not an http(s) URL, empty client ID, unknown auth method, or a method that needs a secret without one)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       302:
+ *         description: Not signed in; redirected to /login like every other route behind the authentication guard
+ */
+router.post(
+  '/api/settings/oidc/test',
+  isAuthenticated,
+  express.json(),
+  async (req, res) => {
+    try {
+      const issuerUrl = oidcService.normalizeIssuerUrl(req.body?.issuerUrl);
+      const clientId = String(req.body?.clientId || '').trim();
+      const tokenAuthMethod = String(req.body?.tokenAuthMethod || '')
+        .trim()
+        .toLowerCase();
+
+      if (!oidcService.isAbsoluteHttpUrl(issuerUrl)) {
+        return res.status(400).json({
+          success: false,
+          error: 'The issuer URL must start with https:// or http://.',
+        });
+      }
+      if (!clientId) {
+        return res
+          .status(400)
+          .json({ success: false, error: 'The client ID is missing.' });
+      }
+      if (
+        tokenAuthMethod &&
+        !oidcService.TOKEN_AUTH_METHODS.includes(tokenAuthMethod)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: `Unknown token endpoint auth method. Use one of: ${oidcService.TOKEN_AUTH_METHODS.join(', ')}, or leave it empty.`,
+        });
+      }
+
+      const clientSecret = resolveOidcTestClientSecret(
+        issuerUrl,
+        req.body?.clientSecret
+      );
+      if (
+        !clientSecret &&
+        ['client_secret_basic', 'client_secret_post'].includes(tokenAuthMethod)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: `${tokenAuthMethod} needs a client secret. Enter it, or choose another auth method.`,
+        });
+      }
+
+      let data;
+      try {
+        data = await oidcService.testConnection({
+          issuerUrl,
+          clientId,
+          clientSecret,
+          tokenAuthMethod,
+        });
+      } catch (error) {
+        console.warn(
+          '[WARN] POST /api/settings/oidc/test failed:',
+          error.message
+        );
+        return res.json({ success: false, error: error.message });
+      }
+
+      return res.json({
+        success: true,
+        data,
+        message: 'The provider answered and accepted the client.',
+      });
+    } catch (error) {
+      console.error('[ERROR] POST /api/settings/oidc/test:', error);
+      return res.status(500).json({
+        success: false,
+        error: 'Could not test single sign-on.',
       });
     }
   }
@@ -5095,7 +5796,11 @@ router.post(
       const result = await discoverAiModelsForSetup({
         aiProvider: req.body?.aiProvider,
         apiUrl: req.body?.apiUrl,
-        token: resolveSettingsAiToken(req.body?.aiProvider, req.body?.token),
+        token: resolveSettingsAiToken(
+          req.body?.aiProvider,
+          req.body?.token,
+          req.body?.apiUrl
+        ),
         setupValidationTimeoutMs: req.body?.setupValidationTimeoutMs,
       });
 
@@ -5152,14 +5857,23 @@ router.get('/api/settings/ai/presets', isAuthenticated, async (_req, res) => {
  *             properties:
  *               provider:
  *                 type: string
- *                 enum: [mistral, custom, ollama]
+ *                 enum: [mistral, custom, ollama, anthropic]
  *               apiUrl:
  *                 type: string
  *               apiKey:
  *                 type: string
- *                 description: Omit or leave empty to use the stored OCR_API_KEY / MISTRAL_API_KEY
+ *                 description: Omit or leave empty to use the stored OCR_API_KEY / MISTRAL_API_KEY (for anthropic, the stored Claude OCR key, then the Anthropic AI key)
  *               setupOcrValidationTimeoutMs:
  *                 type: integer
+ *               anthropicApiKey:
+ *                 type: string
+ *                 description: Anthropic AI key typed but not saved yet; used by anthropic when no OCR key is set
+ *               anthropicApiUrl:
+ *                 type: string
+ *                 description: Anthropic AI proxy URL typed but not saved yet
+ *               anthropicModel:
+ *                 type: string
+ *                 description: Anthropic AI model; anthropic returns it as suggestedModel
  *     responses:
  *       200:
  *         description: OCR model list returned
@@ -5184,6 +5898,9 @@ router.get('/api/settings/ai/presets', isAuthenticated, async (_req, res) => {
  *                   type: string
  *                   nullable: true
  *                   description: Recommended default; absent for providers without model classification
+ *                 live:
+ *                   type: boolean
+ *                   description: anthropic only — false when the live list failed and the suggested Claude models are returned instead
  *                 resolvedApiUrl:
  *                   type: string
  *                 message:
@@ -5202,7 +5919,14 @@ router.post(
       const result = await discoverOcrModelsForSetup({
         provider: req.body?.provider,
         apiUrl: req.body?.apiUrl,
-        apiKey: resolveOcrApiKey(req.body?.apiKey),
+        apiKey: resolveOcrApiKeyForProvider(
+          req.body?.provider,
+          req.body?.apiKey,
+          req.body?.apiUrl || req.body?.anthropicApiUrl
+        ),
+        anthropicApiKey: req.body?.anthropicApiKey,
+        anthropicApiUrl: req.body?.anthropicApiUrl,
+        anthropicModel: req.body?.anthropicModel,
         setupOcrValidationTimeoutMs:
           req.body?.setupOcrValidationTimeoutMs ??
           req.body?.setupValidationTimeoutMs,
@@ -5406,15 +6130,25 @@ router.post('/api/setup/complete', express.json(), async (req, res) => {
       .trim()
       .toLowerCase();
     const ocrApiUrlRaw = String(req.body?.ocrApiUrl || '').trim();
+    // Mistral OCR has no URL field. For Claude OCR the field is an optional
+    // proxy URL: empty falls back to the Anthropic AI provider's URL, and
+    // that to api.anthropic.com. The wizard empties the field when Claude is
+    // picked, so a value here was typed for it.
     const ocrApiUrl = ocrProvider === 'mistral' ? '' : ocrApiUrlRaw;
     const ocrApiKey = String(
       req.body?.ocrApiKey || req.body?.mistralApiKey || ''
     ).trim();
+    const anthropicAiSelected = aiProvider === 'anthropic';
     const mistralOcrModel =
-      String(req.body?.mistralOcrModel || 'mistral-ocr-latest').trim() ||
-      'mistral-ocr-latest';
+      ocrProvider === 'anthropic'
+        ? setupService.resolveAnthropicOcrModel(
+            req.body?.mistralOcrModel,
+            anthropicAiSelected ? aiModel : ''
+          )
+        : String(req.body?.mistralOcrModel || 'mistral-ocr-latest').trim() ||
+          'mistral-ocr-latest';
 
-    if (!['mistral', 'custom', 'ollama'].includes(ocrProvider)) {
+    if (!['mistral', 'custom', 'ollama', 'anthropic'].includes(ocrProvider)) {
       return res.status(400).json({
         success: false,
         error: 'A valid OCR provider is required.',
@@ -5426,6 +6160,20 @@ router.post('/api/setup/complete', express.json(), async (req, res) => {
         success: false,
         error:
           'Mistral API key is required when OCR provider is set to mistral.',
+      });
+    }
+
+    if (
+      mistralOcrEnabled &&
+      ocrProvider === 'anthropic' &&
+      !ocrApiKey &&
+      !(anthropicAiSelected && aiToken) &&
+      !process.env.ANTHROPIC_API_KEY
+    ) {
+      return res.status(400).json({
+        success: false,
+        error:
+          'Claude OCR needs an Anthropic API key: enter one for OCR, or choose Anthropic as the AI provider.',
       });
     }
 
@@ -5460,7 +6208,7 @@ router.post('/api/setup/complete', express.json(), async (req, res) => {
 
     if (
       !aiProvider ||
-      !['openai', 'ollama', 'custom', 'azure'].includes(aiProvider)
+      !['openai', 'ollama', 'custom', 'azure', 'anthropic'].includes(aiProvider)
     ) {
       return res.status(400).json({
         success: false,
@@ -5507,6 +6255,9 @@ router.post('/api/setup/complete', express.json(), async (req, res) => {
           apiKey: ocrApiKey,
           model: mistralOcrModel,
           setupOcrValidationTimeoutMs,
+          anthropicApiKey: anthropicAiSelected ? aiToken : '',
+          anthropicApiUrl: anthropicAiSelected ? aiApiUrl : '',
+          anthropicModel: anthropicAiSelected ? aiModel : '',
         });
 
     if (!ocrValidation.success) {
@@ -5552,7 +6303,8 @@ router.post('/api/setup/complete', express.json(), async (req, res) => {
       OCR_PROVIDER: ocrProvider,
       OCR_API_URL: ocrApiUrl,
       OCR_API_KEY: ocrApiKey,
-      MISTRAL_API_KEY: ocrApiKey,
+      // An Anthropic key must not land where Mistral OCR would read it.
+      MISTRAL_API_KEY: ocrProvider === 'anthropic' ? '' : ocrApiKey,
       MISTRAL_OCR_MODEL: mistralOcrModel,
       SETUP_VALIDATION_TIMEOUT_MS: String(setupValidationTimeoutMs),
       SETUP_OCR_VALIDATION_TIMEOUT_MS: String(setupOcrValidationTimeoutMs),
@@ -5570,6 +6322,11 @@ router.post('/api/setup/complete', express.json(), async (req, res) => {
       finalConfig.AZURE_API_KEY = aiToken;
       finalConfig.AZURE_DEPLOYMENT_NAME = aiModel;
       finalConfig.AZURE_API_VERSION = aiAzureApiVersion;
+    } else if (aiProvider === 'anthropic') {
+      finalConfig.ANTHROPIC_API_KEY = aiToken;
+      finalConfig.ANTHROPIC_MODEL = aiModel || ANTHROPIC_DEFAULT_MODEL;
+      // Only a proxy needs one; leaving it out keeps api.anthropic.com.
+      if (aiApiUrl) finalConfig.ANTHROPIC_API_URL = aiApiUrl;
     } else {
       finalConfig.CUSTOM_BASE_URL = aiApiUrl;
       finalConfig.CUSTOM_API_KEY = aiToken;
@@ -6615,6 +7372,18 @@ router.get('/settings', async (req, res) => {
     AZURE_API_KEY: process.env.AZURE_API_KEY || '',
     AZURE_DEPLOYMENT_NAME: process.env.AZURE_DEPLOYMENT_NAME || '',
     AZURE_API_VERSION: process.env.AZURE_API_VERSION || '',
+    // Same defaults as config.anthropic, so a fresh instance shows the values
+    // the provider would actually run with. The key is blanked below and only
+    // reported through configuredSecrets.
+    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
+    ANTHROPIC_API_URL: process.env.ANTHROPIC_API_URL || '',
+    ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL || ANTHROPIC_DEFAULT_MODEL,
+    ANTHROPIC_EFFORT: process.env.ANTHROPIC_EFFORT || '',
+    ANTHROPIC_MAX_TOKENS:
+      process.env.ANTHROPIC_MAX_TOKENS || String(ANTHROPIC_DEFAULT_MAX_TOKENS),
+    ANTHROPIC_STRUCTURED_OUTPUT:
+      process.env.ANTHROPIC_STRUCTURED_OUTPUT || 'yes',
+    ANTHROPIC_PROMPT_CACHING: process.env.ANTHROPIC_PROMPT_CACHING || 'yes',
     RESTRICT_TO_EXISTING_TAGS: process.env.RESTRICT_TO_EXISTING_TAGS || 'no',
     RESTRICT_TO_EXISTING_CORRESPONDENTS:
       process.env.RESTRICT_TO_EXISTING_CORRESPONDENTS || 'no',
@@ -6697,6 +7466,23 @@ router.get('/settings', async (req, res) => {
     PAPERLESS_AI_PORT: process.env.PAPERLESS_AI_PORT || '3000',
     LOG_LEVEL: process.env.LOG_LEVEL || 'info',
     DATE_FORMAT: process.env.DATE_FORMAT || 'DD.MM.YYYY',
+    // Single sign-on. Defaults mirror config.getOidcConfig(); the settings
+    // page lists them so values injected by the container show as locked.
+    OIDC_ENABLED: process.env.OIDC_ENABLED || 'no',
+    OIDC_ISSUER_URL: process.env.OIDC_ISSUER_URL || '',
+    OIDC_CLIENT_ID: process.env.OIDC_CLIENT_ID || '',
+    OIDC_CLIENT_SECRET: process.env.OIDC_CLIENT_SECRET || '',
+    OIDC_ADMIN_EMAIL: process.env.OIDC_ADMIN_EMAIL || '',
+    OIDC_REDIRECT_URI: process.env.OIDC_REDIRECT_URI || '',
+    OIDC_SCOPES: process.env.OIDC_SCOPES || 'openid profile email',
+    OIDC_EMAIL_CLAIM: process.env.OIDC_EMAIL_CLAIM || 'email',
+    OIDC_ALLOW_UNVERIFIED_EMAIL:
+      process.env.OIDC_ALLOW_UNVERIFIED_EMAIL || 'no',
+    OIDC_TOKEN_AUTH_METHOD: process.env.OIDC_TOKEN_AUTH_METHOD || '',
+    OIDC_BUTTON_TEXT: process.env.OIDC_BUTTON_TEXT || '',
+    OIDC_BUTTON_ICON: process.env.OIDC_BUTTON_ICON || '',
+    OIDC_BUTTON_COLOR: process.env.OIDC_BUTTON_COLOR || '',
+    OIDC_BUTTON_TEXT_COLOR: process.env.OIDC_BUTTON_TEXT_COLOR || '',
   };
 
   if (isConfigured) {
@@ -6776,7 +7562,17 @@ router.get('/settings', async (req, res) => {
     lockedEnvKeys,
     lockedEnvDetails,
     aiProviderPresets,
+    anthropicOptions: getAnthropicFormOptions(),
     mfaSettings,
+    // Single sign-on: the callback URL as this request sees it (what to
+    // register at the provider when OIDC_REDIRECT_URI is empty), and what the
+    // running configuration lacks. enabled is the switch, not whether the
+    // button is offered: that also needs errors to be empty.
+    oidcDetectedRedirectUri: oidcService.deriveRedirectUri(req),
+    oidcStatus: {
+      enabled: oidcService.getSettings().enabled,
+      errors: oidcService.getConfigErrors(),
+    },
     changelogReleases: changelog.releases,
     // No banner for the normal case: "already configured" was shown on every
     // visit to a configured instance, i.e. always, and said nothing.
@@ -7148,7 +7944,7 @@ router.post(
         });
       }
 
-      if (!verifyTotpToken(payload.secret, token)) {
+      if (!consumeTotpToken(username, payload.secret, token)) {
         return res
           .status(400)
           .json({ success: false, error: 'Invalid authentication code.' });
@@ -7325,7 +8121,7 @@ router.post(
           .json({ success: false, error: 'MFA is not enabled for this user.' });
       }
 
-      if (!verifyTotpToken(user.mfa_secret, token)) {
+      if (!consumeTotpToken(username, user.mfa_secret, token)) {
         return res
           .status(400)
           .json({ success: false, error: 'Invalid authentication code.' });
@@ -7533,6 +8329,26 @@ router.post('/manual/analyze', express.json(), async (req, res) => {
         existingDocumentTypesList,
         id || []
       );
+      return res.json(analyzeDocument);
+    } else if (process.env.AI_PROVIDER === 'anthropic') {
+      // Through the factory, which owns the Claude service like every scan
+      // does. Its tokens are billed like OpenAI's, so they are recorded too.
+      const analyzeDocument =
+        await AIServiceFactory.getService().analyzeDocument(
+          content,
+          existingTagsList,
+          existingCorrespondentList,
+          existingDocumentTypesList,
+          id || []
+        );
+      if (analyzeDocument.metrics && id) {
+        await documentModel.addOpenAIMetrics(
+          id,
+          analyzeDocument.metrics.promptTokens,
+          analyzeDocument.metrics.completionTokens,
+          analyzeDocument.metrics.totalTokens
+        );
+      }
       return res.json(analyzeDocument);
     } else {
       return res.status(500).json({ error: 'AI provider not configured' });
@@ -7750,6 +8566,12 @@ function buildScannerHealthSnapshot() {
  *       When automatic processing is switched off via
  *       `DISABLE_AUTOMATIC_PROCESSING=yes`, a missing scan loop is expected and
  *       never reported as degraded.
+ *
+ *       Without authentication the response carries only `status` and
+ *       `database`, with the same HTTP status codes. `message`, `scanner` and
+ *       `paperless` hold raw error messages with internal host names and
+ *       ports, so they are returned only with a session (cookie or bearer
+ *       token) or the `x-api-key` header.
  *     tags:
  *       - System
  *     responses:
@@ -7796,8 +8618,22 @@ router.get('/health', async (req, res) => {
 
     const snapshot = buildScannerHealthSnapshot();
     const degraded = snapshot.scanner.degraded;
+    const status = degraded ? 'degraded' : 'healthy';
+
+    // /health is public for container healthchecks and uptime monitors, which
+    // only need the status and the HTTP code. The scanner and Paperless-ngx
+    // details carry raw error messages ("connect ECONNREFUSED 172.18.0.2:8000")
+    // and the schedule, so only an authenticated caller gets them.
+    if (!isAuthenticatedCaller(req)) {
+      const summary = { status, database: 'ok' };
+      if (degraded && scanHealthService.strictHealthEnabled) {
+        return res.status(503).json(summary);
+      }
+      return res.json(summary);
+    }
+
     const payload = {
-      status: degraded ? 'degraded' : 'healthy',
+      status,
       database: 'ok',
       ...snapshot,
     };
@@ -7817,7 +8653,9 @@ router.get('/health', async (req, res) => {
     console.error('Health check failed:', error);
     res.status(500).json({
       status: 'error',
-      message: error.message,
+      message: isAuthenticatedCaller(req)
+        ? error.message
+        : 'Health check failed',
     });
   }
 });
@@ -7861,7 +8699,7 @@ router.get('/health', async (req, res) => {
  *               aiProvider:
  *                 type: string
  *                 description: Selected AI provider for document analysis
- *                 enum: ["openai", "ollama", "custom", "azure"]
+ *                 enum: ["openai", "ollama", "custom", "azure", "anthropic"]
  *                 example: "openai"
  *               openaiKey:
  *                 type: string
@@ -7895,6 +8733,38 @@ router.get('/health', async (req, res) => {
  *                 type: string
  *                 description: Model name for custom LLM provider
  *                 example: "custom-model"
+ *               anthropicApiKey:
+ *                 type: string
+ *                 description: API key for Anthropic (required when aiProvider is 'anthropic' and none is stored; leave empty to keep the configured value). Saved only with aiProvider 'anthropic'; the anthropic* fields below likewise.
+ *                 example: "sk-ant-api03-abc123"
+ *               anthropicModel:
+ *                 type: string
+ *                 description: Claude model for analysis; empty keeps the configured one
+ *                 example: "claude-sonnet-5-5"
+ *               anthropicEffort:
+ *                 type: string
+ *                 description: Effort level; empty leaves it to the model. Rejected with 400 when it is not one of the listed levels.
+ *                 enum: ["", "low", "medium", "high", "xhigh", "max"]
+ *                 example: ""
+ *               anthropicMaxTokens:
+ *                 type: integer
+ *                 minimum: 1
+ *                 description: Completion cap per request, thinking included. Rejected with 400 when it is not a positive whole number; empty keeps the configured value.
+ *                 example: 16000
+ *               anthropicStructuredOutput:
+ *                 type: string
+ *                 description: Constrain the analysis answer to a JSON schema (yes/no)
+ *                 enum: ["yes", "no"]
+ *                 example: "yes"
+ *               anthropicPromptCaching:
+ *                 type: string
+ *                 description: Mark the system prompt cacheable (yes/no)
+ *                 enum: ["yes", "no"]
+ *                 example: "yes"
+ *               anthropicApiUrl:
+ *                 type: string
+ *                 description: Only for a proxy; empty uses api.anthropic.com
+ *                 example: ""
  *               scanInterval:
  *                 type: number
  *                 description: Interval in minutes for scanning new documents
@@ -8084,6 +8954,11 @@ router.get('/health', async (req, res) => {
  *                 maximum: 100
  *                 description: How many entries the vocabulary proposed from the tag names should aim at, types and topics together (5-100, default 25). Out-of-range values are clamped, a non-numeric value keeps the current setting.
  *                 example: 25
+ *               ocrProvider:
+ *                 type: string
+ *                 description: OCR fallback provider. For anthropic (Claude OCR) an empty ocrApiKey uses the Anthropic AI key, and ocrApiUrl is an optional proxy URL; a key or URL stored for another provider is cleared when switching to it.
+ *                 enum: ["mistral", "custom", "ollama", "anthropic"]
+ *                 example: "mistral"
  *               ocrAutoProcessEnabled:
  *                 type: string
  *                 description: Process queued OCR documents automatically (yes/no)
@@ -8105,6 +8980,72 @@ router.get('/health', async (req, res) => {
  *                 description: How every date in the web interface is rendered
  *                 enum: ["DD.MM.YYYY", "YYYY-MM-DD"]
  *                 example: "DD.MM.YYYY"
+ *               oidcEnabled:
+ *                 type: string
+ *                 description: |
+ *                   Single sign-on switch (OIDC_ENABLED). Every oidc* field is optional; one the body
+ *                   leaves out keeps the stored value. When single sign-on ends up switched on, the save
+ *                   is refused with 400 unless the issuer URL is an http(s) URL, the client ID is set,
+ *                   the admin e-mail is valid, the redirect URI is empty or an absolute http(s) URL, and
+ *                   the auth method, button icon and colours are valid. Values injected by the container
+ *                   are never overwritten.
+ *                 enum: ["yes", "no"]
+ *                 example: "no"
+ *               oidcIssuerUrl:
+ *                 type: string
+ *                 description: Issuer URL of the OpenID Connect provider (OIDC_ISSUER_URL); a pasted discovery URL is accepted
+ *                 example: "https://auth.example.com/application/o/zettelrobbe/"
+ *               oidcClientId:
+ *                 type: string
+ *                 description: Client ID registered at the provider (OIDC_CLIENT_ID)
+ *                 example: "zettelrobbe"
+ *               oidcClientSecret:
+ *                 type: string
+ *                 description: Client secret (OIDC_CLIENT_SECRET); leave empty to keep the stored one
+ *                 example: ""
+ *               oidcAdminEmail:
+ *                 type: string
+ *                 description: E-mail address of the identity that signs in as the administrator (OIDC_ADMIN_EMAIL)
+ *                 example: "admin@example.com"
+ *               oidcRedirectUri:
+ *                 type: string
+ *                 description: Callback URL registered at the provider (OIDC_REDIRECT_URI); empty derives it from the request
+ *                 example: ""
+ *               oidcScopes:
+ *                 type: string
+ *                 description: Space-separated scopes (OIDC_SCOPES); openid is always added
+ *                 example: "openid profile email"
+ *               oidcEmailClaim:
+ *                 type: string
+ *                 description: Claim that carries the e-mail address (OIDC_EMAIL_CLAIM)
+ *                 example: "email"
+ *               oidcAllowUnverifiedEmail:
+ *                 type: string
+ *                 description: Accept an e-mail address the provider marks unverified (OIDC_ALLOW_UNVERIFIED_EMAIL)
+ *                 enum: ["yes", "no"]
+ *                 example: "no"
+ *               oidcTokenAuthMethod:
+ *                 type: string
+ *                 description: Token endpoint auth method (OIDC_TOKEN_AUTH_METHOD); empty picks it automatically
+ *                 enum: ["", "client_secret_basic", "client_secret_post", "none"]
+ *                 example: ""
+ *               oidcButtonText:
+ *                 type: string
+ *                 maxLength: 60
+ *                 description: Label of the login button (OIDC_BUTTON_TEXT); longer text is cut to 60 characters
+ *                 example: "Sign in with Authentik"
+ *               oidcButtonIcon:
+ *                 type: string
+ *                 description: Login button icon (OIDC_BUTTON_ICON); empty for the built-in icon, "none", an https URL or a path on this server
+ *                 example: ""
+ *               oidcButtonColor:
+ *                 type: string
+ *                 description: Login button background (OIDC_BUTTON_COLOR); hex, colour name, rgb() or hsl()
+ *                 example: "#fd4b2d"
+ *               oidcButtonTextColor:
+ *                 type: string
+ *                 description: Login button text colour (OIDC_BUTTON_TEXT_COLOR)
+ *                 example: "#ffffff"
  *     responses:
  *       200:
  *         description: Settings updated successfully
@@ -8210,6 +9151,13 @@ router.post('/settings', express.json(), async (req, res) => {
       azureApiKey,
       azureDeploymentName,
       azureApiVersion,
+      anthropicApiKey,
+      anthropicModel,
+      anthropicEffort,
+      anthropicMaxTokens,
+      anthropicStructuredOutput,
+      anthropicPromptCaching,
+      anthropicApiUrl,
       tagCacheTTL,
       mistralOcrEnabled,
       ocrProvider,
@@ -8316,6 +9264,16 @@ router.post('/settings', express.json(), async (req, res) => {
       AZURE_API_KEY: process.env.AZURE_API_KEY || '',
       AZURE_DEPLOYMENT_NAME: process.env.AZURE_DEPLOYMENT_NAME || '',
       AZURE_API_VERSION: process.env.AZURE_API_VERSION || '',
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
+      ANTHROPIC_API_URL: process.env.ANTHROPIC_API_URL || '',
+      ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL || ANTHROPIC_DEFAULT_MODEL,
+      ANTHROPIC_EFFORT: process.env.ANTHROPIC_EFFORT || '',
+      ANTHROPIC_MAX_TOKENS:
+        process.env.ANTHROPIC_MAX_TOKENS ||
+        String(ANTHROPIC_DEFAULT_MAX_TOKENS),
+      ANTHROPIC_STRUCTURED_OUTPUT:
+        process.env.ANTHROPIC_STRUCTURED_OUTPUT || 'yes',
+      ANTHROPIC_PROMPT_CACHING: process.env.ANTHROPIC_PROMPT_CACHING || 'yes',
       RESTRICT_TO_EXISTING_TAGS: process.env.RESTRICT_TO_EXISTING_TAGS || 'no',
       RESTRICT_TO_EXISTING_CORRESPONDENTS:
         process.env.RESTRICT_TO_EXISTING_CORRESPONDENTS || 'no',
@@ -8394,18 +9352,42 @@ router.post('/settings', express.json(), async (req, res) => {
     const effectiveAzureApiKey = hasAzureApiKeyInput
       ? azureApiKey.trim()
       : currentConfig.AZURE_API_KEY;
+    const hasAnthropicApiKeyInput = hasValue(anthropicApiKey);
+    const effectiveAnthropicApiKey = hasAnthropicApiKeyInput
+      ? anthropicApiKey.trim()
+      : currentConfig.ANTHROPIC_API_KEY;
     const normalizedOcrApiKeyInput = hasValue(ocrApiKey)
       ? String(ocrApiKey).trim()
       : String(mistralApiKey || '').trim();
     const hasOcrApiKeyInput = hasValue(normalizedOcrApiKeyInput);
-    const effectiveOcrApiKey = hasOcrApiKeyInput
-      ? normalizedOcrApiKeyInput
-      : currentConfig.OCR_API_KEY || currentConfig.MISTRAL_API_KEY || '';
     const normalizedOcrProvider = String(
       ocrProvider || currentConfig.OCR_PROVIDER || 'mistral'
     )
       .trim()
       .toLowerCase();
+    // A stored OCR key belongs to the provider it was saved for. Claude OCR
+    // reads OCR_API_KEY before the Anthropic AI key, and Mistral OCR reads it
+    // before MISTRAL_API_KEY, so a key left behind when the provider crosses
+    // to or from Claude would be sent to the wrong vendor (a 401 at best).
+    // Such a key is cleared below unless a new one is typed; the same goes
+    // for a URL that would turn into a Claude proxy.
+    const ocrCrossesClaude =
+      (normalizedOcrProvider === 'anthropic') !==
+      (String(currentConfig.OCR_PROVIDER || 'mistral')
+        .trim()
+        .toLowerCase() ===
+        'anthropic');
+    let storedOcrApiKey;
+    if (normalizedOcrProvider === 'anthropic') {
+      storedOcrApiKey = ocrCrossesClaude ? '' : currentConfig.OCR_API_KEY;
+    } else {
+      storedOcrApiKey = ocrCrossesClaude
+        ? currentConfig.MISTRAL_API_KEY
+        : currentConfig.OCR_API_KEY || currentConfig.MISTRAL_API_KEY;
+    }
+    const effectiveOcrApiKey = hasOcrApiKeyInput
+      ? normalizedOcrApiKeyInput
+      : storedOcrApiKey || '';
     const effectiveOcrEnabled = hasValue(mistralOcrEnabled)
       ? String(mistralOcrEnabled).trim().toLowerCase()
       : String(currentConfig.MISTRAL_OCR_ENABLED || 'no')
@@ -8419,9 +9401,14 @@ router.post('/settings', express.json(), async (req, res) => {
         30000
       );
 
-    if (!['mistral', 'custom', 'ollama'].includes(normalizedOcrProvider)) {
+    if (
+      !['mistral', 'custom', 'ollama', 'anthropic'].includes(
+        normalizedOcrProvider
+      )
+    ) {
       return res.status(400).json({
-        error: 'Invalid OCR provider. Allowed values are mistral and custom.',
+        error:
+          'Invalid OCR provider. Allowed values are mistral, custom and anthropic.',
       });
     }
 
@@ -8433,6 +9420,27 @@ router.post('/settings', express.json(), async (req, res) => {
       return res.status(400).json({
         error:
           'Mistral API key is required when OCR fallback is enabled with provider mistral.',
+      });
+    }
+
+    // Claude OCR may borrow the Anthropic AI key, but only one that is saved:
+    // a key typed into the hidden Anthropic block while another AI provider is
+    // selected is not persisted (see the provider branch below).
+    const anthropicAiKeyForOcr =
+      String(aiProvider || currentConfig.AI_PROVIDER)
+        .trim()
+        .toLowerCase() === 'anthropic'
+        ? effectiveAnthropicApiKey
+        : currentConfig.ANTHROPIC_API_KEY;
+    if (
+      effectiveOcrEnabled === 'yes' &&
+      normalizedOcrProvider === 'anthropic' &&
+      !effectiveOcrApiKey &&
+      !anthropicAiKeyForOcr
+    ) {
+      return res.status(400).json({
+        error:
+          'Claude OCR needs an Anthropic API key: enter one for OCR, or configure the Anthropic AI provider.',
       });
     }
 
@@ -8659,6 +9667,99 @@ router.post('/settings', express.json(), async (req, res) => {
         if (azureDeploymentName)
           updatedConfig.AZURE_DEPLOYMENT_NAME = azureDeploymentName;
         if (azureApiVersion) updatedConfig.AZURE_API_VERSION = azureApiVersion;
+      } else if (selectedAiProvider === 'anthropic') {
+        if (!effectiveAnthropicApiKey) {
+          return res.status(400).json({
+            error:
+              'Anthropic API key is required when the Anthropic provider is selected.',
+          });
+        }
+
+        // Empty is a value of its own here: it leaves the effort to the
+        // model. Anything else must be a level the provider knows, because
+        // the API rejects unknown ones on every request of a scan.
+        const normalizedAnthropicEffort =
+          anthropicEffort === undefined
+            ? currentConfig.ANTHROPIC_EFFORT
+            : String(anthropicEffort ?? '')
+                .trim()
+                .toLowerCase();
+        if (
+          normalizedAnthropicEffort &&
+          !ANTHROPIC_EFFORT_LEVELS.includes(normalizedAnthropicEffort)
+        ) {
+          return res.status(400).json({
+            error: `Invalid Anthropic effort. Allowed values are ${ANTHROPIC_EFFORT_LEVELS.join(', ')}, or empty for the model default.`,
+          });
+        }
+
+        // Same strictness as Token Limit: "16k" must not be read as 16.
+        const normalizedAnthropicMaxTokens = String(
+          anthropicMaxTokens ?? ''
+        ).trim();
+        if (
+          normalizedAnthropicMaxTokens &&
+          (!/^\d+$/.test(normalizedAnthropicMaxTokens) ||
+            Number(normalizedAnthropicMaxTokens) < 1)
+        ) {
+          return res.status(400).json({
+            error:
+              'Invalid Anthropic max tokens. Expected a positive whole number.',
+          });
+        }
+
+        const normalizedAnthropicApiUrl =
+          typeof anthropicApiUrl === 'string' ? anthropicApiUrl.trim() : null;
+        if (normalizedAnthropicApiUrl) {
+          let parsedAnthropicApiUrl = null;
+          try {
+            parsedAnthropicApiUrl = new URL(normalizedAnthropicApiUrl);
+          } catch {
+            parsedAnthropicApiUrl = null;
+          }
+          if (
+            !parsedAnthropicApiUrl ||
+            !['http:', 'https:'].includes(parsedAnthropicApiUrl.protocol)
+          ) {
+            return res.status(400).json({
+              error:
+                'Invalid Anthropic API URL. Expected an http(s) URL, or leave it empty for api.anthropic.com.',
+            });
+          }
+        }
+
+        // The switches arrive as the hidden yes/no inputs of the
+        // settings-switch partial; anything else keeps the stored value.
+        const anthropicSwitch = (rawValue, fallbackValue) => {
+          const normalizedValue = String(rawValue ?? '')
+            .trim()
+            .toLowerCase();
+          return ['yes', 'no'].includes(normalizedValue)
+            ? normalizedValue
+            : String(fallbackValue);
+        };
+
+        if (hasAnthropicApiKeyInput)
+          updatedConfig.ANTHROPIC_API_KEY = effectiveAnthropicApiKey;
+        updatedConfig.ANTHROPIC_MODEL =
+          String(anthropicModel || '').trim() ||
+          currentConfig.ANTHROPIC_MODEL ||
+          ANTHROPIC_DEFAULT_MODEL;
+        updatedConfig.ANTHROPIC_EFFORT = normalizedAnthropicEffort;
+        if (normalizedAnthropicMaxTokens)
+          updatedConfig.ANTHROPIC_MAX_TOKENS = String(
+            Number(normalizedAnthropicMaxTokens)
+          );
+        updatedConfig.ANTHROPIC_STRUCTURED_OUTPUT = anthropicSwitch(
+          anthropicStructuredOutput,
+          currentConfig.ANTHROPIC_STRUCTURED_OUTPUT
+        );
+        updatedConfig.ANTHROPIC_PROMPT_CACHING = anthropicSwitch(
+          anthropicPromptCaching,
+          currentConfig.ANTHROPIC_PROMPT_CACHING
+        );
+        if (normalizedAnthropicApiUrl !== null)
+          updatedConfig.ANTHROPIC_API_URL = normalizedAnthropicApiUrl;
       }
     }
 
@@ -8938,16 +10039,43 @@ router.post('/settings', express.json(), async (req, res) => {
       updatedConfig.MISTRAL_OCR_ENABLED = mistralOcrEnabled;
     if (ocrProvider)
       updatedConfig.OCR_PROVIDER = String(ocrProvider).trim().toLowerCase();
+    const submittedOcrApiUrl =
+      typeof ocrApiUrl === 'string' ? ocrApiUrl.trim() : null;
     if (normalizedOcrProvider === 'mistral') {
       updatedConfig.OCR_API_URL = '';
-    } else if (typeof ocrApiUrl === 'string') {
-      updatedConfig.OCR_API_URL = ocrApiUrl.trim();
+    } else if (normalizedOcrProvider === 'anthropic' && ocrCrossesClaude) {
+      // For Claude OCR the URL is an optional proxy. The one stored for the
+      // previous provider (an auto-detected Ollama URL, say) would be used as
+      // one, so only a URL that differs from it counts as typed for Claude;
+      // empty falls back to ANTHROPIC_API_URL.
+      updatedConfig.OCR_API_URL =
+        submittedOcrApiUrl && submittedOcrApiUrl !== currentConfig.OCR_API_URL
+          ? submittedOcrApiUrl
+          : '';
+    } else if (submittedOcrApiUrl !== null) {
+      updatedConfig.OCR_API_URL = submittedOcrApiUrl;
     }
     if (hasOcrApiKeyInput) {
       updatedConfig.OCR_API_KEY = effectiveOcrApiKey;
-      updatedConfig.MISTRAL_API_KEY = effectiveOcrApiKey;
+      // An Anthropic key must not land where Mistral OCR would read it.
+      if (normalizedOcrProvider !== 'anthropic') {
+        updatedConfig.MISTRAL_API_KEY = effectiveOcrApiKey;
+      }
+    } else if (ocrCrossesClaude) {
+      updatedConfig.OCR_API_KEY = '';
     }
-    if (mistralOcrModel) updatedConfig.MISTRAL_OCR_MODEL = mistralOcrModel;
+    if (normalizedOcrProvider === 'anthropic') {
+      // Stored as the model Claude OCR will run with, so the page shows it
+      // instead of a leftover Mistral model name.
+      if (mistralOcrModel || ocrCrossesClaude) {
+        updatedConfig.MISTRAL_OCR_MODEL = setupService.resolveAnthropicOcrModel(
+          mistralOcrModel,
+          updatedConfig.ANTHROPIC_MODEL || currentConfig.ANTHROPIC_MODEL
+        );
+      }
+    } else if (mistralOcrModel) {
+      updatedConfig.MISTRAL_OCR_MODEL = mistralOcrModel;
+    }
     if (typeof ocrPdfRenderEnabled === 'string') {
       const normalizedPdfRenderEnabled = ocrPdfRenderEnabled
         .trim()
@@ -9085,6 +10213,14 @@ router.post('/settings', express.json(), async (req, res) => {
         updatedConfig.TAG_CACHE_TTL_SECONDS = '300';
       }
     }
+
+    // Single sign-on. Checked last among the fields so an incomplete provider
+    // is reported only when everything else on the page is fine.
+    const oidcUpdate = buildOidcSettingsUpdate(req.body);
+    if (oidcUpdate.error) {
+      return res.status(400).json({ success: false, error: oidcUpdate.error });
+    }
+    Object.assign(updatedConfig, oidcUpdate.updates);
 
     // Handle API key
     let apiToken = configFile.getApiKey
@@ -9432,6 +10568,9 @@ router.get('/about', protectApiRoute, async (req, res) => {
       azureEndpoint: configFile.azure?.endpoint || 'unknown',
       azureDeploymentName: configFile.azure?.deploymentName || 'unknown',
       azureApiVersion: configFile.azure?.apiVersion || 'unknown',
+      anthropicModel: configFile.anthropic?.model || 'unknown',
+      // Empty means api.anthropic.com, which is worth saying in a bug report.
+      anthropicApiUrl: configFile.anthropic?.apiUrl || 'default',
       ocrProvider: configFile.mistralOcr?.provider || 'mistral',
       mistralOcrModel: configFile.mistralOcr?.model || 'unknown',
       scanInterval: configFile.scanInterval || 'unknown',
@@ -9448,6 +10587,7 @@ router.get('/about', protectApiRoute, async (req, res) => {
       openAiKeySet: Boolean(configFile.openai?.apiKey),
       customKeySet: Boolean(configFile.custom?.apiKey),
       azureKeySet: Boolean(configFile.azure?.apiKey),
+      anthropicKeySet: Boolean(configFile.anthropic?.apiKey),
       mistralKeySet: Boolean(configFile.mistralOcr?.apiKey),
       apiKeySet: Boolean(configFile.getApiKey && configFile.getApiKey()),
     };
@@ -9481,6 +10621,8 @@ router.get('/about', protectApiRoute, async (req, res) => {
         azureEndpoint: configFile.azure?.endpoint || 'unknown',
         azureDeploymentName: configFile.azure?.deploymentName || 'unknown',
         azureApiVersion: configFile.azure?.apiVersion || 'unknown',
+        anthropicModel: configFile.anthropic?.model || 'unknown',
+        anthropicApiUrl: configFile.anthropic?.apiUrl || 'default',
         ocrProvider: configFile.mistralOcr?.provider || 'mistral',
         mistralOcrModel: configFile.mistralOcr?.model || 'unknown',
         scanInterval: configFile.scanInterval || 'unknown',
@@ -9497,6 +10639,7 @@ router.get('/about', protectApiRoute, async (req, res) => {
         openAiKeySet: Boolean(configFile.openai?.apiKey),
         customKeySet: Boolean(configFile.custom?.apiKey),
         azureKeySet: Boolean(configFile.azure?.apiKey),
+        anthropicKeySet: Boolean(configFile.anthropic?.apiKey),
         mistralKeySet: Boolean(configFile.mistralOcr?.apiKey),
         apiKeySet: Boolean(configFile.getApiKey && configFile.getApiKey()),
       },

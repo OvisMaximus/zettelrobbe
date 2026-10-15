@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 Paperless-AI **next** — a community fork of clusterzx/paperless-ai. A Node.js/Express app that uses
-LLMs (OpenAI, Ollama, Azure, or any OpenAI-compatible "custom" endpoint) plus optional OCR to auto-tag,
+LLMs (OpenAI, Ollama, Azure, Anthropic, or any OpenAI-compatible "custom" endpoint) plus optional OCR to auto-tag,
 title, classify, and extract metadata for documents in a Paperless-ngx instance. Server-rendered EJS UI,
 no frontend framework. Single SQLite database (better-sqlite3, WAL mode).
 
@@ -54,12 +54,18 @@ the `services/` singletons.
 `class Foo { ... }; module.exports = new Foo();`. Import and call directly; do not `new` them.
 
 **AI provider abstraction:** `services/aiServiceFactory.js` returns the right service based on
-`config.aiProvider` (`openai` | `ollama` | `custom` | `azure`). Every provider service implements
+`config.aiProvider` (`openai` | `ollama` | `custom` | `azure` | `anthropic`). Every provider service implements
 `analyzeDocument(content, doc, existingTags, correspondents)`. To add a provider: add a service singleton,
 wire it into the factory switch, and add its config block in `config/config.js`.
 
-**Token handling:** `services/serviceUtils.js` — `calculateTokens()` (tiktoken for OpenAI, ÷4 char
-estimate otherwise) and `truncateToTokenLimit()`. Also holds AI-error → OCR-fallback classification
+**Anthropic** is not OpenAI-compatible and has its own service (`services/anthropicService.js`). Per-model
+request rules (thinking, effort, structured output, cache minimums), the client factory, usage mapping and
+the truncation/refusal check live in `services/anthropicSupport.js` and are shared with Claude OCR; never
+send `temperature` to it or read `content[0]`. Its analysis prompt and JSON schema come from
+`services/analysisPrompt.js`, which the other providers do not use yet.
+
+**Token handling:** `services/serviceUtils.js` — `calculateTokens()` (tiktoken for OpenAI, ÷3 char
+estimate for `claude-*`, ÷4 otherwise) and `truncateToTokenLimit()`. Also holds AI-error → OCR-fallback classification
 helpers used by the scan loop.
 
 **Prompt restrictions:** `services/restrictionPromptService.js` replaces placeholders like
@@ -69,7 +75,7 @@ in prompts. The base prompts live in `config/config.js` (`specialPromptPreDefine
 normalize them with `toNameList()` from `services/serviceUtils.js` instead of joining them directly.
 
 **OCR:** `services/mistralOcrService.js` — provider can be `mistral`, `ollama` (native `/api/chat`
-vision), or OpenAI-compatible `/v1`. OCR is a fallback path when AI analysis fails on low-text docs.
+vision), OpenAI-compatible `/v1`, or `anthropic` (Claude reads PDFs and images natively). OCR is a fallback path when AI analysis fails on low-text docs.
 
 **Database:** `models/document.js` — better-sqlite3 at `data/documents.db`, WAL mode, prepared
 statements throughout. Key tables: `processed_documents`, `history_documents` (server-side paginated

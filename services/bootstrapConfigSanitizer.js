@@ -8,10 +8,12 @@ const BOOTSTRAP_SECRET_FIELDS = [
   'OLLAMA_API_KEY',
   'CUSTOM_API_KEY',
   'AZURE_API_KEY',
+  'ANTHROPIC_API_KEY',
   'OCR_API_KEY',
   'MISTRAL_API_KEY',
   'API_KEY',
   'JWT_SECRET',
+  'OIDC_CLIENT_SECRET',
 ];
 
 // Returns a shallow copy of config with every secret field removed.

@@ -159,4 +159,10 @@
     opacity: 1;
     background: color-mix(in srgb, var(--zr-brand) 18%, transparent);
   }
+  /* The default 16px icon is wider than its 15px button and stuck out past
+     the chip's rounded end. */
+  .zr-chip button .zr-icon {
+    width: 11px;
+    height: 11px;
+  }
 }

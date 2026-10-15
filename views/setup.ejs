@@ -370,6 +370,7 @@
                             <div class="zr-field zr-field--stacked zr-formgrid__wide">
                                 <label for="aiApiUrl" class="zr-field__name">API URL</label>
                                 <input id="aiApiUrl" type="text" class="zr-input" required>
+                                <p id="aiApiUrlHint" class="zr-field__hint hidden">Only for a proxy; leave empty for api.anthropic.com.</p>
                             </div>
                             <div class="zr-field zr-field--stacked zr-formgrid__wide">
                                 <label for="aiToken" class="zr-field__name">API key</label>
@@ -430,17 +431,20 @@
                             <select id="ocrProvider" class="zr-input">
                                 <option value="mistral" <%= (config.OCR_PROVIDER || 'mistral') === 'mistral' ? 'selected' : '' %>>Mistral OCR API</option>
                                 <option value="custom" <%= ((config.OCR_PROVIDER || 'mistral') === 'custom' || (config.OCR_PROVIDER || 'mistral') === 'ollama') ? 'selected' : '' %>>Custom (Ollama, LM Studio, local models)</option>
+                                <option value="anthropic" <%= (config.OCR_PROVIDER || 'mistral') === 'anthropic' ? 'selected' : '' %>>Claude (Anthropic)</option>
                             </select>
                         </div>
                         <div id="ocrApiUrlContainer" class="zr-field zr-field--stacked">
                             <label for="ocrApiUrl" class="zr-field__name">OCR API URL (optional override)</label>
-                            <input id="ocrApiUrl" type="text" class="zr-input" value="<%= config.OCR_API_URL || '' %>" placeholder="Leave empty to use provider default URL">
-                            <p class="zr-field__hint">For custom provider, set URL to your local endpoint (e.g. Ollama or LM Studio /v1).</p>
+                            <input id="ocrApiUrl" type="text" class="zr-input" value="<%= config.OCR_API_URL || '' %>" placeholder="Leave empty to use provider default URL" data-placeholder-default="Leave empty to use provider default URL" data-placeholder-anthropic="Optional proxy URL">
+                            <p id="ocrApiUrlHint" class="zr-field__hint">For custom provider, set URL to your local endpoint (e.g. Ollama or LM Studio /v1).</p>
+                            <p id="ocrApiUrlAnthropicHint" class="zr-field__hint hidden">Only for a proxy; empty uses the Anthropic API URL of the AI provider, then api.anthropic.com.</p>
                         </div>
                         <div id="ocrApiKeyContainer" class="zr-field zr-field--stacked">
                             <label for="ocrApiKey" class="zr-field__name">OCR API key</label>
-                            <input id="ocrApiKey" type="password" class="zr-input" placeholder="Required for Mistral">
-                            <p class="zr-field__hint">Optional for local and custom OCR providers.</p>
+                            <input id="ocrApiKey" type="password" class="zr-input" placeholder="Required for Mistral" data-placeholder-default="Required for Mistral" data-placeholder-anthropic="Optional">
+                            <p id="ocrApiKeyHint" class="zr-field__hint">Optional for local and custom OCR providers.</p>
+                            <p id="ocrApiKeyAnthropicHint" class="zr-field__hint hidden">Empty uses the Anthropic API key from the AI provider.</p>
                         </div>
                         <div class="zr-field zr-field--stacked">
                             <label for="mistralOcrModel" class="zr-field__name">OCR model</label>
@@ -518,7 +522,8 @@
         window.__SETUP_BOOTSTRAP__ = <%- JSON.stringify({
             config: config || {},
             defaults: defaults || {},
-            aiProviderPresets: Array.isArray(aiProviderPresets) ? aiProviderPresets : []
+            aiProviderPresets: Array.isArray(aiProviderPresets) ? aiProviderPresets : [],
+            anthropic: (typeof anthropicOptions !== 'undefined' && anthropicOptions) || {}
         }).replace(/</g, '\\u003c') %>;
     </script>
     <script type="module" src="/js/zr.js"></script>

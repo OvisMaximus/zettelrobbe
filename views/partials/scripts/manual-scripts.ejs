@@ -158,7 +158,7 @@ function updateSuggestedTags(tags) {
     suggestedTags.innerHTML = '';
     
     tags.forEach(tag => {
-        const tagElement = createTagElement(tag, 'blue', true);
+        const tagElement = createTagElement(tag, true);
         if (tagElement) {
             suggestedTags.appendChild(tagElement);
         }
@@ -166,7 +166,19 @@ function updateSuggestedTags(tags) {
 }
 
 // Tag Management Functions
-function createTagElement(tag, color = 'gray', isSuggested = false) {
+
+// A chip button in the shape settings.ejs and the styleguide use: the icon
+// alone, so it needs a label of its own.
+function createChipButton(icon, label) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'zr-link';
+    button.setAttribute('aria-label', label);
+    button.innerHTML = `<svg class="zr-icon" aria-hidden="true"><use href="/icons.svg#${icon}"/></svg>`;
+    return button;
+}
+
+function createTagElement(tag, isSuggested = false) {
     if (!tag) return null;
 
     // If tag is just an ID string/number, look up the full tag object in availableTags
@@ -178,29 +190,18 @@ function createTagElement(tag, color = 'gray', isSuggested = false) {
     const tagId = fullTag.id;
     const tagName = fullTag.name;
 
-    const tagElement = document.createElement('span');
-    tagElement.className = `inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-${color}-100 text-${color}-800`;
+    // Suggestions are not on the document yet; the modifier sets them apart
+    // from the tags it already carries.
+    const tagElement = document.createElement('div');
+    tagElement.className = isSuggested ? 'zr-chip manual-chip--suggested' : 'zr-chip';
     tagElement.dataset.tagId = tagId;
-    
+
     const nameSpan = document.createElement('span');
     nameSpan.textContent = tagName;
     tagElement.appendChild(nameSpan);
 
-    const removeButton = document.createElement('button');
-    removeButton.className = `ml-1 text-${color}-600 hover:text-${color}-800`;
-    removeButton.innerHTML = '<svg class="zr-icon" aria-hidden="true"><use href="/icons.svg#i-x"/></svg>';
-    removeButton.onclick = (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        tagElement.remove();
-        updateHiddenTagsInput(); // Update hidden input when tag is removed
-    };
-    tagElement.appendChild(removeButton);
-
     if (isSuggested) {
-        const addButton = document.createElement('button');
-        addButton.className = `ml-1 text-${color}-600 hover:text-${color}-800`;
-        addButton.innerHTML = '<svg class="zr-icon" aria-hidden="true"><use href="/icons.svg#i-plus"/></svg>';
+        const addButton = createChipButton('i-plus', `Add ${tagName}`);
         addButton.onclick = (e) => {
             e.preventDefault();
             e.stopPropagation();
@@ -213,6 +214,18 @@ function createTagElement(tag, color = 'gray', isSuggested = false) {
         };
         tagElement.appendChild(addButton);
     }
+
+    const removeButton = createChipButton(
+        'i-x',
+        isSuggested ? `Dismiss ${tagName}` : `Remove ${tagName}`
+    );
+    removeButton.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        tagElement.remove();
+        updateHiddenTagsInput(); // Update hidden input when tag is removed
+    };
+    tagElement.appendChild(removeButton);
 
     return tagElement;
 }
@@ -272,7 +285,7 @@ async function handleDocumentSelection(documentId) {
         if (data.tags && Array.isArray(data.tags)) {
             const currentTagsContainer = document.getElementById('currentTags');
             data.tags.forEach(tag => {
-                const tagElement = createTagElement(tag, 'gray', false);
+                const tagElement = createTagElement(tag);
                 if (tagElement) {
                     currentTagsContainer.appendChild(tagElement);
                 }

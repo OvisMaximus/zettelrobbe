@@ -140,6 +140,11 @@ const TESTS = {
   'token-limit-config': 'test-token-limit-config.js',
   'truncate-returns-string': 'test-truncate-returns-string.js',
   'session-token-type': 'test-session-token-type.js',
+  'health-disclosure': 'test-health-disclosure.js',
+  'totp-replay': 'test-totp-replay.js',
+  'login-username-timing': 'test-login-username-timing.js',
+  'oidc-sso': 'test-oidc-sso.js',
+  'settings-oidc': 'test-settings-oidc.js',
   'setup-complete-guard': 'test-setup-complete-guard.js',
   'rescan-fetch-before-delete': 'test-rescan-fetch-before-delete.js',
   'ocr-empty-result-guard': 'test-ocr-empty-result-guard.js',
@@ -167,10 +172,24 @@ const TESTS = {
   'review-sheet': 'test-review-sheet.js',
   'review-assist': 'test-review-assist.js',
   'review-voice': 'test-review-voice.js',
+  'anthropic-support': 'test-anthropic-support.js',
+  'anthropic-provider': 'test-anthropic-provider.js',
+  'anthropic-settings': 'test-anthropic-settings.js',
+  'ocr-provider-anthropic': 'test-ocr-provider-anthropic.js',
+  'settings-save-session-secret': 'test-settings-save-session-secret.js',
+  'session-guard': 'test-session-guard.js',
 };
 
 const AREAS = {
-  auth: ['login-mfa-flow', 'rate-limiting', 'thumbnail-auth-guard'],
+  auth: [
+    'login-mfa-flow',
+    'rate-limiting',
+    'thumbnail-auth-guard',
+    'settings-save-session-secret',
+    'session-guard',
+    'oidc-sso',
+    'settings-oidc',
+  ],
   ocr: [
     'ocr-fallback-ai-errors',
     'ocr-startup-recovery',
@@ -282,6 +301,10 @@ const AREAS = {
     'thumbnail-cache-path-sanitization',
     'url-base-validation',
     'session-token-type',
+    'health-disclosure',
+    'totp-replay',
+    'login-username-timing',
+    'oidc-sso',
     'setup-complete-guard',
   ],
   duplicates: [
@@ -307,6 +330,12 @@ const AREAS = {
     'simplify-assistant-ui',
   ],
   review: ['review-sheet', 'review-assist', 'review-voice'],
+  anthropic: [
+    'anthropic-support',
+    'anthropic-provider',
+    'anthropic-settings',
+    'ocr-provider-anthropic',
+  ],
 };
 
 // Tests intentionally excluded from the auto-discovery drift check below.

@@ -9,6 +9,14 @@
       "tokenPlaceholder": "sk-..."
     },
     {
+      "id": "anthropic-default",
+      "label": "Anthropic (Claude)",
+      "provider": "anthropic",
+      "apiUrl": "",
+      "model": "claude-haiku-5-5",
+      "tokenPlaceholder": "sk-ant-..."
+    },
+    {
       "id": "lmstudio-local",
       "label": "LM Studio (OpenAI compatible)",
       "provider": "custom",

@@ -24,6 +24,8 @@
         azureEndpoint: appAzureEndpoint || 'unknown',
         azureDeploymentName: appAzureDeploymentName || 'unknown',
         azureApiVersion: appAzureApiVersion || 'unknown',
+        anthropicModel: (typeof appAnthropicModel !== 'undefined' && appAnthropicModel) || 'unknown',
+        anthropicApiUrl: (typeof appAnthropicApiUrl !== 'undefined' && appAnthropicApiUrl) || 'default',
         mistralOcrModel: appMistralOcrModel || 'unknown',
         scanInterval: appScanInterval || 'unknown',
         tokenLimit: appTokenLimit || 'unknown',
@@ -37,6 +39,7 @@
         openAiKeySet: Boolean(appOpenAiKeySet),
         customKeySet: Boolean(appCustomKeySet),
         azureKeySet: Boolean(appAzureKeySet),
+        anthropicKeySet: typeof appAnthropicKeySet !== 'undefined' && Boolean(appAnthropicKeySet),
         mistralKeySet: Boolean(appMistralKeySet),
         apiKeySet: Boolean(appApiKeySet)
     }).replace(/</g, '\\u003c') %></script>

@@ -1088,6 +1088,10 @@ class EntityMatchAiService {
           runtimeConfig.azure?.deploymentName ||
           null
         );
+      case 'anthropic':
+        return (
+          process.env.ANTHROPIC_MODEL || runtimeConfig.anthropic?.model || null
+        );
       default:
         return process.env.OPENAI_MODEL || runtimeConfig.openai?.model || null;
     }

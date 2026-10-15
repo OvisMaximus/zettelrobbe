@@ -2198,7 +2198,7 @@ test('A failed run points at the settings that could have prevented it', () => {
     'the message of a failed run must be escaped like everything else'
   );
   assert.ok(
-    failure.includes('href="/settings#duplicates-tab"'),
+    failure.includes('href="/settings#duplicates"'),
     'the link must land on the Duplicates section, not on the settings page'
   );
   assert.ok(

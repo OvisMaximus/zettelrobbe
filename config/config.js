@@ -368,6 +368,32 @@ const getCookieSecureMode = () => {
   return 'auto';
 };
 
+/* Single sign-on through OpenID Connect. Read on every call rather than
+   snapshotted at load, like the other auth getters above, so a runtime
+   override or a test can change it without reloading the module. Off unless
+   OIDC_ENABLED is set; password login keeps working either way. */
+const getOidcConfig = () => ({
+  enabled: parseEnvBoolean(process.env.OIDC_ENABLED, 'no') === 'yes',
+  issuerUrl: String(process.env.OIDC_ISSUER_URL || '').trim(),
+  clientId: String(process.env.OIDC_CLIENT_ID || '').trim(),
+  clientSecret: String(process.env.OIDC_CLIENT_SECRET || ''),
+  // Required: the identity whose e-mail matches signs in as the admin.
+  adminEmail: String(process.env.OIDC_ADMIN_EMAIL || '').trim(),
+  redirectUri: String(process.env.OIDC_REDIRECT_URI || '').trim(),
+  scopes: String(process.env.OIDC_SCOPES || 'openid profile email').trim(),
+  emailClaim: String(process.env.OIDC_EMAIL_CLAIM || 'email').trim() || 'email',
+  // An address the provider marks unverified is refused unless this is set.
+  allowUnverifiedEmail:
+    parseEnvBoolean(process.env.OIDC_ALLOW_UNVERIFIED_EMAIL, 'no') === 'yes',
+  // client_secret_basic | client_secret_post | none; empty = automatic.
+  tokenAuthMethod: String(process.env.OIDC_TOKEN_AUTH_METHOD || '').trim(),
+  // Login button appearance.
+  buttonText: String(process.env.OIDC_BUTTON_TEXT || '').trim(),
+  buttonIcon: String(process.env.OIDC_BUTTON_ICON || '').trim(),
+  buttonColor: String(process.env.OIDC_BUTTON_COLOR || '').trim(),
+  buttonTextColor: String(process.env.OIDC_BUTTON_TEXT_COLOR || '').trim(),
+});
+
 // Initialize limit functions with defaults
 const limitFunctions = {
   activateTagging: parseEnvBoolean(process.env.ACTIVATE_TAGGING, 'yes'),
@@ -433,13 +459,14 @@ startupLog(logLevel, 'info', 'Configuration loaded:', {
 });
 
 module.exports = {
-  PAPERLESS_AI_VERSION: 'v2026.09.03',
+  PAPERLESS_AI_VERSION: 'v2026.10.01',
   CONFIGURED: false,
   configSourceMode: CONFIG_SOURCE_MODE,
   getApiKey,
   getJwtSecret,
   getTrustProxy,
   getCookieSecureMode,
+  getOidcConfig,
   isProtectedRuntimeEnvKey,
   get apiKey() {
     return getApiKey();
@@ -652,6 +679,33 @@ module.exports = {
     endpoint: process.env.AZURE_ENDPOINT || '',
     deploymentName: process.env.AZURE_DEPLOYMENT_NAME || '',
     apiVersion: process.env.AZURE_API_VERSION || '2023-05-15',
+  },
+  // The Claude API speaks its own Messages dialect, so it is a provider of
+  // its own rather than a preset of `custom`. Request rules per model live in
+  // services/anthropicSupport.js.
+  anthropic: {
+    apiKey: process.env.ANTHROPIC_API_KEY || '',
+    // Empty means api.anthropic.com; set only for a proxy in front of it.
+    apiUrl: process.env.ANTHROPIC_API_URL || '',
+    model: process.env.ANTHROPIC_MODEL || 'claude-haiku-5-5',
+    // low | medium | high | xhigh | max; empty leaves the model's default.
+    effort: String(process.env.ANTHROPIC_EFFORT || '')
+      .trim()
+      .toLowerCase(),
+    // Completion cap per request. Thinking counts toward it, which is why it
+    // is separate from RESPONSE_TOKENS.
+    maxTokens: parseTokenCount(
+      process.env.ANTHROPIC_MAX_TOKENS,
+      16000,
+      'ANTHROPIC_MAX_TOKENS'
+    ),
+    // Constrain the analysis answer to a JSON schema (output_config.format).
+    structuredOutput: parseEnvBoolean(
+      process.env.ANTHROPIC_STRUCTURED_OUTPUT,
+      'yes'
+    ),
+    // Mark the system prompt cacheable; it repeats for every document of a scan.
+    promptCaching: parseEnvBoolean(process.env.ANTHROPIC_PROMPT_CACHING, 'yes'),
   },
   mistralOcr: {
     enabled: parseEnvBoolean(process.env.MISTRAL_OCR_ENABLED, 'no'),

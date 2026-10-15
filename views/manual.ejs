@@ -15,42 +15,47 @@
         
                 <!-- Document Selection -->
                 <div class="zr-module">
-                    <h2 class="zr-module__title">Select Document</h2>
-                    <div class="manual-search-wrapper">
-                        <!-- Field and results share one box: the results panel
-                             is positioned against it and drops over the page,
-                             instead of pushing the rest of the form down on
-                             every keystroke. -->
-                        <div class="manual-search-anchor">
-                            <input
-                                id="manualDocumentSearchInput"
-                                class="zr-input"
-                                type="search"
-                                placeholder="Search documents (title, ID, correspondent)..."
-                                autocomplete="off">
-                            <div id="manualDocumentSearchResults" class="manual-search-results hidden" role="listbox" aria-label="Manual document search results"></div>
-                            <input type="hidden" id="documentSelect" value="">
+                    <div class="zr-module__head">
+                        <h2 class="zr-module__title">Select Document</h2>
+                    </div>
+                    <div class="zr-module__body">
+                        <div class="manual-search-wrapper">
+                            <!-- Field and results share one box: the results panel
+                                 is positioned against it and drops over the page,
+                                 instead of pushing the rest of the form down on
+                                 every keystroke. -->
+                            <div class="manual-search-anchor">
+                                <input
+                                    id="manualDocumentSearchInput"
+                                    class="zr-input"
+                                    type="search"
+                                    placeholder="Search documents (title, ID, correspondent)..."
+                                    autocomplete="off">
+                                <div id="manualDocumentSearchResults" class="manual-search-results hidden" role="listbox" aria-label="Manual document search results"></div>
+                                <input type="hidden" id="documentSelect" value="">
+                            </div>
+                            <p id="manualDocumentSearchStatus" class="manual-search-status">Loading recent documents...</p>
                         </div>
-                        <p id="manualDocumentSearchStatus" class="manual-search-status">Loading recent documents...</p>
                     </div>
                 </div>
-        
+
                 <!-- Main Grid -->
                 <div class="card-grid">
                     <!-- Document Preview Card -->
                     <div class="zr-module">
-                        <h2 class="zr-module__title">Document Preview</h2>
-                        <!-- Correspondent Info -->
-                        <div id="correspondentInfo" class="stat-box hidden">
-                            <h3 class="zr-field__name">Correspondent:</h3>
-                            <p id="correspondentName"></p>
+                        <div class="zr-module__head">
+                            <h2 class="zr-module__title">Document Preview</h2>
                         </div>
-                        <div id="titleInfo" class="stat-box hidden">
-                            <h3 class="zr-field__name">Title:</h3>
-                            <p id="titleName"></p>
-                        </div>
-                        <div class="stat-box">
-                            <div id="documentPreview" class="manual-preview">
+                        <div class="zr-module__body zr-col">
+                            <div id="correspondentInfo" class="zr-kv hidden">
+                                <span class="zr-kv__k">Correspondent</span>
+                                <span id="correspondentName" class="zr-kv__v"></span>
+                            </div>
+                            <div id="titleInfo" class="zr-kv hidden">
+                                <span class="zr-kv__k">Title</span>
+                                <span id="titleName" class="zr-kv__v"></span>
+                            </div>
+                            <div id="documentPreview" class="zr-panel manual-preview">
                                 <div id="contentPreview" class="zr-mono"></div>
                                 <!-- Shown while contentPreview is empty (CSS sibling
                                      rule) so the box is not a bare grey area. -->
@@ -62,66 +67,62 @@
                             </div>
                         </div>
                     </div>
-        
+
                     <!-- AI and Tags Section -->
                     <div>
                         <!-- AI Analysis Card -->
                         <div class="zr-module">
-                            <h2 class="zr-module__title">AI Analysis</h2>
-                            <button id="analyzeBtn" 
-                                    class="zr-btn zr-btn--block" 
-                                    disabled>
+                            <div class="zr-module__head">
+                                <h2 class="zr-module__title">AI Analysis</h2>
+                            </div>
+                            <div class="zr-module__body zr-col">
+                                <button id="analyzeBtn" type="button" class="zr-btn zr-btn--block" disabled>
                                     <svg class="zr-icon" aria-hidden="true"><use href="/icons.svg#i-cpu"/></svg>
                                     Analyze with AI
-                            </button>
-                            <div id="aiStatus" class="hidden">
-                                <div class="zr-row">
-                                    <div>
-                                        <svg class="zr-icon zr-icon--spin" aria-hidden="true"><use href="/icons.svg#i-refresh"/></svg>
-                                    </div>
-                                    <div class="zr-muted">
-                                        AI is analyzing the document...
-                                    </div>
+                                </button>
+                                <div id="aiStatus" class="zr-row zr-sm zr-muted hidden" role="status">
+                                    <svg class="zr-icon zr-icon--spin" aria-hidden="true"><use href="/icons.svg#i-refresh"/></svg>
+                                    AI is analyzing the document...
                                 </div>
                             </div>
                         </div>
-        
+
                         <!-- Tags Card -->
                         <div class="zr-module">
-                            <h2 class="zr-module__title">Tags</h2>
-                            <!-- AI Suggested Tags -->
-                            <div>
-                                <h3 class="zr-field__name">AI Suggestions</h3>
-                                <div id="suggestedTags" class="zr-row zr-row--wrap"></div>
-                                <input type="hidden" id="tags" name="tags" value="">
-                            </div>
-        
-                            <!-- Current Tags -->
-                            <div>
-                                <div class="zr-row zr-row--between">
-                                    <h3 class="zr-muted">Current Tags</h3>
+                            <div class="zr-module__head">
+                                <h2 class="zr-module__title">Tags</h2>
+                                <div class="zr-module__actions">
                                     <!-- Enabled once a document is selected; there is
                                          nothing to save before that. -->
-                                    <button id="saveTagsBtn"
-                                            class="zr-btn zr-btn--primary" disabled>
+                                    <button id="saveTagsBtn" type="button" class="zr-btn zr-btn--primary" disabled>
                                         Save Tags
                                     </button>
                                 </div>
-                                <div id="currentTags" class="zr-row zr-row--wrap"></div>
                             </div>
-        
-                            <!-- Add New Tag -->
-                            <div>
-                                <h3 class="zr-field__name">Add New Tag</h3>
-                                <div class="zr-row">
-                                    <select id="newTagSelect" class="zr-select zr-grow" disabled>
-                                        <option value="">Select a tag...</option>
-                                    </select>
-                                    <!-- Quiet: Save Tags is the one primary action here. -->
-                                    <button id="addTagBtn" class="zr-btn" disabled aria-label="Add tag">
-                                        <svg class="zr-icon" aria-hidden="true"><use href="/icons.svg#i-plus"/></svg>
-                                    </button>
-                                    <input type="hidden" id="hiddenId" value="">
+                            <div class="zr-module__body zr-col zr-col--loose">
+                                <div class="zr-col zr-col--tight">
+                                    <span class="zr-label">AI Suggestions</span>
+                                    <div id="suggestedTags" class="zr-chips manual-tags" data-empty="Run the AI analysis for suggestions."></div>
+                                </div>
+
+                                <div class="zr-col zr-col--tight">
+                                    <span class="zr-label">Current Tags</span>
+                                    <div id="currentTags" class="zr-chips manual-tags" data-empty="No tags yet."></div>
+                                    <input type="hidden" id="tags" name="tags" value="">
+                                </div>
+
+                                <div class="zr-col zr-col--tight">
+                                    <label for="newTagSelect" class="zr-label">Add New Tag</label>
+                                    <div class="zr-row">
+                                        <select id="newTagSelect" class="zr-select zr-grow" disabled>
+                                            <option value="">Select a tag...</option>
+                                        </select>
+                                        <!-- Quiet: Save Tags is the one primary action here. -->
+                                        <button id="addTagBtn" type="button" class="zr-btn" disabled aria-label="Add tag">
+                                            <svg class="zr-icon" aria-hidden="true"><use href="/icons.svg#i-plus"/></svg>
+                                        </button>
+                                        <input type="hidden" id="hiddenId" value="">
+                                    </div>
                                 </div>
                             </div>
                         </div>

@@ -114,6 +114,7 @@ class FormManager {
     const ollamaSettings = document.getElementById('ollamaSettings');
     const customSettings = document.getElementById('customSettings');
     const azureSettings = document.getElementById('azureSettings');
+    const anthropicSettings = document.getElementById('anthropicSettings');
 
     // Get all provider-specific fields
     const openaiKey = document.getElementById('openaiKey');
@@ -141,6 +142,13 @@ class FormManager {
     ollamaSettings.classList.add('hidden');
     customSettings.classList.add('hidden');
     azureSettings.classList.add('hidden');
+    anthropicSettings?.classList.add('hidden');
+
+    // Claude models reject sampling parameters, so the temperature fields
+    // stay (they apply again after switching back) but say they are ignored.
+    document.querySelectorAll('[data-anthropic-hint]').forEach((hint) => {
+      hint.classList.toggle('hidden', provider !== 'anthropic');
+    });
 
     // Reset all required fields
     openaiKey.required = false;
@@ -174,6 +182,11 @@ class FormManager {
         azureEndpoint.required = true;
         azureDeploymentName.required = true;
         azureApiVersion.required = true;
+        break;
+      case 'anthropic':
+        // Nothing is required here: an empty key keeps the stored one (the
+        // save route refuses when there is none), and the model has a default.
+        anthropicSettings?.classList.remove('hidden');
         break;
     }
   }
@@ -501,6 +514,15 @@ function initializeFormHandlers() {
   const aiProviderPresets = Array.isArray(settingsBootstrap.aiProviderPresets)
     ? settingsBootstrap.aiProviderPresets
     : [];
+  // Claude models and defaults as services/anthropicSupport.js defines them.
+  const anthropicOptions = settingsBootstrap.anthropic || {};
+  const anthropicSuggestedModelIds = (
+    Array.isArray(anthropicOptions.suggestedModels)
+      ? anthropicOptions.suggestedModels
+      : []
+  )
+    .map((entry) => String(entry?.id || '').trim())
+    .filter(Boolean);
 
   const aiPresetSelect = document.getElementById('aiPreset');
   const aiPresetHint = document.getElementById('aiPresetHint');
@@ -514,6 +536,12 @@ function initializeFormHandlers() {
   const fetchAiModelsBtn = document.getElementById('fetchAiModelsBtn');
   const fetchCustomAiModelsBtn = document.getElementById(
     'fetchCustomAiModelsBtn'
+  );
+  const anthropicApiKeyInput = document.getElementById('anthropicApiKey');
+  const anthropicModelInput = document.getElementById('anthropicModel');
+  const anthropicApiUrlInput = document.getElementById('anthropicApiUrl');
+  const fetchAnthropicModelsBtn = document.getElementById(
+    'fetchAnthropicModelsBtn'
   );
 
   const ocrEnabledSelect = document.getElementById('mistralOcrEnabled');
@@ -672,6 +700,16 @@ function initializeFormHandlers() {
         ).trim(),
       };
     }
+    if (provider === 'anthropic') {
+      // An empty URL is api.anthropic.com, which is what the preset says.
+      return {
+        provider,
+        apiUrl: String(anthropicApiUrlInput?.value || '')
+          .trim()
+          .replace(/\/+$/, ''),
+        model: String(anthropicModelInput?.value || '').trim(),
+      };
+    }
 
     return {
       provider: 'custom',
@@ -757,6 +795,27 @@ function initializeFormHandlers() {
         azureEndpoint.value = String(preset.apiUrl || '').trim();
       if (azureDeploymentName)
         azureDeploymentName.value = String(preset.model || '').trim();
+    } else if (provider === 'anthropic') {
+      if (anthropicApiUrlInput)
+        anthropicApiUrlInput.value = String(preset.apiUrl || '').trim();
+      if (anthropicModelInput) {
+        const presetModel =
+          String(preset.model || '').trim() ||
+          String(anthropicOptions.defaultModel || '');
+        populateModelSelect(
+          anthropicModelInput,
+          [...anthropicSuggestedModelIds, presetModel],
+          'Select Claude model',
+          { preferred: presetModel }
+        );
+      }
+      if (
+        anthropicApiKeyInput &&
+        preset.tokenPlaceholder &&
+        anthropicApiKeyInput.placeholder !== 'Configured'
+      ) {
+        anthropicApiKeyInput.placeholder = preset.tokenPlaceholder;
+      }
     }
 
     if (aiPresetHint) {
@@ -824,6 +883,8 @@ function initializeFormHandlers() {
     document.getElementById('openaiModel'),
     document.getElementById('azureEndpoint'),
     document.getElementById('azureDeploymentName'),
+    anthropicModelInput,
+    anthropicApiUrlInput,
   ].forEach((element) => {
     if (element) {
       element.addEventListener('change', () => refreshAiPresetSelection());
@@ -1002,6 +1063,83 @@ function initializeFormHandlers() {
     });
   }
 
+  /* The live list needs a key; without one (or when the call fails) the route
+     answers with the suggested models and says so in its message. The list is
+     laid out like the OCR model select, and the model chosen before stays
+     selected and listed even when the answer does not name it. */
+  const fillAnthropicModelSelect = (models) => {
+    const current = String(anthropicModelInput?.value || '').trim();
+    const preferred = current || String(anthropicOptions.defaultModel || '');
+    populateModelSelect(
+      anthropicModelInput,
+      [...models, preferred],
+      'Select Claude model',
+      { preferred }
+    );
+  };
+
+  if (fetchAnthropicModelsBtn) {
+    fetchAnthropicModelsBtn.addEventListener('click', async () => {
+      setButtonLoading(fetchAnthropicModelsBtn, true);
+      try {
+        const response = await fetch('/api/settings/ai/models', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            aiProvider: 'anthropic',
+            apiUrl: String(anthropicApiUrlInput?.value || '').trim(),
+            // Empty means the stored key; the route resolves it.
+            token: String(anthropicApiKeyInput?.value || '').trim(),
+          }),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || !result.success) {
+          throw new Error(
+            result.error || result.message || 'Model discovery failed'
+          );
+        }
+
+        const models = Array.isArray(result.models) ? result.models : [];
+        fillAnthropicModelSelect(
+          models.length > 0 ? models : anthropicSuggestedModelIds
+        );
+        await zrDialog({
+          icon: result.live === false ? 'warning' : 'success',
+          title:
+            result.live === false ? 'Suggested models shown' : 'Models loaded',
+          text: result.message || `Found ${models.length} model(s).`,
+        });
+      } catch (error) {
+        fillAnthropicModelSelect(anthropicSuggestedModelIds);
+        await zrDialog({
+          icon: 'error',
+          title: 'Loading failed',
+          text: String(error?.message || error),
+        });
+      } finally {
+        setButtonLoading(fetchAnthropicModelsBtn, false);
+      }
+    });
+  }
+
+  /* What Claude OCR falls back to when its own fields are empty: the
+     Anthropic AI provider's key, URL and model — but only while that provider
+     is selected, because the save route stores them only then. */
+  const getAnthropicFallbackForOcr = () => {
+    if (
+      String(aiProviderSelect?.value || '')
+        .trim()
+        .toLowerCase() !== 'anthropic'
+    ) {
+      return {};
+    }
+    return {
+      anthropicApiKey: String(anthropicApiKeyInput?.value || '').trim(),
+      anthropicApiUrl: String(anthropicApiUrlInput?.value || '').trim(),
+      anthropicModel: String(anthropicModelInput?.value || '').trim(),
+    };
+  };
+
   const setOcrTestPill = (state, text) => {
     if (!ocrTestState) return;
     ocrTestState.textContent = text;
@@ -1017,9 +1155,13 @@ function initializeFormHandlers() {
 
   const normalizeOcrProviderForApi = (provider) => {
     const normalized = String(provider || 'mistral').toLowerCase();
-    return normalized === 'custom' ? 'custom' : 'mistral';
+    return ['custom', 'anthropic'].includes(normalized)
+      ? normalized
+      : 'mistral';
   };
 
+  // Mistral has no URL field. For Claude the field is an optional proxy URL,
+  // so whatever is in it was typed for Claude (switching to Claude empties it).
   const normalizeOcrApiUrlForProvider = (provider, rawUrl) => {
     const normalizedProvider = normalizeOcrProviderForApi(provider);
     if (normalizedProvider === 'mistral') {
@@ -1027,6 +1169,27 @@ function initializeFormHandlers() {
     }
 
     return String(rawUrl || '').trim();
+  };
+
+  const isClaudeModelName = (model) => /^claude-/i.test(String(model || ''));
+
+  /* The OCR model select for Claude: the suggested models, with the current
+     choice kept when it is a Claude model and the AI provider's model (or the
+     default) preselected otherwise. */
+  const offerAnthropicOcrModels = () => {
+    if (!ocrModelInput) return;
+    const current = String(ocrModelInput.value || '').trim();
+    const aiModel = getAnthropicFallbackForOcr().anthropicModel || '';
+    const preferred = isClaudeModelName(current)
+      ? current
+      : (isClaudeModelName(aiModel) && aiModel) ||
+        String(anthropicOptions.defaultModel || '');
+    populateModelSelect(
+      ocrModelInput,
+      [...anthropicSuggestedModelIds, preferred],
+      'Select Claude model',
+      { preferred }
+    );
   };
 
   const getOcrValidationTimeoutMs = () => {
@@ -1039,6 +1202,13 @@ function initializeFormHandlers() {
       : 30;
     return normalizedSeconds * 1000;
   };
+
+  // The provider the OCR fields were last laid out for, so a switch to
+  // Claude can be told apart from a re-render (the quickstart sets the select
+  // without a change event and then calls toggleOcrFields()).
+  let previousOcrProvider = String(
+    ocrProviderSelect?.value || 'mistral'
+  ).toLowerCase();
 
   const toggleOcrFields = () => {
     if (!ocrEnabledSelect || !ocrProviderSelect) return;
@@ -1057,9 +1227,30 @@ function initializeFormHandlers() {
     if (ocrApiUrlContainer) {
       ocrApiUrlContainer.classList.toggle(
         'hidden',
-        !enabled || provider !== 'custom'
+        !enabled || !['custom', 'anthropic'].includes(provider)
       );
     }
+
+    // Claude OCR: the key is optional (the AI provider's key is the
+    // fallback) and the URL is only for a proxy. Placeholders and hints for
+    // both cases are rendered by the server, which knows what is stored.
+    const isAnthropicOcr = provider === 'anthropic';
+    [ocrApiKeyInput, ocrApiUrlInput].forEach((input) => {
+      if (!input) return;
+      const placeholder = isAnthropicOcr
+        ? input.dataset.placeholderAnthropic
+        : input.dataset.placeholderDefault;
+      if (placeholder) input.placeholder = placeholder;
+    });
+    document
+      .getElementById('ocrApiKeyHint')
+      ?.classList.toggle('hidden', isAnthropicOcr);
+    document
+      .getElementById('ocrApiKeyAnthropicHint')
+      ?.classList.toggle('hidden', !isAnthropicOcr);
+    document
+      .getElementById('ocrApiUrlAnthropicHint')
+      ?.classList.toggle('hidden', !isAnthropicOcr);
 
     // The recommended/other grouping in the model dropdown only exists on the
     // classification path, which the Mistral provider does not take.
@@ -1071,8 +1262,8 @@ function initializeFormHandlers() {
       );
     }
 
-    // PDF page rendering only applies to local vision models; the Mistral
-    // provider handles PDFs natively.
+    // PDF page rendering only applies to local vision models; Mistral and
+    // Claude read PDFs natively.
     const ocrPdfRenderContainer = document.getElementById(
       'ocrPdfRenderContainer'
     );
@@ -1086,6 +1277,8 @@ function initializeFormHandlers() {
     if (testOcrBtn) {
       testOcrBtn.disabled = !enabled;
     }
+
+    previousOcrProvider = provider;
   };
 
   if (ocrProviderSelect) {
@@ -1095,8 +1288,29 @@ function initializeFormHandlers() {
     if (initialProvider === 'ollama') {
       ocrProviderSelect.value = 'custom';
     }
+    if (initialProvider === 'anthropic') {
+      offerAnthropicOcrModels();
+    }
 
     ocrProviderSelect.addEventListener('change', () => {
+      const provider = String(
+        ocrProviderSelect.value || 'mistral'
+      ).toLowerCase();
+      if (provider === 'anthropic' && previousOcrProvider !== 'anthropic') {
+        // A URL left from another provider (an auto-detected Ollama URL,
+        // say) would be used as a Claude proxy.
+        if (ocrApiUrlInput) ocrApiUrlInput.value = '';
+        offerAnthropicOcrModels();
+      } else if (
+        provider === 'mistral' &&
+        isClaudeModelName(ocrModelInput?.value)
+      ) {
+        populateModelSelect(
+          ocrModelInput,
+          ['mistral-ocr-latest'],
+          'Select OCR model'
+        );
+      }
       toggleOcrFields();
       setOcrTestPill('default', 'Not tested');
     });
@@ -1625,9 +1839,15 @@ function initializeFormHandlers() {
           ocrApiUrlInput?.value
         ),
         apiKey: String(ocrApiKeyInput?.value || '').trim(),
+        // Claude OCR picks the AI model when this is empty; the Mistral
+        // default would only be replaced again.
         model:
-          String(ocrModelInput?.value || '').trim() || 'mistral-ocr-latest',
+          String(ocrModelInput?.value || '').trim() ||
+          (ocrProviderSelect?.value === 'anthropic'
+            ? ''
+            : 'mistral-ocr-latest'),
         setupOcrValidationTimeoutMs: getOcrValidationTimeoutMs(),
+        ...getAnthropicFallbackForOcr(),
       };
 
       const originalHtml = testOcrBtn.innerHTML;
@@ -1713,6 +1933,7 @@ function initializeFormHandlers() {
             apiUrl,
             apiKey,
             setupOcrValidationTimeoutMs: getOcrValidationTimeoutMs(),
+            ...getAnthropicFallbackForOcr(),
           }),
         });
 
@@ -1727,6 +1948,14 @@ function initializeFormHandlers() {
           ocrApiUrlInput.value = String(result.resolvedApiUrl).trim();
         }
 
+        // A Claude model already chosen stays chosen; the route suggests the
+        // AI provider's model otherwise.
+        const currentOcrModel = String(ocrModelInput?.value || '').trim();
+        const preferredOcrModel =
+          provider === 'anthropic' && isClaudeModelName(currentOcrModel)
+            ? currentOcrModel
+            : result.suggestedModel;
+
         const models = Array.isArray(result.models) ? result.models : [];
         const visionModels = Array.isArray(result.visionModels)
           ? result.visionModels
@@ -1738,11 +1967,14 @@ function initializeFormHandlers() {
           recommended: visionModels,
           recommendedLabel: 'Recommended (vision detected)',
           otherLabel: 'Other models',
-          preferred: result.suggestedModel,
+          preferred: preferredOcrModel,
         });
         await zrDialog({
-          icon: 'success',
-          title: 'OCR models loaded',
+          icon: result.live === false ? 'warning' : 'success',
+          title:
+            result.live === false
+              ? 'Suggested models shown'
+              : 'OCR models loaded',
           text: models.length > 0 ? result.message : 'No models found.',
         });
       } catch (error) {
@@ -2382,6 +2614,7 @@ function initializeFormHandlers() {
           ),
           apiKey: String(formData.get('ocrApiKey') || '').trim(),
           setupOcrValidationTimeoutMs: getOcrValidationTimeoutMs(),
+          ...getAnthropicFallbackForOcr(),
         };
 
         const response = await fetch('/api/settings/ocr/models', {
@@ -2442,6 +2675,9 @@ function initializeFormHandlers() {
       const result = await response.json();
 
       if (result.success) {
+        // The saved values are the new baseline for the unsaved-change count
+        // and the leave warning (modules/settings-form.js).
+        setupForm.dispatchEvent(new CustomEvent('zr:settings-saved'));
         await zrDialog({
           icon: 'success',
           title: 'Success!',
@@ -2465,6 +2701,13 @@ function initializeFormHandlers() {
         title: 'Error',
         text: error.message,
       });
+      // Only one settings topic is visible at a time; this opens the one
+      // holding the field the message names (modules/settings-nav.js).
+      document.dispatchEvent(
+        new CustomEvent('zr:settings-save-error', {
+          detail: { message: String(error.message || '') },
+        })
+      );
     } finally {
       submitBtn.disabled = false;
       submitBtn.innerHTML = originalBtnText;
@@ -2691,6 +2934,75 @@ function initializeTooltipAndValidation() {
   initializeFieldHelp();
 }
 
+/**
+ * Names each field's environment variable in its hint ("SCAN_INTERVAL ·
+ * Restart required") and on the field itself as data-env-key, unless the
+ * markup already names it. A switch carries the key on its hidden yes/no input
+ * and on the visible switch alike.
+ */
+function annotateEnvKeys(fieldMappings) {
+  fieldMappings.forEach(({ selector, envKey }) => {
+    const field = document.querySelector(selector);
+    if (!field) return;
+    field.dataset.envKey = envKey;
+    const visibleSwitch = field.id
+      ? document.querySelector(`[data-switch-target="${field.id}"]`)
+      : null;
+    if (visibleSwitch) visibleSwitch.dataset.envKey = envKey;
+
+    // A tile is a single checkbox with its label; the key goes in its tooltip.
+    const tile = field.closest('.zr-checktile');
+    if (tile) {
+      tile.title = envKey;
+      return;
+    }
+    const container = field.closest('.zr-field, .zr-switchrow');
+    if (!container) return;
+    const hints = [...container.querySelectorAll('.zr-field__hint')].filter(
+      (hint) => !hint.hasAttribute('data-anthropic-hint')
+    );
+    const keyElement = () => {
+      const code = document.createElement('code');
+      code.className = 'zr-envkey';
+      code.textContent = envKey;
+      return code;
+    };
+
+    // A hint that names the key in its markup already gets it set like the
+    // added ones, instead of a second copy.
+    const naming = hints.filter((hint) => hint.textContent.includes(envKey));
+    if (naming.length) {
+      naming.forEach((hint) => {
+        if (hint.querySelector('.zr-envkey')) return;
+        const node = [...hint.childNodes].find(
+          (child) =>
+            child.nodeType === Node.TEXT_NODE &&
+            child.textContent.includes(envKey)
+        );
+        if (!node) return;
+        const at = node.textContent.indexOf(envKey);
+        const rest = node.splitText(at);
+        rest.textContent = rest.textContent.slice(envKey.length);
+        hint.insertBefore(keyElement(), rest);
+      });
+      return;
+    }
+    if (!hints.length) {
+      const hint = document.createElement('p');
+      hint.className = 'zr-field__hint';
+      hint.append(keyElement());
+      container.append(hint);
+      return;
+    }
+    // Hints that swap with the provider (the OCR key) each name the key, so it
+    // does not vanish with the one that is shown first.
+    const targets = hints.some((hint) => hint.id)
+      ? hints.filter((hint) => hint.id)
+      : [hints[0]];
+    targets.forEach((hint) => hint.prepend(keyElement(), ' · '));
+  });
+}
+
 function initializeRuntimeOverridePills() {
   const resetLocalOverridesBtn = document.getElementById(
     'resetLocalOverridesBtn'
@@ -2740,26 +3052,9 @@ function initializeRuntimeOverridePills() {
     }
   }
 
-  const overrideKeys = new Set(
-    Array.isArray(parsedOverrideKeys) ? parsedOverrideKeys : []
-  );
-  const lockedEnvKeys = new Set(
-    Array.isArray(parsedLockedEnvKeys) ? parsedLockedEnvKeys : []
-  );
-  if (overrideKeys.size === 0 && lockedEnvKeys.size === 0) {
-    return;
-  }
-
-  // Kept local because classic scripts cannot import ES modules; keep in sync
-  // with modules/text-utils.js.
-  const escapeHtml = (value) =>
-    String(value)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-
+  // Every field with the variable it writes. Besides the pills below, this
+  // names the variable in each hint and gives the settings search
+  // (modules/settings-nav.js) something to find a field by.
   const fieldMappings = [
     { selector: '#paperlessUrl', envKey: 'PAPERLESS_API_URL' },
     { selector: '#paperlessPublicUrl', envKey: 'PAPERLESS_PUBLIC_URL' },
@@ -2786,6 +3081,16 @@ function initializeRuntimeOverridePills() {
     { selector: '#azureApiKey', envKey: 'AZURE_API_KEY' },
     { selector: '#azureDeploymentName', envKey: 'AZURE_DEPLOYMENT_NAME' },
     { selector: '#azureApiVersion', envKey: 'AZURE_API_VERSION' },
+    { selector: '#anthropicApiKey', envKey: 'ANTHROPIC_API_KEY' },
+    { selector: '#anthropicModel', envKey: 'ANTHROPIC_MODEL' },
+    { selector: '#anthropicEffort', envKey: 'ANTHROPIC_EFFORT' },
+    { selector: '#anthropicMaxTokens', envKey: 'ANTHROPIC_MAX_TOKENS' },
+    {
+      selector: '#anthropicStructuredOutput',
+      envKey: 'ANTHROPIC_STRUCTURED_OUTPUT',
+    },
+    { selector: '#anthropicPromptCaching', envKey: 'ANTHROPIC_PROMPT_CACHING' },
+    { selector: '#anthropicApiUrl', envKey: 'ANTHROPIC_API_URL' },
     { selector: '#tokenLimit', envKey: 'TOKEN_LIMIT' },
     { selector: '#responseTokens', envKey: 'RESPONSE_TOKENS' },
     { selector: '#aiTemperatureAnalysis', envKey: 'AI_TEMPERATURE_ANALYSIS' },
@@ -2933,7 +3238,46 @@ function initializeRuntimeOverridePills() {
       selector: '#externalApiAllowPrivateIps',
       envKey: 'EXTERNAL_API_ALLOW_PRIVATE_IPS',
     },
+    { selector: '#oidcEnabled', envKey: 'OIDC_ENABLED' },
+    { selector: '#oidcIssuerUrl', envKey: 'OIDC_ISSUER_URL' },
+    { selector: '#oidcClientId', envKey: 'OIDC_CLIENT_ID' },
+    { selector: '#oidcClientSecret', envKey: 'OIDC_CLIENT_SECRET' },
+    { selector: '#oidcAdminEmail', envKey: 'OIDC_ADMIN_EMAIL' },
+    { selector: '#oidcRedirectUri', envKey: 'OIDC_REDIRECT_URI' },
+    { selector: '#oidcScopes', envKey: 'OIDC_SCOPES' },
+    { selector: '#oidcEmailClaim', envKey: 'OIDC_EMAIL_CLAIM' },
+    {
+      selector: '#oidcAllowUnverifiedEmail',
+      envKey: 'OIDC_ALLOW_UNVERIFIED_EMAIL',
+    },
+    { selector: '#oidcTokenAuthMethod', envKey: 'OIDC_TOKEN_AUTH_METHOD' },
+    { selector: '#oidcButtonText', envKey: 'OIDC_BUTTON_TEXT' },
+    { selector: '#oidcButtonIcon', envKey: 'OIDC_BUTTON_ICON' },
+    { selector: '#oidcButtonColor', envKey: 'OIDC_BUTTON_COLOR' },
+    { selector: '#oidcButtonTextColor', envKey: 'OIDC_BUTTON_TEXT_COLOR' },
   ];
+
+  annotateEnvKeys(fieldMappings);
+
+  const overrideKeys = new Set(
+    Array.isArray(parsedOverrideKeys) ? parsedOverrideKeys : []
+  );
+  const lockedEnvKeys = new Set(
+    Array.isArray(parsedLockedEnvKeys) ? parsedLockedEnvKeys : []
+  );
+  if (overrideKeys.size === 0 && lockedEnvKeys.size === 0) {
+    return;
+  }
+
+  // Kept local because classic scripts cannot import ES modules; keep in sync
+  // with modules/text-utils.js.
+  const escapeHtml = (value) =>
+    String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
 
   const pills = [];
 
@@ -2990,6 +3334,15 @@ function initializeRuntimeOverridePills() {
       // The :disabled styling in the framework carries the visual state.
       fieldElement.disabled = true;
       fieldElement.setAttribute('aria-disabled', 'true');
+      // A switch is clicked on its visible half; the hidden yes/no input alone
+      // being disabled left the switch movable with nothing to show for it.
+      const lockedSwitch = fieldElement.id
+        ? document.querySelector(`[data-switch-target="${fieldElement.id}"]`)
+        : null;
+      if (lockedSwitch) {
+        lockedSwitch.disabled = true;
+        lockedSwitch.setAttribute('aria-disabled', 'true');
+      }
 
       if (!targetLabel.querySelector('.locked-pill')) {
         const lockedPill = document.createElement('span');

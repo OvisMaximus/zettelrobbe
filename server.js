@@ -11,6 +11,8 @@ const documentModel = require('./models/document');
 const setupService = require('./services/setupService');
 const { runStartupMigrations } = require('./services/startupMigrations');
 const setupRoutes = require('./routes/setup');
+const oidcRoutes = require('./routes/oidc');
+const oidcService = require('./services/oidcService');
 const { isAuthenticated } = require('./routes/auth');
 const mistralOcrService = require('./services/mistralOcrService');
 const ocrAutoProcessService = require('./services/ocrAutoProcessService');
@@ -362,6 +364,9 @@ app.use((req, res, next) => {
   res.locals.appAzureEndpoint = config.azure?.endpoint || 'unknown';
   res.locals.appAzureDeploymentName = config.azure?.deploymentName || 'unknown';
   res.locals.appAzureApiVersion = config.azure?.apiVersion || 'unknown';
+  res.locals.appAnthropicModel = config.anthropic?.model || 'unknown';
+  // Empty means api.anthropic.com, which is worth saying in a bug report.
+  res.locals.appAnthropicApiUrl = config.anthropic?.apiUrl || 'default';
   res.locals.appMistralOcrModel = config.mistralOcr?.model || 'unknown';
   res.locals.appScanInterval = config.scanInterval || 'unknown';
   res.locals.appTokenLimit = String(config.tokenLimit || 'unknown');
@@ -377,6 +382,7 @@ app.use((req, res, next) => {
   res.locals.appOpenAiKeySet = Boolean(config.openai?.apiKey);
   res.locals.appCustomKeySet = Boolean(config.custom?.apiKey);
   res.locals.appAzureKeySet = Boolean(config.azure?.apiKey);
+  res.locals.appAnthropicKeySet = Boolean(config.anthropic?.apiKey);
   res.locals.appMistralKeySet = Boolean(config.mistralOcr?.apiKey);
   res.locals.appApiKeySet = Boolean(config.getApiKey && config.getApiKey());
   res.locals.loginCookieSecurityWarning = null;
@@ -1131,6 +1137,9 @@ async function scanDocuments(source = 'scheduler') {
 }
 
 // Routes
+// Single sign-on comes first: its callback must be reachable without a
+// session, before the setup router's authentication guard runs.
+app.use('/', oidcRoutes);
 app.use('/', setupRoutes);
 
 // Development-only reference page for the zr UI framework. It ships no product
@@ -1548,6 +1557,7 @@ async function startServer() {
     app.listen(port, () => {
       console.log(`Server running on port ${port}`);
       warnIfRemoteSetupExposed();
+      oidcService.logStatus();
       startScanning();
       // Armed separately from the scan scheduler so the dashboard also warns
       // when automatic processing is switched off.

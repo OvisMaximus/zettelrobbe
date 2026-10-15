@@ -471,14 +471,24 @@
           },
           "message": {
             "type": "string",
-            "description": "Additional status information (for non-healthy states)",
+            "description": "Additional status information (for non-healthy states). Authenticated callers only.",
             "example": "Document scan failed 3 time(s) in a row: connect ECONNREFUSED 172.18.0.2:8000"
           },
           "scanner": {
-            "$ref": "#/components/schemas/ScannerHealth"
+            "description": "Authenticated callers only.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ScannerHealth"
+              }
+            ]
           },
           "paperless": {
-            "$ref": "#/components/schemas/PaperlessHealth"
+            "description": "Authenticated callers only.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PaperlessHealth"
+              }
+            ]
           }
         }
       },
@@ -4609,6 +4619,10 @@
                       "nullable": true,
                       "description": "Recommended default; absent for providers without model classification"
                     },
+                    "live": {
+                      "type": "boolean",
+                      "description": "anthropic only — false when the live list failed and the suggested Claude models are returned instead"
+                    },
                     "resolvedApiUrl": {
                       "type": "string"
                     },
@@ -4697,17 +4711,21 @@
                       "openai",
                       "ollama",
                       "custom",
-                      "azure"
+                      "azure",
+                      "anthropic"
                     ]
                   },
                   "apiUrl": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "Not needed for anthropic unless a proxy sits in front of api.anthropic.com"
                   },
                   "token": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "Omit or leave empty to use the stored key of the selected provider"
                   },
                   "model": {
-                    "type": "string"
+                    "type": "string",
+                    "description": "For anthropic, checked with a models lookup that spends no tokens"
                   },
                   "setupValidationTimeoutMs": {
                     "type": "integer"
@@ -4723,6 +4741,217 @@
           },
           "401": {
             "description": "Unauthorized"
+          }
+        }
+      }
+    },
+    "/api/settings/ocr/test": {
+      "post": {
+        "summary": "Test OCR provider connectivity from the settings page",
+        "description": "Runs one OCR request on a generated test image. For `anthropic` the\nkey is the OCR key when one is given or stored for Claude OCR, and\notherwise the Anthropic AI provider's key (`anthropicApiKey`, then\nthe stored ANTHROPIC_API_KEY).\n",
+        "tags": [
+          "Settings"
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "enabled": {
+                    "type": "string",
+                    "enum": [
+                      "yes",
+                      "no"
+                    ]
+                  },
+                  "provider": {
+                    "type": "string",
+                    "enum": [
+                      "mistral",
+                      "custom",
+                      "ollama",
+                      "anthropic"
+                    ]
+                  },
+                  "apiUrl": {
+                    "type": "string",
+                    "description": "Ignored for mistral. For anthropic an optional proxy URL; empty uses the Anthropic AI provider's URL, then api.anthropic.com"
+                  },
+                  "apiKey": {
+                    "type": "string",
+                    "description": "Omit or leave empty to use the stored key"
+                  },
+                  "model": {
+                    "type": "string",
+                    "description": "For anthropic, a Claude model; anything else falls back to the AI model"
+                  },
+                  "setupOcrValidationTimeoutMs": {
+                    "type": "integer"
+                  },
+                  "anthropicApiKey": {
+                    "type": "string",
+                    "description": "Anthropic AI key typed but not saved yet; Claude OCR falls back to it"
+                  },
+                  "anthropicApiUrl": {
+                    "type": "string",
+                    "description": "Anthropic AI proxy URL typed but not saved yet"
+                  },
+                  "anthropicModel": {
+                    "type": "string",
+                    "description": "Anthropic AI model typed but not saved yet"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OCR connectivity result returned"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        }
+      }
+    },
+    "/api/settings/oidc/test": {
+      "post": {
+        "summary": "Test a single sign-on provider from the settings page",
+        "description": "Reads the provider's discovery document, picks the token endpoint auth\nmethod the login would use, and checks the client credentials by\nredeeming an authorization code that cannot exist: the provider\nanswers invalid_client for wrong credentials and invalid_grant for\nright ones. Nobody is signed in and nothing is saved.\n\nAn empty `clientSecret` uses the stored OIDC_CLIENT_SECRET, but only\nwhen the issuer has the same origin (scheme, host, port) as the\nconfigured OIDC_ISSUER_URL; for any other issuer the test runs\nwithout a secret. Private network addresses are allowed, since\nidentity providers usually run next to the application.\n",
+        "tags": [
+          "Settings"
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "issuerUrl",
+                  "clientId"
+                ],
+                "properties": {
+                  "issuerUrl": {
+                    "type": "string",
+                    "description": "Issuer URL (http or https); a pasted discovery URL is accepted",
+                    "example": "https://auth.example.com/application/o/zettelrobbe/"
+                  },
+                  "clientId": {
+                    "type": "string",
+                    "example": "zettelrobbe"
+                  },
+                  "clientSecret": {
+                    "type": "string",
+                    "description": "Omit or leave empty to use the stored secret (same issuer origin only)",
+                    "example": ""
+                  },
+                  "tokenAuthMethod": {
+                    "type": "string",
+                    "description": "Empty picks the method automatically",
+                    "enum": [
+                      "",
+                      "client_secret_basic",
+                      "client_secret_post",
+                      "none"
+                    ],
+                    "example": ""
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Test result. success is false (still HTTP 200) when the provider\ncould not be reached, sent no usable discovery document, or refused\nthe client credentials; error then says which.\n",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "success": {
+                          "type": "boolean",
+                          "example": true
+                        },
+                        "data": {
+                          "type": "object",
+                          "properties": {
+                            "issuer": {
+                              "type": "string",
+                              "description": "The issuer the provider advertises",
+                              "example": "https://auth.example.com/application/o/zettelrobbe/"
+                            },
+                            "tokenAuthMethods": {
+                              "type": "array",
+                              "description": "Token endpoint auth methods the provider advertises (empty when it lists none)",
+                              "items": {
+                                "type": "string"
+                              },
+                              "example": [
+                                "client_secret_basic",
+                                "client_secret_post"
+                              ]
+                            },
+                            "chosenAuthMethod": {
+                              "type": "string",
+                              "description": "The method a login would use",
+                              "example": "client_secret_basic"
+                            },
+                            "pkce": {
+                              "type": "boolean",
+                              "description": "Whether the provider advertises PKCE with S256",
+                              "example": true
+                            }
+                          }
+                        },
+                        "message": {
+                          "type": "string",
+                          "example": "The provider answered and accepted the client."
+                        }
+                      }
+                    },
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "302": {
+            "description": "Not signed in; redirected to /login like every other route behind the authentication guard"
+          },
+          "400": {
+            "description": "Invalid input (issuer not an http(s) URL, empty client ID, unknown auth method, or a method that needs a secret without one)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
         }
       }
@@ -4754,7 +4983,8 @@
                     "enum": [
                       "mistral",
                       "custom",
-                      "ollama"
+                      "ollama",
+                      "anthropic"
                     ]
                   },
                   "apiUrl": {
@@ -4762,10 +4992,22 @@
                   },
                   "apiKey": {
                     "type": "string",
-                    "description": "Omit or leave empty to use the stored OCR_API_KEY / MISTRAL_API_KEY"
+                    "description": "Omit or leave empty to use the stored OCR_API_KEY / MISTRAL_API_KEY (for anthropic, the stored Claude OCR key, then the Anthropic AI key)"
                   },
                   "setupOcrValidationTimeoutMs": {
                     "type": "integer"
+                  },
+                  "anthropicApiKey": {
+                    "type": "string",
+                    "description": "Anthropic AI key typed but not saved yet; used by anthropic when no OCR key is set"
+                  },
+                  "anthropicApiUrl": {
+                    "type": "string",
+                    "description": "Anthropic AI proxy URL typed but not saved yet"
+                  },
+                  "anthropicModel": {
+                    "type": "string",
+                    "description": "Anthropic AI model; anthropic returns it as suggestedModel"
                   }
                 }
               }
@@ -4801,6 +5043,10 @@
                       "type": "string",
                       "nullable": true,
                       "description": "Recommended default; absent for providers without model classification"
+                    },
+                    "live": {
+                      "type": "boolean",
+                      "description": "anthropic only — false when the live list failed and the suggested Claude models are returned instead"
                     },
                     "resolvedApiUrl": {
                       "type": "string"
@@ -5642,7 +5888,8 @@
                       "openai",
                       "ollama",
                       "custom",
-                      "azure"
+                      "azure",
+                      "anthropic"
                     ],
                     "example": "openai"
                   },
@@ -5685,6 +5932,58 @@
                     "type": "string",
                     "description": "Model name for custom LLM provider",
                     "example": "custom-model"
+                  },
+                  "anthropicApiKey": {
+                    "type": "string",
+                    "description": "API key for Anthropic (required when aiProvider is 'anthropic' and none is stored; leave empty to keep the configured value). Saved only with aiProvider 'anthropic'; the anthropic* fields below likewise.",
+                    "example": "sk-ant-api03-abc123"
+                  },
+                  "anthropicModel": {
+                    "type": "string",
+                    "description": "Claude model for analysis; empty keeps the configured one",
+                    "example": "claude-sonnet-5-5"
+                  },
+                  "anthropicEffort": {
+                    "type": "string",
+                    "description": "Effort level; empty leaves it to the model. Rejected with 400 when it is not one of the listed levels.",
+                    "enum": [
+                      "",
+                      "low",
+                      "medium",
+                      "high",
+                      "xhigh",
+                      "max"
+                    ],
+                    "example": ""
+                  },
+                  "anthropicMaxTokens": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Completion cap per request, thinking included. Rejected with 400 when it is not a positive whole number; empty keeps the configured value.",
+                    "example": 16000
+                  },
+                  "anthropicStructuredOutput": {
+                    "type": "string",
+                    "description": "Constrain the analysis answer to a JSON schema (yes/no)",
+                    "enum": [
+                      "yes",
+                      "no"
+                    ],
+                    "example": "yes"
+                  },
+                  "anthropicPromptCaching": {
+                    "type": "string",
+                    "description": "Mark the system prompt cacheable (yes/no)",
+                    "enum": [
+                      "yes",
+                      "no"
+                    ],
+                    "example": "yes"
+                  },
+                  "anthropicApiUrl": {
+                    "type": "string",
+                    "description": "Only for a proxy; empty uses api.anthropic.com",
+                    "example": ""
                   },
                   "scanInterval": {
                     "type": "number",
@@ -5922,6 +6221,17 @@
                     "description": "How many entries the vocabulary proposed from the tag names should aim at, types and topics together (5-100, default 25). Out-of-range values are clamped, a non-numeric value keeps the current setting.",
                     "example": 25
                   },
+                  "ocrProvider": {
+                    "type": "string",
+                    "description": "OCR fallback provider. For anthropic (Claude OCR) an empty ocrApiKey uses the Anthropic AI key, and ocrApiUrl is an optional proxy URL; a key or URL stored for another provider is cleared when switching to it.",
+                    "enum": [
+                      "mistral",
+                      "custom",
+                      "ollama",
+                      "anthropic"
+                    ],
+                    "example": "mistral"
+                  },
                   "ocrAutoProcessEnabled": {
                     "type": "string",
                     "description": "Process queued OCR documents automatically (yes/no)",
@@ -5950,6 +6260,91 @@
                       "YYYY-MM-DD"
                     ],
                     "example": "DD.MM.YYYY"
+                  },
+                  "oidcEnabled": {
+                    "type": "string",
+                    "description": "Single sign-on switch (OIDC_ENABLED). Every oidc* field is optional; one the body\nleaves out keeps the stored value. When single sign-on ends up switched on, the save\nis refused with 400 unless the issuer URL is an http(s) URL, the client ID is set,\nthe admin e-mail is valid, the redirect URI is empty or an absolute http(s) URL, and\nthe auth method, button icon and colours are valid. Values injected by the container\nare never overwritten.\n",
+                    "enum": [
+                      "yes",
+                      "no"
+                    ],
+                    "example": "no"
+                  },
+                  "oidcIssuerUrl": {
+                    "type": "string",
+                    "description": "Issuer URL of the OpenID Connect provider (OIDC_ISSUER_URL); a pasted discovery URL is accepted",
+                    "example": "https://auth.example.com/application/o/zettelrobbe/"
+                  },
+                  "oidcClientId": {
+                    "type": "string",
+                    "description": "Client ID registered at the provider (OIDC_CLIENT_ID)",
+                    "example": "zettelrobbe"
+                  },
+                  "oidcClientSecret": {
+                    "type": "string",
+                    "description": "Client secret (OIDC_CLIENT_SECRET); leave empty to keep the stored one",
+                    "example": ""
+                  },
+                  "oidcAdminEmail": {
+                    "type": "string",
+                    "description": "E-mail address of the identity that signs in as the administrator (OIDC_ADMIN_EMAIL)",
+                    "example": "admin@example.com"
+                  },
+                  "oidcRedirectUri": {
+                    "type": "string",
+                    "description": "Callback URL registered at the provider (OIDC_REDIRECT_URI); empty derives it from the request",
+                    "example": ""
+                  },
+                  "oidcScopes": {
+                    "type": "string",
+                    "description": "Space-separated scopes (OIDC_SCOPES); openid is always added",
+                    "example": "openid profile email"
+                  },
+                  "oidcEmailClaim": {
+                    "type": "string",
+                    "description": "Claim that carries the e-mail address (OIDC_EMAIL_CLAIM)",
+                    "example": "email"
+                  },
+                  "oidcAllowUnverifiedEmail": {
+                    "type": "string",
+                    "description": "Accept an e-mail address the provider marks unverified (OIDC_ALLOW_UNVERIFIED_EMAIL)",
+                    "enum": [
+                      "yes",
+                      "no"
+                    ],
+                    "example": "no"
+                  },
+                  "oidcTokenAuthMethod": {
+                    "type": "string",
+                    "description": "Token endpoint auth method (OIDC_TOKEN_AUTH_METHOD); empty picks it automatically",
+                    "enum": [
+                      "",
+                      "client_secret_basic",
+                      "client_secret_post",
+                      "none"
+                    ],
+                    "example": ""
+                  },
+                  "oidcButtonText": {
+                    "type": "string",
+                    "maxLength": 60,
+                    "description": "Label of the login button (OIDC_BUTTON_TEXT); longer text is cut to 60 characters",
+                    "example": "Sign in with Authentik"
+                  },
+                  "oidcButtonIcon": {
+                    "type": "string",
+                    "description": "Login button icon (OIDC_BUTTON_ICON); empty for the built-in icon, \"none\", an https URL or a path on this server",
+                    "example": ""
+                  },
+                  "oidcButtonColor": {
+                    "type": "string",
+                    "description": "Login button background (OIDC_BUTTON_COLOR); hex, colour name, rgb() or hsl()",
+                    "example": "#fd4b2d"
+                  },
+                  "oidcButtonTextColor": {
+                    "type": "string",
+                    "description": "Login button text colour (OIDC_BUTTON_TEXT_COLOR)",
+                    "example": "#ffffff"
                   }
                 }
               }
@@ -6567,7 +6962,7 @@
     "/health": {
       "get": {
         "summary": "System health check endpoint",
-        "description": "Reports database connectivity **and** whether the document scanner is\nactually able to work. Used by the Docker healthcheck and monitoring.\n\n`status` is `healthy` when the database is reachable and the scanner is\noperational, `degraded` when automatic processing is enabled but the\nscan loop is not armed or has failed `failureThreshold` runs in a row\n(for example because Paperless-ngx is unreachable), and `database_error`\nwhen the local database cannot be queried.\n\nA `degraded` state answers with HTTP 503 unless `HEALTHCHECK_STRICT=no`\nis configured, in which case the details are reported with HTTP 200.\nWhen automatic processing is switched off via\n`DISABLE_AUTOMATIC_PROCESSING=yes`, a missing scan loop is expected and\nnever reported as degraded.\n",
+        "description": "Reports database connectivity **and** whether the document scanner is\nactually able to work. Used by the Docker healthcheck and monitoring.\n\n`status` is `healthy` when the database is reachable and the scanner is\noperational, `degraded` when automatic processing is enabled but the\nscan loop is not armed or has failed `failureThreshold` runs in a row\n(for example because Paperless-ngx is unreachable), and `database_error`\nwhen the local database cannot be queried.\n\nA `degraded` state answers with HTTP 503 unless `HEALTHCHECK_STRICT=no`\nis configured, in which case the details are reported with HTTP 200.\nWhen automatic processing is switched off via\n`DISABLE_AUTOMATIC_PROCESSING=yes`, a missing scan loop is expected and\nnever reported as degraded.\n\nWithout authentication the response carries only `status` and\n`database`, with the same HTTP status codes. `message`, `scanner` and\n`paperless` hold raw error messages with internal host names and\nports, so they are returned only with a session (cookie or bearer\ntoken) or the `x-api-key` header.\n",
         "tags": [
           "System"
         ],
@@ -10251,6 +10646,75 @@
           },
           "401": {
             "description": "Not authenticated"
+          }
+        }
+      }
+    },
+    "/auth/oidc/login": {
+      "get": {
+        "summary": "Start single sign-on with the configured OpenID Connect provider",
+        "description": "Redirects the browser to the identity provider's authorization endpoint\n(authorization code flow with PKCE, state and nonce). Only available when\nOIDC_ENABLED=yes and OIDC_ISSUER_URL, OIDC_CLIENT_ID and OIDC_ADMIN_EMAIL\nare set.\n",
+        "tags": [
+          "Authentication"
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect to the identity provider"
+          },
+          "404": {
+            "description": "Single sign-on is not enabled"
+          },
+          "502": {
+            "description": "The identity provider could not be reached; the login page is rendered with an error"
+          }
+        }
+      }
+    },
+    "/auth/oidc/callback": {
+      "get": {
+        "summary": "Complete single sign-on",
+        "description": "Redirect target registered with the identity provider. Exchanges the\nauthorization code, validates the ID token and signs in as the\nadministrator account when the identity's e-mail address equals\nOIDC_ADMIN_EMAIL. Sets the session cookie.\n",
+        "tags": [
+          "Authentication"
+        ],
+        "parameters": [
+          {
+            "in": "query",
+            "name": "code",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Authorization code issued by the provider"
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "schema": {
+              "type": "string"
+            },
+            "description": "State value echoed back by the provider"
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Signed in, redirected to the dashboard",
+            "headers": {
+              "Set-Cookie": {
+                "schema": {
+                  "type": "string",
+                  "description": "HTTP-only cookie containing the session JWT"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or expired sign-in transaction, or the provider reported an error"
+          },
+          "403": {
+            "description": "The identity's e-mail address does not match OIDC_ADMIN_EMAIL"
+          },
+          "404": {
+            "description": "Single sign-on is not enabled"
           }
         }
       }

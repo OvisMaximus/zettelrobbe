@@ -147,6 +147,9 @@
         '<svg class="zr-icon zr-icon--sm" aria-hidden="true"><use href="/icons.svg#i-eye-off"/></svg>Insufficient content (&lt; 10 chars)',
       ai_response_truncated:
         '<svg class="zr-icon zr-icon--sm" aria-hidden="true"><use href="/icons.svg#i-cpu"/></svg>AI answer cut off (token limit)',
+      // A Claude model declined the request (stop_reason "refusal").
+      ai_refused:
+        '<svg class="zr-icon zr-icon--sm" aria-hidden="true"><use href="/icons.svg#i-ban"/></svg>Declined by the AI model',
     };
 
     if (map[reason]) return map[reason];

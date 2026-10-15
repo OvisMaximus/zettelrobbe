@@ -1,5 +1,5 @@
 /* ==========================================================================
-   Cross-page legacy pieces: the pre-framework modal system, .stat-box,
+   Cross-page legacy pieces: the pre-framework modal system,
    the manual document search, the queue toolbar and the odds and ends
    the page scripts of history, settings and manual generate
    at runtime. Not one page — several, which is why they are not in any
@@ -163,22 +163,36 @@
     transition: filter 0.3s ease;
   }
 
-  /* Stats Box */
-  .stat-box {
-    background: var(--zr-surface-2);
-    padding: 1rem;
-    border-radius: 8px;
-    border: 1px solid var(--zr-line);
-    transition: all 0.2s ease;
-    color: var(--zr-text);
-  }
-
   /* The manual preview claims its height up front, so picking a document does
-     not make the rest of the page jump. Frame and padding come from .stat-box. */
-  /* Tall enough to balance the analysis column once content loads; while empty
+     not make the rest of the page jump. Frame and padding come from .zr-panel.
+     Tall enough to balance the analysis column once content loads; while empty
      the #previewEmpty hint fills it instead of a bare grey area. */
   .manual-preview {
     min-height: 360px;
+  }
+  /* Document text keeps its own line breaks and scrolls inside the panel: a
+     long document used to run together into one paragraph and stretch the
+     page to its full length. */
+  .manual-preview #contentPreview {
+    max-height: 600px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-size: var(--zr-fs-sm);
+  }
+
+  /* An empty tag list says so instead of leaving its label over nothing. */
+  .manual-tags:empty::before {
+    content: attr(data-empty);
+    font-size: var(--zr-fs-sm);
+    color: var(--zr-text-faint);
+  }
+  /* A suggestion is not on the document yet: outlined rather than filled. The
+     padding gives back the border's pixel so both chips stand equally tall. */
+  .manual-chip--suggested {
+    padding: 1px 3px 1px 7px;
+    background: transparent;
+    border: 1px dashed color-mix(in srgb, var(--zr-brand) 55%, transparent);
   }
   /* The empty hint shows only while the preview has no content. */
   .manual-preview #contentPreview:not(:empty) + #previewEmpty {
@@ -190,12 +204,9 @@
     .manual-preview {
       min-height: 160px;
     }
-  }
-
-  .stat-box:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-    background: var(--zr-surface-2);
+    .manual-preview #contentPreview {
+      max-height: 320px;
+    }
   }
 
   /* Modal Styles */

@@ -7,6 +7,15 @@ class SetupWizard {
     this.presets = Array.isArray(this.bootstrap.aiProviderPresets)
       ? this.bootstrap.aiProviderPresets
       : [];
+    // Claude models and defaults as services/anthropicSupport.js defines them.
+    this.anthropic = this.bootstrap.anthropic || {};
+    this.anthropicSuggestedModelIds = (
+      Array.isArray(this.anthropic.suggestedModels)
+        ? this.anthropic.suggestedModels
+        : []
+    )
+      .map((entry) => String(entry?.id || '').trim())
+      .filter(Boolean);
 
     this.steps = Array.from(document.querySelectorAll('.zr-steppane'));
     this.stepLabel = document.getElementById('setupStepLabel');
@@ -115,6 +124,7 @@ class SetupWizard {
     this.aiPresetHint = document.getElementById('aiPresetHint');
     this.aiProvider = document.getElementById('aiProvider');
     this.aiApiUrl = document.getElementById('aiApiUrl');
+    this.aiApiUrlHint = document.getElementById('aiApiUrlHint');
     this.aiToken = document.getElementById('aiToken');
     this.aiModel = document.getElementById('aiModel');
     this.fetchAiModelsBtn = document.getElementById('fetchAiModelsBtn');
@@ -277,6 +287,11 @@ class SetupWizard {
       );
       this.aiModel.value = this.config.AZURE_DEPLOYMENT_NAME || '';
       this.aiToken.value = this.config.AZURE_API_KEY || '';
+    } else if (provider === 'anthropic') {
+      // The key never reaches the page (sanitizeConfigForBootstrap drops it).
+      this.aiApiUrl.value = this.config.ANTHROPIC_API_URL || '';
+      this.offerAnthropicAiModels(this.config.ANTHROPIC_MODEL);
+      this.aiToken.value = '';
     } else {
       this.aiProvider.value = 'custom';
       this.aiApiUrl.value = this.config.CUSTOM_BASE_URL || '';
@@ -288,6 +303,88 @@ class SetupWizard {
       this.aiModel.value = this.config.CUSTOM_MODEL || '';
       this.aiToken.value = this.config.CUSTOM_API_KEY || '';
     }
+    this.updateAiProviderFields();
+    // After the AI values, whose model Claude OCR prefers.
+    if (this.ocrProvider.value === 'anthropic') {
+      this.offerAnthropicOcrModels();
+    }
+  }
+
+  isClaudeModelName(model) {
+    return /^claude-/i.test(String(model || ''));
+  }
+
+  /* The model select for Anthropic: the suggested models, preselecting the
+     given one (or the default). A live list replaces it on "Fetch models". */
+  offerAnthropicAiModels(model) {
+    const preferred =
+      String(model || '').trim() || String(this.anthropic.defaultModel || '');
+    this.setModelSelectOptions(
+      this.aiModel,
+      [...this.anthropicSuggestedModelIds, preferred],
+      'Select model',
+      { preferred }
+    );
+  }
+
+  /* Anthropic is the one provider whose API URL is optional: the SDK knows
+     api.anthropic.com and the field only serves a proxy. */
+  updateAiProviderFields() {
+    const isAnthropic =
+      String(this.aiProvider.value || '')
+        .trim()
+        .toLowerCase() === 'anthropic';
+    this.aiApiUrl.required = !isAnthropic;
+    this.aiApiUrl.placeholder = isAnthropic ? 'https://api.anthropic.com' : '';
+    this.aiApiUrlHint?.classList.toggle('hidden', !isAnthropic);
+  }
+
+  aiProviderNeedsApiUrl(provider) {
+    return String(provider || '').toLowerCase() !== 'anthropic';
+  }
+
+  /* What Claude OCR falls back to when its own key is empty: the AI step's
+     key, URL and model, while Anthropic is the AI provider. */
+  getAnthropicFallbackForOcr() {
+    if (
+      String(this.aiProvider.value || '')
+        .trim()
+        .toLowerCase() !== 'anthropic'
+    ) {
+      return {};
+    }
+    return {
+      anthropicApiKey: this.aiToken.value.trim(),
+      anthropicApiUrl: this.aiApiUrl.value.trim(),
+      anthropicModel: this.aiModel.value.trim(),
+    };
+  }
+
+  /* The OCR model sent to the server. Claude OCR picks the AI model itself
+     when this is empty, so the Mistral default is only filled in for others. */
+  getOcrModelForRequest() {
+    const model = this.mistralOcrModel.value.trim();
+    if (model) return model;
+    return (this.ocrProvider.value || 'mistral').toLowerCase() === 'anthropic'
+      ? ''
+      : 'mistral-ocr-latest';
+  }
+
+  /* The OCR model select for Claude: the suggested models, keeping a Claude
+     model already chosen and preferring the AI step's model otherwise. */
+  offerAnthropicOcrModels() {
+    const current = this.mistralOcrModel.value.trim();
+    const aiModel = this.getAnthropicFallbackForOcr().anthropicModel || '';
+    const preferred = this.isClaudeModelName(current)
+      ? current
+      : (this.isClaudeModelName(aiModel) && aiModel) ||
+        String(this.anthropic.defaultModel || '');
+    this.setModelSelectOptions(
+      this.mistralOcrModel,
+      [...this.anthropicSuggestedModelIds, preferred],
+      'Select Claude model',
+      { preferred }
+    );
   }
 
   findMatchingPreset() {
@@ -893,12 +990,52 @@ class SetupWizard {
       this.ocrApiKeyContainer.classList.toggle('hidden', !enabled);
     }
 
+    // Switching to Claude: a URL left from another provider (an
+    // auto-detected Ollama URL, say) would be used as a Claude proxy, and the
+    // model select needs the Claude models. Back to Mistral, a Claude model
+    // would be sent to Mistral.
+    const previousProvider = this.previousOcrProvider || provider;
+    if (provider === 'anthropic' && previousProvider !== 'anthropic') {
+      this.ocrApiUrl.value = '';
+      this.offerAnthropicOcrModels();
+    } else if (
+      provider === 'mistral' &&
+      previousProvider !== 'mistral' &&
+      this.isClaudeModelName(this.mistralOcrModel.value)
+    ) {
+      this.setModelSelectOptions(
+        this.mistralOcrModel,
+        ['mistral-ocr-latest'],
+        'Select OCR model'
+      );
+    }
+    this.previousOcrProvider = provider;
+
+    const isAnthropic = provider === 'anthropic';
     if (this.ocrApiUrlContainer) {
       this.ocrApiUrlContainer.classList.toggle(
         'hidden',
-        provider !== 'custom' || !enabled
+        !['custom', 'anthropic'].includes(provider) || !enabled
       );
     }
+    document
+      .getElementById('ocrApiUrlHint')
+      ?.classList.toggle('hidden', isAnthropic);
+    document
+      .getElementById('ocrApiUrlAnthropicHint')
+      ?.classList.toggle('hidden', !isAnthropic);
+    document
+      .getElementById('ocrApiKeyHint')
+      ?.classList.toggle('hidden', isAnthropic);
+    document
+      .getElementById('ocrApiKeyAnthropicHint')
+      ?.classList.toggle('hidden', !isAnthropic);
+    [this.ocrApiKey, this.ocrApiUrl].forEach((input) => {
+      const placeholder = isAnthropic
+        ? input?.dataset.placeholderAnthropic
+        : input?.dataset.placeholderDefault;
+      if (placeholder) input.placeholder = placeholder;
+    });
 
     // The recommended/other grouping in the model dropdown only exists on the
     // classification path, which the Mistral provider does not take.
@@ -929,8 +1066,9 @@ class SetupWizard {
         this.ocrApiUrl.value
       ),
       apiKey: this.ocrApiKey.value.trim(),
-      model: this.mistralOcrModel.value.trim() || 'mistral-ocr-latest',
+      model: this.getOcrModelForRequest(),
       setupOcrValidationTimeoutMs: this.getOcrValidationTimeoutMs(),
+      ...this.getAnthropicFallbackForOcr(),
     };
 
     if (!payload.enabled) {
@@ -1316,6 +1454,7 @@ class SetupWizard {
   applyPreset(preset) {
     if (!preset) {
       this.aiProvider.value = 'custom';
+      this.updateAiProviderFields();
       this.aiPresetHint.textContent =
         'Manual mode: choose provider and enter values yourself. Token is optional for custom endpoints.';
       return;
@@ -1323,7 +1462,13 @@ class SetupWizard {
 
     this.aiProvider.value = preset.provider || 'custom';
     this.aiApiUrl.value = preset.apiUrl || '';
-    this.aiModel.value = preset.model || '';
+    if (this.aiProvider.value === 'anthropic') {
+      // The select has to offer the model before it can show it.
+      this.offerAnthropicAiModels(preset.model);
+    } else {
+      this.aiModel.value = preset.model || '';
+    }
+    this.updateAiProviderFields();
     this.aiToken.placeholder =
       preset.tokenPlaceholder || 'Enter API token if required';
     this.aiPresetHint.textContent = `Preset "${preset.label}" selected.${this.aiProvider.value === 'custom' ? ' Token can stay empty if your endpoint allows anonymous access.' : ''}`;
@@ -1501,6 +1646,7 @@ class SetupWizard {
       (selectedAiModel && this.aiModel.value !== selectedAiModel);
 
     this.aiProvider.value = detection.aiProvider || 'custom';
+    this.updateAiProviderFields();
     this.aiApiUrl.value = detection.resolvedAiApiUrl || '';
     this.aiToken.value = quickstartKey;
     if (selectedAiModel) {
@@ -1833,7 +1979,10 @@ class SetupWizard {
       return [];
     }
 
-    if (!['openai', 'azure'].includes(payload.aiProvider) && !payload.apiUrl) {
+    if (
+      !['openai', 'azure', 'anthropic'].includes(payload.aiProvider) &&
+      !payload.apiUrl
+    ) {
       if (!silent) {
         await this.showPopup({
           icon: 'warning',
@@ -1862,8 +2011,15 @@ class SetupWizard {
         const resolvedInfo = result.resolvedApiUrl
           ? `\nResolved API URL: ${String(result.resolvedApiUrl).trim()}`
           : '';
+        // Anthropic answers with the suggested models when the live list
+        // fails (live: false); the message says so.
         await this.showPopup({
-          icon: models.length > 0 ? 'success' : 'info',
+          icon:
+            result.live === false
+              ? 'warning'
+              : models.length > 0
+                ? 'success'
+                : 'info',
           title: 'AI models loaded',
           text: `${result.message || (models.length > 0 ? 'Models discovered successfully.' : 'No models found.')}${resolvedInfo}`,
         });
@@ -1900,6 +2056,7 @@ class SetupWizard {
       ),
       apiKey: this.ocrApiKey.value.trim(),
       setupOcrValidationTimeoutMs: this.getOcrValidationTimeoutMs(),
+      ...this.getAnthropicFallbackForOcr(),
     };
 
     // No local refusal on an empty field: an operator who already has
@@ -1907,6 +2064,7 @@ class SetupWizard {
     // resolves it. Whether a key exists is the server's question to answer.
     this.setButtonLoading(this.fetchOcrModelsBtn, true, 'Loading...');
     try {
+      const previousOcrModel = this.mistralOcrModel.value.trim();
       const result = await this.request('/api/setup/ocr/models', payload);
       // The result dialog is awaited below; reset the button first so it
       // does not keep claiming the test is still running.
@@ -1930,13 +2088,23 @@ class SetupWizard {
             : [],
           recommendedLabel: 'Recommended (vision detected)',
           otherLabel: 'Other models',
-          preferred: result.suggestedModel,
+          // A Claude model already chosen stays chosen.
+          preferred:
+            payload.provider === 'anthropic' &&
+            this.isClaudeModelName(previousOcrModel)
+              ? previousOcrModel
+              : result.suggestedModel,
         }
       );
 
       if (!silent) {
         await this.showPopup({
-          icon: models.length > 0 ? 'success' : 'info',
+          icon:
+            result.live === false
+              ? 'warning'
+              : models.length > 0
+                ? 'success'
+                : 'info',
           title: 'OCR models loaded',
           text:
             result.message ||
@@ -1981,11 +2149,17 @@ class SetupWizard {
       setupValidationTimeoutMs: this.getAiValidationTimeoutMs(),
     };
 
-    if (!payload.aiProvider || !payload.model || !payload.apiUrl) {
+    if (
+      !payload.aiProvider ||
+      !payload.model ||
+      (!payload.apiUrl && this.aiProviderNeedsApiUrl(payload.aiProvider))
+    ) {
       await this.showPopup({
         icon: 'warning',
         title: 'Missing values',
-        text: 'Provider, API URL, and model are required.',
+        text: this.aiProviderNeedsApiUrl(payload.aiProvider)
+          ? 'Provider, API URL, and model are required.'
+          : 'Provider and model are required.',
       });
       return;
     }
@@ -2201,21 +2375,26 @@ class SetupWizard {
         await this.fetchAiModels(true);
       }
 
+      const providerNeedsUrl = this.aiProviderNeedsApiUrl(
+        this.aiProvider.value.trim()
+      );
       if (
         !this.aiProvider.value.trim() ||
-        !this.aiApiUrl.value.trim() ||
+        (providerNeedsUrl && !this.aiApiUrl.value.trim()) ||
         !this.aiModel.value.trim()
       ) {
         await this.showPopup({
           icon: 'warning',
           title: 'Missing values',
-          text: 'Provider, API URL, and model are required.',
+          text: providerNeedsUrl
+            ? 'Provider, API URL, and model are required.'
+            : 'Provider and model are required.',
         });
         return false;
       }
 
       const provider = this.aiProvider.value.trim().toLowerCase();
-      const tokenRequired = provider === 'openai' || provider === 'azure';
+      const tokenRequired = ['openai', 'azure', 'anthropic'].includes(provider);
       if (tokenRequired && !this.aiToken.value.trim()) {
         await this.showPopup({
           icon: 'warning',
@@ -2283,11 +2462,11 @@ class SetupWizard {
         await this.fetchOcrModels(true);
       }
 
-      if (!['mistral', 'custom'].includes(provider)) {
+      if (!['mistral', 'custom', 'anthropic'].includes(provider)) {
         await this.showPopup({
           icon: 'warning',
           title: 'Invalid OCR provider',
-          text: 'Choose either mistral or custom for OCR fallback.',
+          text: 'Choose Mistral, custom or Claude for OCR fallback.',
         });
         return false;
       }
@@ -2342,6 +2521,15 @@ class SetupWizard {
       preview.push(`AZURE_API_KEY=${this.aiToken.value.trim()}`);
       preview.push(`AZURE_DEPLOYMENT_NAME=${this.aiModel.value.trim()}`);
       preview.push('AZURE_API_VERSION=2023-05-15');
+    } else if (provider === 'anthropic') {
+      preview.push(`ANTHROPIC_API_KEY=${this.aiToken.value.trim()}`);
+      preview.push(
+        `ANTHROPIC_MODEL=${this.aiModel.value.trim() || this.anthropic.defaultModel || ''}`
+      );
+      // Written only when set, like the server does: empty is api.anthropic.com.
+      if (this.aiApiUrl.value.trim()) {
+        preview.push(`ANTHROPIC_API_URL=${this.aiApiUrl.value.trim()}`);
+      }
     } else {
       preview.push(`CUSTOM_BASE_URL=${this.aiApiUrl.value.trim()}`);
       preview.push(`CUSTOM_API_KEY=${this.aiToken.value.trim()}`);
@@ -2362,14 +2550,14 @@ class SetupWizard {
       this.ocrProvider.value || 'mistral'
     ).toLowerCase();
     preview.push(
-      `OCR_PROVIDER=${normalizedOcrProvider === 'custom' ? 'custom' : 'mistral'}`
+      `OCR_PROVIDER=${['custom', 'anthropic'].includes(normalizedOcrProvider) ? normalizedOcrProvider : 'mistral'}`
     );
     preview.push(
       `OCR_API_URL=${this.normalizeOcrApiUrlForProvider(normalizedOcrProvider, this.ocrApiUrl.value)}`
     );
     preview.push(`OCR_API_KEY=${this.ocrApiKey.value.trim()}`);
     preview.push(
-      `MISTRAL_OCR_MODEL=${this.mistralOcrModel.value.trim() || 'mistral-ocr-latest'}`
+      `MISTRAL_OCR_MODEL=${this.getOcrModelForRequest() || this.getAnthropicFallbackForOcr().anthropicModel || this.anthropic.defaultModel || ''}`
     );
 
     return preview.join('\n');
@@ -2425,7 +2613,7 @@ class SetupWizard {
           this.ocrApiUrl.value
         ),
         this.ocrApiKey.value.trim(),
-        this.mistralOcrModel.value.trim() || 'mistral-ocr-latest',
+        this.getOcrModelForRequest(),
       ]),
     };
   }
@@ -2478,8 +2666,7 @@ class SetupWizard {
         this.ocrApiUrl.value
       ),
       ocrApiKey: this.ocrApiKey.value.trim(),
-      mistralOcrModel:
-        this.mistralOcrModel.value.trim() || 'mistral-ocr-latest',
+      mistralOcrModel: this.getOcrModelForRequest(),
     };
   }
 

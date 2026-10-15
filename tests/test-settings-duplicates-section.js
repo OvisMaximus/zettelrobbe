@@ -251,48 +251,51 @@ function sliceBetween(source, from, to) {
         'the section itself must be rendered'
       );
       assert.ok(
-        html.includes('id="duplicates-tab"'),
-        'the nav entry needs a target block'
+        html.includes('id="entry-duplicates"'),
+        'the topic list needs an entry to open'
       );
 
       const desktopNav = sliceBetween(
         html,
-        '<nav class="zr-sectionnav" data-module="section-nav">',
+        '<nav class="zr-sectionnav zr-settings-nav"',
         '</nav>'
       );
-      const mobileNav = sliceBetween(
+      const mobilePicker = sliceBetween(
         html,
-        '<nav class="zr-sectionnav zr-only-mobile">',
-        '</nav>'
+        '<select id="settingsEntrySelect"',
+        '</select>'
       );
 
+      // The page shows one topic at a time; the topic list (a sidebar on
+      // desktop, a select on phones) is the only way to reach it, and it
+      // groups the topics in the order the page declares them.
       [
-        ['desktop', desktopNav],
-        ['mobile', mobileNav],
-      ].forEach(([label, nav]) => {
+        ['desktop', desktopNav, (id) => `data-entry-link="${id}"`],
+        ['mobile', mobilePicker, (id) => `value="${id}"`],
+      ].forEach(([label, nav, needle]) => {
         assert.ok(
-          nav.includes('href="#duplicates-tab"'),
-          `the ${label} nav must link the section`
+          nav.includes(needle('duplicates')),
+          `the ${label} topic list must link the entry`
         );
-        // The nav order has to match the page order or the scroll-spy
-        // highlight jumps around while scrolling.
         assert.ok(
-          nav.indexOf('href="#ai-tab"') <
-            nav.indexOf('href="#duplicates-tab"') &&
-            nav.indexOf('href="#duplicates-tab"') <
-              nav.indexOf('href="#ocr-tab"'),
-          `the ${label} nav must list Duplicates after AI and before OCR`
+          nav.indexOf(needle('runtime')) < nav.indexOf(needle('duplicates')) &&
+            nav.indexOf(needle('duplicates')) < nav.indexOf(needle('simplify')),
+          `the ${label} topic list must list duplicates after runtime and before simplify`
         );
       });
 
       assert.ok(
-        desktopNav.includes('/icons.svg#i-merge'),
-        'the desktop nav entry carries the i-merge icon, like every other entry carries one'
+        desktopNav.includes('/icons.svg#i-tag') &&
+          desktopNav.indexOf('Tag tools') <
+            desktopNav.indexOf('data-entry-link="duplicates"'),
+        'Duplicates sits in the Tag tools group, which carries the i-tag icon'
       );
       assert.ok(
-        html.indexOf('id="ai-tab"') < html.indexOf('id="duplicates-tab"') &&
-          html.indexOf('id="duplicates-tab"') < html.indexOf('id="ocr-tab"'),
-        'the section itself sits after the AI sections and before OCR'
+        html.indexOf('id="entry-runtime"') <
+          html.indexOf('id="entry-duplicates"') &&
+          html.indexOf('id="entry-duplicates"') <
+            html.indexOf('id="entry-simplify"'),
+        'the entry itself sits after Runtime controls and before Simplify tags'
       );
     });
 
@@ -300,8 +303,8 @@ function sliceBetween(source, from, to) {
       const html = await getSettingsPage();
       const section = sliceBetween(
         html,
-        'id="duplicates-tab"',
-        'id="simplify-tab"'
+        'id="entry-duplicates"',
+        'id="entry-simplify"'
       );
 
       FIELDS.forEach(({ input, envKey }) => {
@@ -345,8 +348,8 @@ function sliceBetween(source, from, to) {
       const html = await getSettingsPage();
       const section = sliceBetween(
         html,
-        'id="duplicates-tab"',
-        'id="simplify-tab"'
+        'id="entry-duplicates"',
+        'id="entry-simplify"'
       );
 
       const thinking = sliceBetween(
@@ -405,8 +408,8 @@ function sliceBetween(source, from, to) {
       const html = await getSettingsPage();
       const section = sliceBetween(
         html,
-        'id="duplicates-tab"',
-        'id="simplify-tab"'
+        'id="entry-duplicates"',
+        'id="entry-simplify"'
       );
 
       const guard = sliceBetween(
@@ -451,8 +454,8 @@ function sliceBetween(source, from, to) {
       const html = await getSettingsPage();
       const section = sliceBetween(
         html,
-        'id="duplicates-tab"',
-        'id="simplify-tab"'
+        'id="entry-duplicates"',
+        'id="entry-simplify"'
       );
 
       const sweep = sliceBetween(
@@ -490,8 +493,8 @@ function sliceBetween(source, from, to) {
       const html = await getSettingsPage();
       const section = sliceBetween(
         html,
-        'id="duplicates-tab"',
-        'id="simplify-tab"'
+        'id="entry-duplicates"',
+        'id="entry-simplify"'
       );
 
       const budget = sliceBetween(
@@ -707,8 +710,8 @@ function sliceBetween(source, from, to) {
       const html = await getSettingsPage();
       const section = sliceBetween(
         html,
-        'id="duplicates-tab"',
-        'id="simplify-tab"'
+        'id="entry-duplicates"',
+        'id="entry-simplify"'
       );
       assert.ok(
         section.includes('data-switch-target="duplicatesAiThinking" checked'),
@@ -865,8 +868,8 @@ function sliceBetween(source, from, to) {
       const html = await getSettingsPage();
       const section = sliceBetween(
         html,
-        'id="duplicates-tab"',
-        'id="simplify-tab"'
+        'id="entry-duplicates"',
+        'id="entry-simplify"'
       );
       assert.ok(
         section.includes(
@@ -929,8 +932,8 @@ function sliceBetween(source, from, to) {
       const html = await getSettingsPage();
       const section = sliceBetween(
         html,
-        'id="duplicates-tab"',
-        'id="simplify-tab"'
+        'id="entry-duplicates"',
+        'id="entry-simplify"'
       );
 
       const lanes = sliceBetween(
@@ -1007,53 +1010,60 @@ function sliceBetween(source, from, to) {
         'the section itself must be rendered'
       );
       assert.ok(
-        html.includes('id="simplify-tab"'),
-        'the nav entry needs a target block'
+        html.includes('id="entry-simplify"'),
+        'the topic list needs an entry to open'
       );
 
       const desktopNav = sliceBetween(
         html,
-        '<nav class="zr-sectionnav" data-module="section-nav">',
+        '<nav class="zr-sectionnav zr-settings-nav"',
         '</nav>'
       );
-      const mobileNav = sliceBetween(
+      const mobilePicker = sliceBetween(
         html,
-        '<nav class="zr-sectionnav zr-only-mobile">',
-        '</nav>'
+        '<select id="settingsEntrySelect"',
+        '</select>'
       );
 
+      // The page shows one topic at a time; the topic list (a sidebar on
+      // desktop, a select on phones) is the only way to reach it, and it
+      // groups the topics in the order the page declares them.
       [
-        ['desktop', desktopNav],
-        ['mobile', mobileNav],
-      ].forEach(([label, nav]) => {
+        ['desktop', desktopNav, (id) => `data-entry-link="${id}"`],
+        ['mobile', mobilePicker, (id) => `value="${id}"`],
+      ].forEach(([label, nav, needle]) => {
         assert.ok(
-          nav.includes('href="#simplify-tab"'),
-          `the ${label} nav must link the section`
+          nav.includes(needle('simplify')),
+          `the ${label} topic list must link the entry`
         );
         assert.ok(
-          nav.indexOf('href="#duplicates-tab"') <
-            nav.indexOf('href="#simplify-tab"') &&
-            nav.indexOf('href="#simplify-tab"') <
-              nav.indexOf('href="#ocr-tab"'),
-          `the ${label} nav must list Simplify tags after Duplicates and before OCR`
+          nav.indexOf(needle('duplicates')) < nav.indexOf(needle('simplify')) &&
+            nav.indexOf(needle('simplify')) < nav.indexOf(needle('account')),
+          `the ${label} topic list must list simplify after duplicates and before account`
         );
       });
 
       assert.ok(
-        desktopNav.includes('/icons.svg#i-split'),
-        'the desktop entry carries the i-split icon the page uses'
+        desktopNav.indexOf('Tag tools') <
+          desktopNav.indexOf('data-entry-link="simplify"'),
+        'Simplify tags sits in the Tag tools group'
       );
       assert.ok(
-        html.indexOf('id="duplicates-tab"') <
-          html.indexOf('id="simplify-tab"') &&
-          html.indexOf('id="simplify-tab"') < html.indexOf('id="ocr-tab"'),
-        'the section itself sits between Duplicates and OCR'
+        html.indexOf('id="entry-duplicates"') <
+          html.indexOf('id="entry-simplify"') &&
+          html.indexOf('id="entry-simplify"') <
+            html.indexOf('id="entry-account"'),
+        'the entry itself sits between Duplicates and Account and two-factor'
       );
     });
 
     await test('both Simplify tags fields render with the value configured now', async () => {
       const html = await getSettingsPage();
-      const section = sliceBetween(html, 'id="simplify-tab"', 'id="ocr-tab"');
+      const section = sliceBetween(
+        html,
+        'id="entry-simplify"',
+        'id="entry-account"'
+      );
 
       SIMPLIFY_FIELDS.forEach(({ input, envKey }) => {
         assert.ok(

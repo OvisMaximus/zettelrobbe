@@ -5,6 +5,12 @@ const { OpenAI } = require('openai');
 const config = require('../config/config');
 const AzureOpenAI = require('openai').AzureOpenAI;
 const { validateApiUrl, stripTrailingSlashes } = require('./serviceUtils');
+const {
+  ANTHROPIC_DEFAULT_MODEL,
+  ANTHROPIC_SUGGESTED_MODELS,
+  createAnthropicClient,
+  isConfiguredAnthropicHost,
+} = require('./anthropicSupport');
 
 const CUSTOM_PROVIDER_FALLBACK_API_KEY = 'no-auth-required';
 
@@ -92,6 +98,11 @@ class SetupService {
       AZURE_DEPLOYMENT_NAME: process.env.AZURE_DEPLOYMENT_NAME || '',
       CUSTOM_BASE_URL: process.env.CUSTOM_BASE_URL || '',
       CUSTOM_MODEL: process.env.CUSTOM_MODEL || '',
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
+      // config.anthropic runs with the default model when none is set, so an
+      // operator who only injects the key has a complete configuration.
+      ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL || ANTHROPIC_DEFAULT_MODEL,
+      ANTHROPIC_API_URL: process.env.ANTHROPIC_API_URL || '',
     };
   }
 
@@ -529,6 +540,172 @@ class SetupService {
     }
   }
 
+  /**
+   * Proves an Anthropic key and model without spending tokens: the Models API
+   * answers for a model the key may use and refuses everything else, which
+   * is all a test before saving needs to know. A completion request would
+   * bill the operator for every click on "Test".
+   *
+   * @param {string} apiKey
+   * @param {string} model
+   * @param {string} [apiUrl] - proxy only; empty means api.anthropic.com
+   * @returns {Promise<boolean>}
+   */
+  async validateAnthropicConfig(apiKey, model, apiUrl = '') {
+    const normalizedApiKey = String(apiKey || '').trim();
+    const normalizedModel = String(model || '').trim();
+    const normalizedApiUrl = String(apiUrl || '').trim();
+
+    if (!normalizedApiKey || !normalizedModel) {
+      console.error(
+        'Anthropic validation error: API key and model are required'
+      );
+      return false;
+    }
+
+    // A proxy URL is operator input like the custom provider's base URL, so it
+    // gets the same SSRF rules. The default endpoint needs no check.
+    if (normalizedApiUrl) {
+      const urlValidation = await validateApiUrl(
+        normalizedApiUrl,
+        this.getSetupUrlValidationOptions()
+      );
+      if (!urlValidation.valid) {
+        console.error('Anthropic URL validation error:', urlValidation.error);
+        return false;
+      }
+    }
+
+    try {
+      const client = createAnthropicClient({
+        apiKey: normalizedApiKey,
+        apiUrl: normalizedApiUrl,
+        timeoutMs: this.getValidationTimeoutMs(),
+      });
+      const modelInfo = await this.withValidationTimeout(
+        client.models.retrieve(normalizedModel),
+        'Anthropic validation'
+      );
+      return Boolean(modelInfo && modelInfo.id);
+    } catch (error) {
+      console.error('Anthropic validation error:', error.message);
+      return false;
+    }
+  }
+
+  /**
+   * The Claude models a key can use, for the model pickers of setup and
+   * settings. Falls back to ANTHROPIC_SUGGESTED_MODELS whenever the live list
+   * cannot be had — no key yet, a refused key, a blocked proxy URL, a network
+   * error — because the picker is still useful with the three current models
+   * in it, and an empty list is not.
+   *
+   * @param {{apiKey?: string, apiUrl?: string}} options
+   * @returns {Promise<{models: string[], live: boolean, error: string|null}>}
+   */
+  async discoverAnthropicModels(options = {}) {
+    const apiKey = String(options.apiKey || '').trim();
+    const apiUrl = String(options.apiUrl || '').trim();
+    const suggested = (error) => ({
+      models: ANTHROPIC_SUGGESTED_MODELS.map((entry) => entry.id),
+      live: false,
+      error,
+    });
+
+    if (!apiKey) {
+      return suggested('No Anthropic API key is configured yet.');
+    }
+
+    if (apiUrl) {
+      const urlValidation = await validateApiUrl(
+        apiUrl,
+        this.getSetupUrlValidationOptions()
+      );
+      if (!urlValidation.valid) {
+        return suggested(`Model URL validation failed: ${urlValidation.error}`);
+      }
+    }
+
+    try {
+      const client = createAnthropicClient({
+        apiKey,
+        apiUrl,
+        timeoutMs: this.getValidationTimeoutMs(),
+      });
+      const collect = async () => {
+        const ids = [];
+        // The page object paginates by itself when iterated.
+        for await (const modelInfo of client.models.list()) {
+          ids.push(String(modelInfo?.id || '').trim());
+        }
+        return ids;
+      };
+      const models = this.dedupeModelIds(
+        await this.withValidationTimeout(collect(), 'Anthropic model discovery')
+      );
+      if (models.length === 0) {
+        return suggested('The Models API returned no models for this key.');
+      }
+      return { models, live: true, error: null };
+    } catch (error) {
+      console.error('Anthropic model discovery error:', error.message);
+      return suggested(error.message);
+    }
+  }
+
+  /**
+   * Key and URL for Claude OCR: the OCR fields when they are set, else the
+   * Anthropic AI provider's. The same order mistralOcrService follows at
+   * runtime, so a green OCR test means the saved configuration reads too.
+   *
+   * `anthropicApiKey` / `anthropicApiUrl` carry AI provider values that are
+   * not saved yet (the setup wizard collects both before anything is
+   * written); the environment covers the ones that are. The stored
+   * ANTHROPIC_API_KEY is only used when the URL is one already configured
+   * (see isConfiguredAnthropicHost).
+   *
+   * @param {object} options
+   * @returns {{apiKey: string, apiUrl: string}}
+   */
+  resolveAnthropicOcrConnection(options = {}) {
+    const firstSet = (...values) =>
+      values.map((value) => String(value || '').trim()).find(Boolean) || '';
+    const apiUrl = firstSet(
+      options.apiUrl,
+      options.anthropicApiUrl,
+      process.env.ANTHROPIC_API_URL
+    );
+    const storedKey = isConfiguredAnthropicHost(apiUrl)
+      ? process.env.ANTHROPIC_API_KEY
+      : '';
+    return {
+      apiKey: firstSet(options.apiKey, options.anthropicApiKey, storedKey),
+      apiUrl,
+    };
+  }
+
+  /**
+   * The model Claude OCR runs with. MISTRAL_OCR_MODEL is shared by every OCR
+   * provider and defaults to a Mistral model, so it only counts when it names
+   * a Claude model; otherwise the AI provider's model (or the default) is
+   * used, exactly as mistralOcrService decides at runtime.
+   *
+   * @param {string} model - the OCR model field
+   * @param {string} [aiModel] - ANTHROPIC_MODEL, saved or about to be
+   * @returns {string}
+   */
+  resolveAnthropicOcrModel(model, aiModel = '') {
+    const ocrModel = String(model || '').trim();
+    if (/^claude-/i.test(ocrModel)) {
+      return ocrModel;
+    }
+    return (
+      String(aiModel || '').trim() ||
+      String(process.env.ANTHROPIC_MODEL || '').trim() ||
+      ANTHROPIC_DEFAULT_MODEL
+    );
+  }
+
   extractOpenAiModelIds(payload) {
     const candidates = Array.isArray(payload?.data) ? payload.data : [];
     return candidates
@@ -667,7 +844,7 @@ class SetupService {
 
     if (
       !provider ||
-      !['openai', 'ollama', 'custom', 'azure'].includes(provider)
+      !['openai', 'ollama', 'custom', 'azure', 'anthropic'].includes(provider)
     ) {
       throw new Error('A valid AI provider is required for URL detection');
     }
@@ -676,6 +853,15 @@ class SetupService {
       return {
         resolvedApiUrl: apiUrl,
         mode: 'azure',
+      };
+    }
+
+    // Nothing to probe: empty means api.anthropic.com, anything else is a
+    // proxy the operator typed and the SDK appends the paths itself.
+    if (provider === 'anthropic') {
+      return {
+        resolvedApiUrl: apiUrl,
+        mode: 'anthropic',
       };
     }
 
@@ -756,8 +942,14 @@ class SetupService {
     const apiUrl = String(options.apiUrl || '').trim();
     const apiKey = String(options.apiKey || '').trim();
 
-    if (!['mistral', 'ollama'].includes(provider)) {
+    if (!['mistral', 'ollama', 'anthropic'].includes(provider)) {
       throw new Error('A valid OCR provider is required for URL detection');
+    }
+
+    // Claude OCR has no endpoint of its own to find: an empty URL falls back
+    // to the AI provider's, which falls back to api.anthropic.com.
+    if (provider === 'anthropic') {
+      return { resolvedApiUrl: apiUrl, mode: 'anthropic' };
     }
 
     const cacheKey = `${provider}|${apiUrl}|${apiKey ? 'with-key' : 'without-key'}`;
@@ -840,13 +1032,18 @@ class SetupService {
 
     if (
       !provider ||
-      !['openai', 'ollama', 'custom', 'azure'].includes(provider)
+      !['openai', 'ollama', 'custom', 'azure', 'anthropic'].includes(provider)
     ) {
       throw new Error('A valid AI provider is required for model discovery');
     }
 
     if (provider === 'azure') {
       return [];
+    }
+
+    if (provider === 'anthropic') {
+      const discovery = await this.discoverAnthropicModels({ apiKey, apiUrl });
+      return discovery.models;
     }
 
     if (provider === 'openai') {
@@ -921,8 +1118,15 @@ class SetupService {
     const apiUrl = String(options.apiUrl || '').trim();
     const apiKey = String(options.apiKey || '').trim();
 
-    if (!['mistral', 'ollama'].includes(provider)) {
+    if (!['mistral', 'ollama', 'anthropic'].includes(provider)) {
       throw new Error('A valid OCR provider is required for model discovery');
+    }
+
+    if (provider === 'anthropic') {
+      const discovery = await this.discoverAnthropicModels(
+        this.resolveAnthropicOcrConnection(options)
+      );
+      return discovery.models;
     }
 
     if (provider === 'mistral') {
@@ -1229,6 +1433,73 @@ class SetupService {
     return '';
   }
 
+  /**
+   * Claude OCR, tested the way it will run: one real transcription of the
+   * validation image through mistralOcrService.runAnthropicOcr(), with the
+   * key, URL and model the saved configuration would resolve to. A Models API
+   * check alone would pass for a model that cannot read images.
+   *
+   * @param {object} options - see validateOcrConfig(); also anthropicApiKey,
+   *   anthropicApiUrl and anthropicModel for AI provider values not saved yet
+   * @returns {Promise<boolean>}
+   */
+  async validateAnthropicOcrConfig(options = {}) {
+    const { apiKey, apiUrl } = this.resolveAnthropicOcrConnection(options);
+    const model = this.resolveAnthropicOcrModel(
+      options.model,
+      options.anthropicModel
+    );
+
+    if (!apiKey) {
+      console.error(
+        'Claude OCR validation error: no API key — enter one for OCR or configure the Anthropic AI provider'
+      );
+      return false;
+    }
+
+    if (apiUrl) {
+      const urlValidation = await validateApiUrl(
+        apiUrl,
+        this.getSetupUrlValidationOptions()
+      );
+      if (!urlValidation.valid) {
+        console.error('Claude OCR URL validation error:', urlValidation.error);
+        return false;
+      }
+    }
+
+    try {
+      const token = this.getOcrValidationToken();
+      const imageDataUrl = this.buildOcrValidationImageDataUrl(token);
+      // Required here rather than at the top: mistralOcrService opens the
+      // database when it loads, and nothing else in this service needs it.
+      const mistralOcrService = require('./mistralOcrService');
+      const ocrOutput = await this.withValidationTimeout(
+        mistralOcrService.runAnthropicOcr({
+          apiKey,
+          apiUrl,
+          model,
+          base64: imageDataUrl.replace(/^data:image\/png;base64,/, ''),
+          mimeType: 'image/png',
+          timeoutMs: this.getValidationTimeoutMs(),
+        }),
+        'Claude OCR validation'
+      );
+
+      if (!this.isExpectedOcrTokenPresent(ocrOutput, token)) {
+        console.error(
+          'Claude OCR validation error: OCR output did not match expected token'
+        );
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      console.error('Claude OCR validation error:', error.message);
+      return false;
+    }
+  }
+
   async validateOcrConfig(options = {}) {
     const enabled =
       String(options.enabled || 'no')
@@ -1246,9 +1517,13 @@ class SetupService {
     const apiKey = String(options.apiKey || '').trim();
     const configuredApiUrl = String(options.apiUrl || '').trim();
 
-    if (!['mistral', 'ollama'].includes(provider)) {
+    if (!['mistral', 'ollama', 'anthropic'].includes(provider)) {
       console.error('OCR validation error: unsupported provider', provider);
       return false;
+    }
+
+    if (provider === 'anthropic') {
+      return this.validateAnthropicOcrConfig(options);
     }
 
     if (!model) {
@@ -1455,13 +1730,55 @@ class SetupService {
       if (!azureValid) {
         throw new Error('Invalid Azure configuration');
       }
+    } else if (aiProvider === 'anthropic') {
+      const anthropicValid = await this.validateAnthropicConfig(
+        config.ANTHROPIC_API_KEY,
+        config.ANTHROPIC_MODEL || ANTHROPIC_DEFAULT_MODEL,
+        config.ANTHROPIC_API_URL
+      );
+      if (!anthropicValid) {
+        throw new Error('Invalid Anthropic configuration');
+      }
     }
 
     return true;
   }
 
-  async saveConfig(configValues, options = {}) {
+  /**
+   * Adds the running JWT_SECRET and OIDC_* settings to a configuration that
+   * does not carry them.
+   *
+   * The secret is minted once at first start (server.js) and appears in no
+   * form, while saveConfig rewrites both stores whole. The settings page saved
+   * without it, so the restart after every save minted a new secret and every
+   * open session — the one that had just saved included — stopped verifying.
+   * Single sign-on is configured outside the forms as well, so a save dropped
+   * OIDC_* lines kept in data/.env or the runtime overrides in the same way.
+   *
+   * @param {object} configValues
+   * @returns {object}
+   */
+  withSessionSecret(configValues) {
+    const carried = {};
+    const secret = String(process.env.JWT_SECRET || '').trim();
+    if (secret && !String(configValues?.JWT_SECRET || '').trim()) {
+      carried.JWT_SECRET = secret;
+    }
+    Object.keys(process.env)
+      .filter((key) => key.startsWith('OIDC_'))
+      .filter((key) => !(configValues && key in configValues))
+      .forEach((key) => {
+        carried[key] = process.env[key];
+      });
+    return Object.keys(carried).length > 0
+      ? { ...configValues, ...carried }
+      : configValues;
+  }
+
+  async saveConfig(rawConfigValues, options = {}) {
     try {
+      const configValues = this.withSessionSecret(rawConfigValues);
+
       // Validate the new configuration before saving unless explicitly skipped
       if (!options.skipValidation) {
         await this.validateConfig(configValues);
@@ -1534,6 +1851,14 @@ class SetupService {
       return (
         Boolean(String(config.CUSTOM_BASE_URL || '').trim()) &&
         Boolean(String(config.CUSTOM_MODEL || '').trim())
+      );
+    }
+
+    // No URL: empty means api.anthropic.com.
+    if (aiProvider === 'anthropic') {
+      return (
+        Boolean(String(config.ANTHROPIC_API_KEY || '').trim()) &&
+        Boolean(String(config.ANTHROPIC_MODEL || '').trim())
       );
     }
 

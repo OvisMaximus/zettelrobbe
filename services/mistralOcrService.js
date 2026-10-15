@@ -5,15 +5,111 @@
 // write the extracted markdown text back to Paperless-ngx via PATCH.
 // Falls back to storing the OCR text locally in the ocr_queue table when
 // the Paperless PATCH endpoint does not allow writing the content field.
+//
+// OCR_PROVIDER picks the engine: `mistral` (default), `ollama`/`custom` (a
+// local vision model) or `anthropic` (a Claude model via the Messages API).
 
 const axios = require('axios');
+const { APIError } = require('@anthropic-ai/sdk');
 const config = require('../config/config');
 const PaperlessService = require('./paperlessService');
 const popplerService = require('./popplerService');
 const documentModel = require('../models/document');
 const AIServiceFactory = require('./aiServiceFactory');
 const documentProcessingService = require('./documentProcessingService');
-const { isTimeoutError, buildTimeoutErrorMessage } = require('./serviceUtils');
+const {
+  isTimeoutError,
+  buildTimeoutErrorMessage,
+  stripTrailingSlashes,
+} = require('./serviceUtils');
+const {
+  ANTHROPIC_DEFAULT_MODEL,
+  anthropicThinkingParams,
+  anthropicMaxTokens,
+  createAnthropicClient,
+  anthropicMessageText,
+  mapAnthropicUsage,
+  assertAnthropicCompleted,
+} = require('./anthropicSupport');
+
+// ── Claude OCR limits ──────────────────────────────────────────────────────
+//
+// The Messages API rejects a request body over 32 MB and an image over 10 MB
+// (both measured as base64, which is what travels). Checking before sending
+// turns a bare 413 into an error that says which limit was hit and what to do
+// about it. Decimal megabytes on purpose: if the API means MiB, this errs on
+// the safe side by a megabyte and a half.
+const CLAUDE_OCR_MAX_REQUEST_BYTES = 32 * 1000 * 1000;
+const CLAUDE_OCR_MAX_IMAGE_BYTES = 10 * 1000 * 1000;
+// Room for everything in the request besides the document: the JSON around
+// it and the instruction text.
+const CLAUDE_OCR_REQUEST_RESERVE_BYTES = 64 * 1024;
+const CLAUDE_OCR_IMAGE_TYPES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+]);
+
+// A transcript is as long as the document, so the completion cap has to be
+// sized for the document rather than for a JSON answer. Every current model
+// writes up to 128K tokens; 64000 also fits Claude Haiku 4.5, which stops at
+// 64K, so one cap works whichever model the operator picks. It holds roughly
+// a hundred dense pages; past it the answer is cut off, which fails the OCR
+// run instead of writing half a document. Operators with longer documents
+// raise ANTHROPIC_MAX_TOKENS, which OCR honours up to the 128K ceiling. Caps
+// this large require streaming.
+const CLAUDE_OCR_MAX_TOKENS = 64000;
+const CLAUDE_OCR_MAX_TOKENS_CEILING = 128000;
+
+// What the model answers for a page without any text. The empty-result guard
+// in processQueueItem() then refuses to overwrite the document's content,
+// instead of a sentence like "This page is blank." becoming its text.
+const CLAUDE_OCR_NO_TEXT_MARKER = '[no text]';
+
+const CLAUDE_OCR_INSTRUCTION = [
+  'Transcribe all text in this document exactly as it is written, in reading order, page by page.',
+  '- Keep the original language, spelling, numbers and punctuation. Do not translate, correct, summarize or explain anything.',
+  '- Reproduce tables as Markdown tables. Keep headings, lists and paragraph breaks.',
+  '- Include handwriting, stamps and filled-in form values where they are legible.',
+  '- Write [illegible] where text cannot be read. Do not guess.',
+  '- Answer with the transcript only: no introduction, no comments, no code fences.',
+  `- If the document contains no readable text at all, answer with exactly ${CLAUDE_OCR_NO_TEXT_MARKER}`,
+].join('\n');
+
+/**
+ * The media type Claude would be told, from a Content-Type value: parameters
+ * dropped, lower-cased, the common `image/jpg` misspelling fixed.
+ *
+ * @param {unknown} mimeType
+ * @returns {string}
+ */
+function normalizeClaudeOcrMediaType(mimeType) {
+  const mediaType = String(mimeType || 'application/pdf')
+    .split(';')[0]
+    .trim()
+    .toLowerCase();
+  return mediaType === 'image/jpg' ? 'image/jpeg' : mediaType;
+}
+
+/** A byte count as decimal megabytes with one decimal, for messages. */
+function formatMegabytes(bytes) {
+  return (bytes / 1000 / 1000).toFixed(1);
+}
+
+/** Whether a base64 PDF leaves no room for the rest of a Messages request. */
+function exceedsClaudeOcrRequestLimit(base64Length) {
+  return (
+    base64Length + CLAUDE_OCR_REQUEST_RESERVE_BYTES >
+    CLAUDE_OCR_MAX_REQUEST_BYTES
+  );
+}
+
+function claudeOcrInputError(message, code) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
 
 class MistralOcrService {
   constructor() {
@@ -27,6 +123,18 @@ class MistralOcrService {
   // ── Helpers ──────────────────────────────────────────────────────────────
 
   get apiKey() {
+    if (this.provider === 'anthropic') {
+      // Not config.mistralOcr.apiKey: it falls back to MISTRAL_API_KEY, and a
+      // Mistral key left over from an earlier setup must never be sent to the
+      // Claude API. A dedicated OCR key wins, else the AI provider's key.
+      return (
+        String(process.env.OCR_API_KEY || '').trim() ||
+        config.anthropic?.apiKey ||
+        process.env.ANTHROPIC_API_KEY ||
+        ''
+      );
+    }
+
     const configuredKey =
       config.mistralOcr?.apiKey || process.env.MISTRAL_API_KEY || '';
     if (configuredKey || this.provider !== 'ollama') {
@@ -39,6 +147,18 @@ class MistralOcrService {
   }
 
   get model() {
+    if (this.provider === 'anthropic') {
+      // MISTRAL_OCR_MODEL is the OCR model field for every provider, and it
+      // defaults to mistral-ocr-latest, which the Claude API would answer
+      // with a 404. Only a Claude model name in it counts; otherwise OCR uses
+      // the model the AI provider is configured with. Proxies sometimes
+      // prefix the name (anthropic.claude-…, anthropic/claude-…).
+      const ocrModel = String(config.mistralOcr?.model || '').trim();
+      return /(?:^|[./])claude-/i.test(ocrModel)
+        ? ocrModel
+        : config.anthropic?.model || ANTHROPIC_DEFAULT_MODEL;
+    }
+
     return config.mistralOcr?.model || 'mistral-ocr-latest';
   }
 
@@ -46,12 +166,46 @@ class MistralOcrService {
     const normalizedProvider = String(config.mistralOcr?.provider || 'mistral')
       .trim()
       .toLowerCase();
+    if (normalizedProvider === 'anthropic') {
+      return 'anthropic';
+    }
     return normalizedProvider === 'ollama' || normalizedProvider === 'custom'
       ? 'ollama'
       : 'mistral';
   }
 
+  /** The provider's name in progress messages and errors. */
+  get providerLabel() {
+    if (this.provider === 'ollama') return 'Local OCR';
+    if (this.provider === 'anthropic') return 'Claude OCR';
+    return 'Mistral OCR';
+  }
+
+  /**
+   * The completion cap for one Claude OCR request: CLAUDE_OCR_MAX_TOKENS, or
+   * ANTHROPIC_MAX_TOKENS when the operator raised it above that, never more
+   * than the 128K output ceiling of the current models.
+   */
+  get anthropicOcrMaxTokens() {
+    const configured = Number(config.anthropic?.maxTokens) || 0;
+    return Math.min(
+      Math.max(CLAUDE_OCR_MAX_TOKENS, configured),
+      CLAUDE_OCR_MAX_TOKENS_CEILING
+    );
+  }
+
   get apiBase() {
+    if (this.provider === 'anthropic') {
+      // OCR_API_URL only when the operator set one (a proxy used for OCR
+      // alone); otherwise the AI provider's ANTHROPIC_API_URL. Empty means
+      // api.anthropic.com.
+      return stripTrailingSlashes(
+        String(
+          config.mistralOcr?.apiUrl || config.anthropic?.apiUrl || ''
+        ).trim()
+      );
+    }
+
     if (this.provider === 'ollama') {
       const ollamaDefault =
         config.ollama?.apiUrl ||
@@ -168,7 +322,8 @@ class MistralOcrService {
    * @param {string} mimeType - MIME type of the document
    * @param {number|null} documentId - Paperless document ID (local provider only)
    * @param {{onPageProgress?: (pageNumber: number, pageCount: number) => void}} opts
-   *   - progress hooks; only used by the local provider's PDF render path
+   *   - progress hooks; only used by the PDF render paths (local provider, and
+   *     Claude for a PDF over its request limit)
    * @returns {Promise<string>} - Extracted text
    */
   async performOcr(
@@ -179,6 +334,10 @@ class MistralOcrService {
   ) {
     if (this.provider === 'ollama') {
       return this.performOcrWithOllama(base64, mimeType, documentId, opts);
+    }
+
+    if (this.provider === 'anthropic') {
+      return this.performOcrWithAnthropic(base64, mimeType, documentId, opts);
     }
 
     return this.performOcrWithMistral(base64, mimeType);
@@ -245,6 +404,311 @@ class MistralOcrService {
   }
 
   /**
+   * OCR with the configured Claude model (OCR_PROVIDER=anthropic).
+   *
+   * A PDF goes to Claude whole, as one document; Claude reads its text layer
+   * and its page images together. Only a PDF over the 32 MB request limit
+   * takes another route: the poppler rendering the local provider uses, one
+   * page image per request, because a page image is far smaller than the
+   * PDF around it. Without poppler that PDF fails with the limit named.
+   *
+   * @param {string} base64
+   * @param {string} mimeType
+   * @param {number|null} documentId - log context for the render path
+   * @param {{onPageProgress?: (pageNumber: number, pageCount: number) => void}} opts
+   * @returns {Promise<string>}
+   */
+  async performOcrWithAnthropic(
+    base64,
+    mimeType = 'application/pdf',
+    documentId = null,
+    opts = {}
+  ) {
+    const apiKey = this.apiKey;
+    if (!apiKey) {
+      throw new Error(
+        'Claude OCR needs an API key: set ANTHROPIC_API_KEY, or OCR_API_KEY for a key used only for OCR'
+      );
+    }
+
+    const request = {
+      apiKey,
+      apiUrl: this.apiBase,
+      model: this.model,
+      timeoutMs: this.ocrTimeoutMs,
+      maxTokens: this.anthropicOcrMaxTokens,
+    };
+
+    if (
+      normalizeClaudeOcrMediaType(mimeType) === 'application/pdf' &&
+      exceedsClaudeOcrRequestLimit(String(base64 || '').length)
+    ) {
+      return this._performAnthropicOcrOnRenderedPdf(
+        base64,
+        documentId,
+        opts,
+        request
+      );
+    }
+
+    return this.runAnthropicOcr({ ...request, base64, mimeType });
+  }
+
+  /**
+   * The fallback for a PDF too large for one Claude request: render its pages
+   * with poppler (same OCR_PDF_RENDER_* settings as local OCR) and transcribe
+   * each page image on its own.
+   */
+  async _performAnthropicOcrOnRenderedPdf(base64, documentId, opts, request) {
+    const limit = `The PDF is ${formatMegabytes(String(base64).length)} MB as base64; Claude accepts at most ${formatMegabytes(CLAUDE_OCR_MAX_REQUEST_BYTES)} MB per request`;
+
+    if (!this.pdfRenderEnabled) {
+      throw claudeOcrInputError(
+        `${limit}. Enable OCR_PDF_RENDER_ENABLED to send it page by page instead.`,
+        'claude_ocr_too_large'
+      );
+    }
+    if (!(await popplerService.isAvailable())) {
+      throw claudeOcrInputError(
+        `${limit}. Install poppler-utils (pdftoppm) to send it page by page instead.`,
+        'claude_ocr_too_large'
+      );
+    }
+
+    console.warn(
+      `[OCR] Document ${documentId}: ${limit} — sending up to ${this.pdfRenderMaxPages} rendered page(s) as images instead`
+    );
+    const rendered = await popplerService.renderPdfToImages(
+      Buffer.from(base64, 'base64'),
+      { maxPages: this.pdfRenderMaxPages, dpi: this.pdfRenderDpi }
+    );
+
+    return this._performOcrOnRenderedPages(rendered, documentId, opts, {
+      label: 'Claude OCR',
+      ocrImage: (pageBase64, pageMimeType) =>
+        this.runAnthropicOcr({
+          ...request,
+          base64: pageBase64,
+          mimeType: pageMimeType,
+        }),
+    });
+  }
+
+  /**
+   * OCR one document with a Claude model (OCR_PROVIDER=anthropic).
+   *
+   * Takes every connection detail as an argument so the setup validation can
+   * try a key and model before they are saved; performOcr() passes the
+   * configured ones. Nothing here reads config.
+   *
+   * One Messages request: the document block (PDF) or image block first, the
+   * transcription instruction after it. Thinking is turned down as far as the
+   * model allows — copying text needs none, and thinking tokens count toward
+   * the cap. The answer is streamed because a transcript can run far past the
+   * size a non-streaming request may wait for.
+   *
+   * A cut-off or declined answer throws (assertAnthropicCompleted), so the
+   * caller fails the OCR run exactly as it does for a truncated local OCR
+   * page instead of writing part of a document back to Paperless-ngx.
+   *
+   * @param {object} params
+   * @param {string} params.apiKey
+   * @param {string} [params.apiUrl] - proxy only; empty means api.anthropic.com
+   * @param {string} params.model
+   * @param {string} params.base64 - the document, base64-encoded (a data URL
+   *   is accepted too)
+   * @param {string} params.mimeType - application/pdf or an image type
+   * @param {number} [params.timeoutMs] - how long the request may go without
+   *   progress: until the answer starts, and between two streamed events
+   * @param {number} [params.maxTokens] - completion cap; default 64000
+   * @returns {Promise<string>} the transcribed text; empty for a document
+   *   without readable text
+   */
+  async runAnthropicOcr({
+    apiKey,
+    apiUrl = '',
+    model,
+    base64,
+    mimeType,
+    timeoutMs,
+    maxTokens,
+  } = {}) {
+    const key = String(apiKey || '').trim();
+    if (!key) {
+      throw new Error('Claude OCR needs an API key');
+    }
+
+    const source = this._prepareClaudeOcrSource(base64, mimeType);
+    const modelName = String(model || '').trim() || ANTHROPIC_DEFAULT_MODEL;
+    const cap = anthropicMaxTokens(maxTokens, CLAUDE_OCR_MAX_TOKENS);
+
+    const params = {
+      model: modelName,
+      max_tokens: cap,
+      ...anthropicThinkingParams(modelName, { reasoning: false }),
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: source.blockType,
+              source: {
+                type: 'base64',
+                media_type: source.mediaType,
+                data: source.data,
+              },
+            },
+            { type: 'text', text: CLAUDE_OCR_INSTRUCTION },
+          ],
+        },
+      ],
+    };
+
+    const client = createAnthropicClient({ apiKey: key, apiUrl, timeoutMs });
+    const message = await this._streamClaudeOcr(client, params, timeoutMs);
+
+    const usage = mapAnthropicUsage(message?.usage);
+    if (usage) {
+      console.log(
+        `[OCR] Claude OCR (${modelName}): ${usage.promptTokens} input / ${usage.completionTokens} output tokens`
+      );
+    }
+
+    assertAnthropicCompleted(
+      message,
+      'Claude OCR',
+      cap < CLAUDE_OCR_MAX_TOKENS_CEILING
+        ? `The transcript needs more room: raise ANTHROPIC_MAX_TOKENS (up to ${CLAUDE_OCR_MAX_TOKENS_CEILING}) or split the document.`
+        : 'The transcript is longer than one answer can be; split the document into smaller parts.'
+    );
+
+    const text = anthropicMessageText(message);
+    return text.toLowerCase() === CLAUDE_OCR_NO_TEXT_MARKER ? '' : text;
+  }
+
+  /**
+   * The document as a Messages content source, or an error naming the limit
+   * it breaks. Checked here rather than left to the API so the setup
+   * validation and the OCR queue both get a message that says what to do.
+   *
+   * @param {string} base64
+   * @param {string} mimeType
+   * @returns {{blockType: 'document'|'image', mediaType: string, data: string}}
+   */
+  _prepareClaudeOcrSource(base64, mimeType) {
+    let data = String(base64 || '');
+    let declaredType = mimeType;
+    const dataUrl = /^data:([^;,]+);base64,/i.exec(data);
+    if (dataUrl) {
+      data = data.slice(dataUrl[0].length);
+      declaredType = declaredType || dataUrl[1];
+    }
+    // The API wants base64 without line breaks; MIME-style wrapped input
+    // would be rejected.
+    if (/\s/.test(data)) {
+      data = data.replace(/\s+/g, '');
+    }
+    if (!data) {
+      throw claudeOcrInputError(
+        'Claude OCR received an empty document',
+        'claude_ocr_empty_input'
+      );
+    }
+
+    const mediaType = normalizeClaudeOcrMediaType(declaredType);
+
+    if (mediaType === 'application/pdf') {
+      if (exceedsClaudeOcrRequestLimit(data.length)) {
+        throw claudeOcrInputError(
+          `The PDF is ${formatMegabytes(data.length)} MB as base64; Claude accepts at most ${formatMegabytes(CLAUDE_OCR_MAX_REQUEST_BYTES)} MB per request.`,
+          'claude_ocr_too_large'
+        );
+      }
+      return { blockType: 'document', mediaType, data };
+    }
+
+    if (CLAUDE_OCR_IMAGE_TYPES.has(mediaType)) {
+      if (data.length > CLAUDE_OCR_MAX_IMAGE_BYTES) {
+        throw claudeOcrInputError(
+          `The image is ${formatMegabytes(data.length)} MB as base64; Claude accepts at most ${formatMegabytes(CLAUDE_OCR_MAX_IMAGE_BYTES)} MB per image.`,
+          'claude_ocr_too_large'
+        );
+      }
+      return { blockType: 'image', mediaType, data };
+    }
+
+    // Paperless-ngx serves its archived PDF when it has one, so this is an
+    // original it could not convert (TIFF, office formats, …).
+    throw claudeOcrInputError(
+      `Claude OCR cannot read ${mediaType} files; it accepts PDF, PNG, JPEG, GIF and WebP. ` +
+        'Paperless-ngx has no archived PDF of this document to send instead.',
+      'claude_ocr_unsupported_type'
+    );
+  }
+
+  /**
+   * Streams one Messages request and returns the final message.
+   *
+   * The SDK's own timeout only covers the wait for the response headers; a
+   * stream that stalls after them would hold the queue item in 'processing'
+   * for good. So a watchdog aborts the request once it has gone `timeoutMs`
+   * without progress — before it starts, or between two events — and a long
+   * transcript that keeps arriving is never cut short.
+   */
+  async _streamClaudeOcr(client, params, timeoutMs) {
+    const stream = client.messages.stream(params);
+    let stalled = false;
+    const watchdog =
+      typeof timeoutMs === 'number' && timeoutMs > 0
+        ? setTimeout(() => {
+            stalled = true;
+            stream.abort();
+          }, timeoutMs)
+        : null;
+    if (watchdog) {
+      const touch = () => watchdog.refresh();
+      stream.on('connect', touch).on('streamEvent', touch);
+    }
+
+    try {
+      return await stream.finalMessage();
+    } catch (error) {
+      if (stalled || isTimeoutError(error)) {
+        console.error(
+          `[TIMEOUT][OCR] Claude OCR request timed out: ${error.message}`
+        );
+        throw new Error(buildTimeoutErrorMessage('OCR', timeoutMs), {
+          cause: error,
+        });
+      }
+      throw this._describeClaudeApiError(error);
+    } finally {
+      if (watchdog) clearTimeout(watchdog);
+    }
+  }
+
+  /**
+   * An API error as one readable line. The SDK puts the whole JSON error body
+   * into its message; the queue and the setup wizard show this text as is.
+   */
+  _describeClaudeApiError(error) {
+    if (!(error instanceof APIError) || !error.status) {
+      return error;
+    }
+    const body = error.error?.error;
+    const type = body?.type ? ` (${body.type})` : '';
+    const detail = body?.message || error.message;
+    const hint =
+      error.status === 413
+        ? ` Claude accepts at most ${formatMegabytes(CLAUDE_OCR_MAX_REQUEST_BYTES)} MB per request.`
+        : '';
+    return new Error(
+      `Claude API answered HTTP ${error.status}${type}: ${detail}${hint}`,
+      { cause: error }
+    );
+  }
+
+  /**
    * OCR a document with a local vision model. Images are sent as-is; PDFs are
    * rendered to per-page images via poppler (pdftoppm) when enabled and
    * available, otherwise the Paperless first-page thumbnail is used.
@@ -296,15 +760,27 @@ class MistralOcrService {
   }
 
   /**
-   * OCR every rendered PDF page through the local vision model and join the
-   * page texts. A failed page is skipped so one bad page cannot discard the
-   * rest; if no page succeeds, the last error is thrown.
+   * OCR every rendered PDF page through the local vision model (or the
+   * engine `pageOcr` names) and join the page texts. A failed page is skipped
+   * so one bad page cannot discard the rest; if no page succeeds, the last
+   * error is thrown.
    * @param {{pages: Array<{base64: string, mimeType: string, pageNumber: number}>, totalPages: number|null, truncated: boolean}} rendered
    * @param {number|null} documentId - log context only
    * @param {{onPageProgress?: (pageNumber: number, pageCount: number) => void}} opts
+   * @param {{label?: string, ocrImage?: (base64: string, mimeType: string) => Promise<string>}} [pageOcr]
+   *   - the engine for one page image and its name in errors; local OCR by default
    * @returns {Promise<string>}
    */
-  async _performOcrOnRenderedPages(rendered, documentId, opts = {}) {
+  async _performOcrOnRenderedPages(
+    rendered,
+    documentId,
+    opts = {},
+    {
+      label = 'Local OCR',
+      ocrImage = (imageBase64, imageMimeType) =>
+        this._performLocalOcrOnImage(imageBase64, imageMimeType),
+    } = {}
+  ) {
     const { pages, totalPages, truncated } = rendered;
 
     if (truncated) {
@@ -322,10 +798,7 @@ class MistralOcrService {
       }
 
       try {
-        const pageText = await this._performLocalOcrOnImage(
-          page.base64,
-          page.mimeType
-        );
+        const pageText = await ocrImage(page.base64, page.mimeType);
         if (pageText) {
           pageTexts.push(pageText);
         }
@@ -342,7 +815,7 @@ class MistralOcrService {
     if (pageTexts.length === 0) {
       throw (
         lastError ||
-        new Error('Local OCR returned empty output for all rendered PDF pages')
+        new Error(`${label} returned empty output for all rendered PDF pages`)
       );
     }
 
@@ -811,8 +1284,7 @@ class MistralOcrService {
       emit('download', `Download complete (${mimeType}).`);
 
       // Step 2: OCR
-      const providerLabel =
-        this.provider === 'ollama' ? 'Local OCR' : 'Mistral OCR';
+      const providerLabel = this.providerLabel;
       emit('ocr', `Sending document to ${providerLabel}…`);
       let ocrText;
       try {

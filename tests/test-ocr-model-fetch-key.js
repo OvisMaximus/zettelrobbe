@@ -112,9 +112,14 @@ check('the setup wizard no longer blocks on an empty field', () => {
 check('every OCR route resolves the key before using it', () => {
   // /api/setup/ocr/models, /api/settings/ocr/test and
   // /api/settings/ocr/models. The wizard was the one passing req.body.apiKey
-  // straight through; the settings test endpoint always resolved.
-  const calls = (source.match(/resolveOcrApiKey\(req\.body\?\.apiKey\)/g) || [])
-    .length;
+  // straight through; the settings test endpoint always resolved. Since
+  // Claude OCR joined, the routes go through resolveOcrApiKeyForProvider(),
+  // which hands every other provider to resolveOcrApiKey() unchanged.
+  const calls = (
+    source.match(
+      /resolveOcrApiKeyForProvider\(\s*req\.body\?\.provider,\s*req\.body\?\.apiKey,\s*req\.body\?\.apiUrl \|\| req\.body\?\.anthropicApiUrl\s*\)/g
+    ) || []
+  ).length;
   assert.strictEqual(
     calls,
     3,

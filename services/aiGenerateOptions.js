@@ -5,6 +5,10 @@ const {
   estimateTokenCount,
   jsonFromText,
 } = require('./serviceUtils');
+const {
+  assertAnthropicCompleted,
+  mapAnthropicUsage,
+} = require('./anthropicSupport');
 
 /**
  * The optional second argument of `generateText(prompt, options)`.
@@ -673,6 +677,134 @@ async function runChatCompletionStream({
   return text;
 }
 
+/**
+ * Reads a Claude Messages stream into a collector.
+ *
+ * The Messages API streams typed events instead of chat chunks: a text block's
+ * deltas are the answer, a thinking block's deltas are reasoning (empty under
+ * the default `display: "omitted"`, so a thinking model is often only heard
+ * once it answers), and the stop reason and usage arrive with the final
+ * message, which the caller reads off the stream afterwards.
+ *
+ * Returns as soon as the signal is aborted; leaving the loop early makes the
+ * SDK abort the request, so the server sees the connection go.
+ *
+ * @param {AsyncIterable<object>} stream - from client.messages.stream()
+ * @param {object} collector - from createProgressCollector()
+ * @param {AbortSignal|null} [signal]
+ * @returns {Promise<void>}
+ */
+async function consumeMessagesStream(stream, collector, signal = null) {
+  for await (const event of stream) {
+    if (signal?.aborted) break;
+    if (event?.type === 'content_block_delta') {
+      const delta = event.delta;
+      if (delta?.type === 'text_delta') {
+        collector.pushContent(delta.text);
+      } else if (delta?.type === 'thinking_delta') {
+        collector.pushReasoning(delta.thinking);
+      }
+    }
+    collector.report();
+  }
+}
+
+/**
+ * Runs one streamed request against the Claude Messages API.
+ *
+ * The same afterwards as runChatCompletionStream(): report as the answer
+ * grows, say `done` exactly once — on a clean end, on a cut-off and on an
+ * abort alike — and then return the answer or throw an error that carries
+ * what did arrive. What differs is the dialect: the events are read by
+ * consumeMessagesStream(), and the stop reason and usage come from the final
+ * message rather than from the last chunk. Usage is mapped with
+ * mapAnthropicUsage(), so promptTokens includes the cached input and the
+ * cache counts ride along; the stop reason goes through
+ * assertAnthropicCompleted(), so `max_tokens` is the shared truncation error
+ * and `refusal` is 'ai_refused', both with the partial text.
+ *
+ * Works without a handler too: the collector then reports to nobody, and the
+ * caller still gets the answer and the usage.
+ *
+ * @param {object} params
+ * @param {object} params.client - an Anthropic SDK client
+ * @param {object} params.request - the Messages body, without `stream`
+ * @param {object|null} params.requestOptions - the SDK's second argument
+ *   (the signal), or null
+ * @param {AbortSignal|null} params.signal
+ * @param {((update: GenerateTextProgress) => void)|null} params.onProgress
+ * @param {string} params.provider - name for the error messages
+ * @param {string} params.remedy - sentence naming the limit to raise
+ * @param {(usage: object) => void} params.onUsage - told before a throw for
+ *   truncation or refusal, so such a request still reports what it spent
+ * @returns {Promise<string>} the answer, reasoning stripped
+ */
+async function runMessagesStream({
+  client,
+  request,
+  requestOptions,
+  signal,
+  onProgress,
+  provider,
+  remedy,
+  onUsage,
+}) {
+  const collector = createProgressCollector({ onProgress });
+  let message;
+
+  try {
+    const stream = requestOptions
+      ? client.messages.stream(request, requestOptions)
+      : client.messages.stream(request);
+    await consumeMessagesStream(stream, collector, signal);
+    if (signal?.aborted) {
+      // Same as the chat runner: the loop left early, the SDK closed the
+      // connection, and the caller is told with what arrived until then.
+      collector.finish();
+      throw abortedGenerationError(null, collector.text());
+    }
+    message = await stream.finalMessage();
+  } catch (error) {
+    collector.finish();
+    if (error?.name === 'AbortError') throw error;
+    if (isAbortError(error, signal)) {
+      throw abortedGenerationError(error, collector.text());
+    }
+    throw error;
+  }
+
+  // The reported counts decide the last report, as a usage chunk does for
+  // the OpenAI-compatible providers.
+  const reported = mapAnthropicUsage(message?.usage);
+  if (reported) {
+    collector.setUsage({
+      prompt_tokens: reported.promptTokens,
+      completion_tokens: reported.completionTokens,
+      total_tokens: reported.totalTokens,
+    });
+  }
+  collector.setFinishReason(message?.stop_reason);
+  collector.finish();
+
+  const summary = collector.usageSummary();
+  if (typeof onUsage === 'function') {
+    onUsage(
+      reported
+        ? {
+            ...summary,
+            cacheReadTokens: reported.cacheReadTokens,
+            cacheWriteTokens: reported.cacheWriteTokens,
+          }
+        : summary
+    );
+  }
+
+  assertAnthropicCompleted(message, provider, remedy, {
+    partialText: collector.text(),
+  });
+  return collector.text();
+}
+
 module.exports = {
   reasoningEnabled,
   reasoningEffortForOpenAi,
@@ -690,4 +822,6 @@ module.exports = {
   runChatCompletionStream,
   isAbortError,
   abortedGenerationError,
+  consumeMessagesStream,
+  runMessagesStream,
 };

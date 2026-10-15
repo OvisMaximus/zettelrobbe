@@ -77,6 +77,11 @@ async function calculateTokens(
   text,
   model = process.env.OPENAI_MODEL || 'gpt-4o-mini'
 ) {
+  if (isClaudeModel(model)) {
+    console.log(`[DEBUG] Using Claude token estimation for model: ${model}`);
+    return estimateTokensForClaude(text);
+  }
+
   try {
     const compatibleModel = getCompatibleModel(model);
 
@@ -161,6 +166,13 @@ async function truncateToTokenLimit(
     throw new Error(
       'truncateToTokenLimit: maxTokens must be a positive finite number'
     );
+  }
+
+  if (isClaudeModel(model)) {
+    console.log(
+      `[DEBUG] Using Claude character-based truncation for model: ${model}`
+    );
+    return truncateForClaude(text, maxTokens);
   }
 
   try {
@@ -1047,6 +1059,63 @@ function estimateTokenCount(textOrLength) {
       : String(textOrLength ?? '').length;
 
   return Math.ceil(length / 4);
+}
+
+/**
+ * Claude models, by the name the Claude API knows them under.
+ *
+ * Their tokenizers are not tiktoken's, and the newer ones count noticeably
+ * more tokens per character than the ÷4 rule assumes (the current generation
+ * counts the same text as roughly 30% more tokens than the one before). An
+ * estimate that comes out low lets through a document the budget meant to
+ * cut, so Claude gets its own, more conservative rate. Every other model keeps
+ * the estimate it always had.
+ */
+const CLAUDE_MODEL_PATTERN = /^claude-/i;
+const CLAUDE_CHARS_PER_TOKEN = 3;
+
+/**
+ * @param {unknown} model
+ * @returns {boolean}
+ */
+function isClaudeModel(model) {
+  return CLAUDE_MODEL_PATTERN.test(String(model ?? '').trim());
+}
+
+/**
+ * Tokens of a text for a Claude model: about three characters each.
+ *
+ * @param {unknown} text
+ * @returns {number}
+ */
+function estimateTokensForClaude(text) {
+  return Math.ceil(String(text ?? '').length / CLAUDE_CHARS_PER_TOKEN);
+}
+
+/**
+ * truncateToTokenLimit() for a Claude model: the same character cut and word
+ * boundary as the other estimated models, at Claude's rate.
+ *
+ * @param {unknown} text
+ * @param {number} maxTokens - a positive finite number, checked by the caller
+ * @returns {string}
+ */
+function truncateForClaude(text, maxTokens) {
+  const source = typeof text === 'string' ? text : String(text ?? '');
+  if (estimateTokensForClaude(source) <= maxTokens) {
+    return source;
+  }
+
+  const maxChars = Math.floor(maxTokens * CLAUDE_CHARS_PER_TOKEN);
+  const truncatedText = source.substring(0, maxChars);
+
+  // Break at a word boundary when that costs little of the budget.
+  const lastSpaceIndex = truncatedText.lastIndexOf(' ');
+  if (lastSpaceIndex > maxChars * 0.8) {
+    return truncatedText.substring(0, lastSpaceIndex);
+  }
+
+  return truncatedText;
 }
 
 module.exports = {

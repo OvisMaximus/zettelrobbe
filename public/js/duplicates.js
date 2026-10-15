@@ -2125,7 +2125,7 @@ async function reattachReview() {
  */
 function htmlReviewFailure(message) {
   const text = String(message == null ? '' : message);
-  return `<div class="zr-alert zr-alert--danger">${htmlIcons.danger}<div class="zr-alert__body"><div class="zr-alert__title">Run failed</div><p class="zr-sm">${esc(text)}</p><p class="zr-sm"><a class="zr-link" href="/settings#duplicates-tab">Duplicates settings</a></p></div></div>`;
+  return `<div class="zr-alert zr-alert--danger">${htmlIcons.danger}<div class="zr-alert__body"><div class="zr-alert__title">Run failed</div><p class="zr-sm">${esc(text)}</p><p class="zr-sm"><a class="zr-link" href="/settings#duplicates">Duplicates settings</a></p></div></div>`;
 }
 
 /** What a review has to admit about itself, or '' when it went through. */

@@ -78,6 +78,8 @@
           `AZURE_ENDPOINT=${supportInfo.azureEndpoint || 'unknown'}`,
           `AZURE_DEPLOYMENT_NAME=${supportInfo.azureDeploymentName || 'unknown'}`,
           `AZURE_API_VERSION=${supportInfo.azureApiVersion || 'unknown'}`,
+          `ANTHROPIC_MODEL=${supportInfo.anthropicModel || 'unknown'}`,
+          `ANTHROPIC_API_URL=${supportInfo.anthropicApiUrl || 'unknown'}`,
           `MISTRAL_OCR_MODEL=${supportInfo.mistralOcrModel || 'unknown'}`,
           `TRUST_PROXY=${supportInfo.trustProxy || 'unknown'}`,
           `USE_EXISTING_DATA=${supportInfo.useExistingData || 'no'}`,
@@ -88,6 +90,7 @@
           `OPENAI_API_KEY=${keyState(supportInfo.openAiKeySet)}`,
           `CUSTOM_API_KEY=${keyState(supportInfo.customKeySet)}`,
           `AZURE_API_KEY=${keyState(supportInfo.azureKeySet)}`,
+          `ANTHROPIC_API_KEY=${keyState(supportInfo.anthropicKeySet)}`,
           `MISTRAL_API_KEY=${keyState(supportInfo.mistralKeySet)}`,
           `API_KEY=${keyState(supportInfo.apiKeySet)}`,
         ].join('\n')
