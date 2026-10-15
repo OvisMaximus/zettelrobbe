@@ -8,7 +8,7 @@
  * 1. getThumbnailCachePath() ran outside the try block, so an id it rejects
  *    ('' after sanitizing, null, undefined) made analyzeDocument() *throw*
  *    instead of returning a result. The scan loop reads analysis.error and
- *    never expects a throw; POST /manual/analyze passes `id || []`, which is
+ *    never expects a throw; POST /manual/analyze passed `id || []`, which is
  *    exactly such a value, and answered 500 for every request without an id.
  * 2. A thumbnail Paperless does not have returned `undefined` from
  *    analyzeDocument(), and every caller immediately reads `.document` on it.
@@ -134,8 +134,8 @@ const writtenCachePaths = [];
     for (const { label, service, stub } of PROVIDERS) {
       /* --- ids the cache path helper rejects ----------------------------- */
 
-      // `id || []` is what routes/setup.js hands over when the request omits
-      // one, and String([]) sanitizes to the empty string.
+      // `id || []` is what routes/setup.js used to hand over when the request
+      // omitted one, and String([]) sanitizes to the empty string.
       for (const id of [[], undefined, null, '', '///']) {
         await check(
           `${label}: an unusable id (${JSON.stringify(id)}) still analyses`,
