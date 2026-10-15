@@ -4,7 +4,10 @@ const axios = require('axios');
 const config = require('../config/config');
 const { cacheThumbnail } = require('./thumbnailCache');
 const { buildAnalysisPrompt } = require('./llm/promptBuilder');
-const { parseAnalysisResponse } = require('./llm/responseParser');
+const {
+  parseAnalysisResponse,
+  isInsufficientContentAnswer,
+} = require('./llm/responseParser');
 const charBudget = require('./llm/tokenBudget/charBudget');
 const {
   OllamaGenerateTransport,
@@ -12,6 +15,7 @@ const {
 const {
   buildSuccess,
   buildFailure,
+  buildInsufficientContent,
   assertAssignableMetadata,
   withDocumentDefaults,
 } = require('./llm/analysisResult');
@@ -218,8 +222,20 @@ class OllamaService {
       );
 
       // Process response
-      const parsedResponse = this._processOllamaResponse(response);
       const metrics = this._extractOllamaMetrics(response);
+      let parsedResponse;
+      try {
+        parsedResponse = this._processOllamaResponse(response);
+      } catch (error) {
+        if (
+          error.message.startsWith('Invalid JSON response from API') &&
+          isInsufficientContentAnswer(response.response)
+        ) {
+          console.warn(`Document ${id} has insufficient content for analysis`);
+          return buildInsufficientContent(id, metrics);
+        }
+        throw error;
+      }
 
       // Log the prompt and response
       await this._logPromptAndResponse(systemPrompt, prompt, parsedResponse);

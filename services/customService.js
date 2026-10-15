@@ -24,10 +24,14 @@ const {
 const {
   buildSuccess,
   buildFailure,
+  buildInsufficientContent,
   assertAssignableMetadata,
   withDocumentDefaults,
 } = require('./llm/analysisResult');
-const { parseAnalysisResponse } = require('./llm/responseParser');
+const {
+  parseAnalysisResponse,
+  isInsufficientContentAnswer,
+} = require('./llm/responseParser');
 const responseLogPath = path.join(
   process.cwd(),
   'data',
@@ -215,6 +219,11 @@ class CustomOpenAIService {
       } catch (error) {
         console.log(`[ERROR] Failed to parse JSON response: ${error.message}`);
         console.debug(error);
+        if (isInsufficientContentAnswer(jsonContent)) {
+          console.warn(`Document ${id} has insufficient content for analysis`);
+          // Return a default structure instead of throwing to prevent retry loops
+          return buildInsufficientContent(id, mappedUsage);
+        }
         throw error;
       }
 

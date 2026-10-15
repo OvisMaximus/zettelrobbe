@@ -259,21 +259,18 @@ const assertRoutesToOcr = (analysis, expectedReason) => {
     }
   );
 
-  /* Only OpenAI implements the "insufficient content" early return today
-     (Finding 7c), and it triggers on the *answer*, not on the document: an
-     unparseable reply containing "i'm sorry" / "i cannot" / "insufficient".
-     The refactor is meant to extend it to the other three. */
-  await check(
-    'OpenAI: a refusal routes to OCR as insufficient content',
-    async () => {
-      const openai = PROVIDERS.find((p) => p.label === 'OpenAI');
-      openai.answer("I'm sorry, there is insufficient text to analyse.");
-      assertRoutesToOcr(
-        await analyse(openai.service),
-        'ai_insufficient_content'
-      );
-    }
-  );
+  /* Finding 7c: all four providers implement the "insufficient content"
+     early return — an unparseable answer containing "i'm sorry" / "i cannot"
+     / "insufficient" routes to OCR under that reason, not as invalid JSON. */
+  for (const { label, service, answer } of PROVIDERS) {
+    await check(
+      `${label}: a refusal routes to OCR as insufficient content`,
+      async () => {
+        answer("I'm sorry, there is insufficient text to analyse.");
+        assertRoutesToOcr(await analyse(service), 'ai_insufficient_content');
+      }
+    );
+  }
 
   /* All four providers raise "could not determine assignable metadata",
      so every one of them routes the document to OCR as an invalid

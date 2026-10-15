@@ -29,7 +29,7 @@ const {
 } = require('./llm/analysisResult');
 const {
   parseAnalysisResponse,
-  stripResponseWrapping,
+  isInsufficientContentAnswer,
 } = require('./llm/responseParser');
 const responseLogPath = path.join(
   process.cwd(),
@@ -188,14 +188,7 @@ class OpenAIService {
       } catch (error) {
         console.error(`Failed to parse JSON response: ${error.message}`);
         console.debug(error);
-        // Check if the response indicates the content is too minimal or API can't process it
-        jsonContent = stripResponseWrapping(jsonContent);
-        if (
-          jsonContent &&
-          (jsonContent.toLowerCase().includes("i'm sorry") ||
-            jsonContent.toLowerCase().includes('i cannot') ||
-            jsonContent.toLowerCase().includes('insufficient'))
-        ) {
+        if (isInsufficientContentAnswer(jsonContent)) {
           console.warn(`Document ${id} has insufficient content for analysis`);
           // Return a default structure instead of throwing to prevent retry loops
           return buildInsufficientContent(id, mappedUsage);

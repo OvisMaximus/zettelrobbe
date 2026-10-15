@@ -361,37 +361,40 @@ const assertFailureRecord = (analysis) => {
     );
   }
 
-  /* OpenAI alone (Finding 7c) answers a refusal with a placeholder document
-     instead of the failure record, so the retry loop does not ask again. The
-     error phrase still routes it to OCR; the document is what the write-back
-     would set, so it is pinned field by field. */
-  await check(
-    'OpenAI: a refusal returns the insufficient-content placeholder',
-    async () => {
-      const openai = PROVIDERS.find((p) => p.label === 'OpenAI');
-      openai.arrangeAnswer("I'm sorry, I cannot analyse this document.");
-      const analysis = await analyse(openai.service);
+  /* Finding 7c: a refusal returns the insufficient-content placeholder on
+     all four providers, not the failure record, so the retry loop does not
+     ask again. The error phrase still routes it to OCR; the document is what
+     the write-back would set, so it is pinned field by field. Metrics are
+     the tokens the refusal cost — the stubs all report 900 prompt / 120
+     completion / 1020 total. */
+  for (const { label, service, arrangeAnswer } of PROVIDERS) {
+    await check(
+      `${label}: a refusal returns the insufficient-content placeholder`,
+      async () => {
+        arrangeAnswer("I'm sorry, I cannot analyse this document.");
+        const analysis = await analyse(service);
 
-      assert.strictEqual(
-        analysis.error,
-        'Insufficient content for AI analysis'
-      );
-      assert.deepStrictEqual(analysis.document, {
-        tags: [],
-        correspondent: 'Unknown',
-        title: `Document ${DOCUMENT_ID}`,
-        document_date: new Date().toISOString().split('T')[0],
-        document_type: 'Document',
-        language: 'und',
-      });
-      assert.deepStrictEqual(analysis.metrics, {
-        promptTokens: 900,
-        completionTokens: 120,
-        totalTokens: 1020,
-      });
-      assert.strictEqual(analysis.truncated, false);
-    }
-  );
+        assert.strictEqual(
+          analysis.error,
+          'Insufficient content for AI analysis'
+        );
+        assert.deepStrictEqual(analysis.document, {
+          tags: [],
+          correspondent: 'Unknown',
+          title: `Document ${DOCUMENT_ID}`,
+          document_date: new Date().toISOString().split('T')[0],
+          document_type: 'Document',
+          language: 'und',
+        });
+        assert.deepStrictEqual(analysis.metrics, {
+          promptTokens: 900,
+          completionTokens: 120,
+          totalTokens: 1020,
+        });
+        assert.strictEqual(analysis.truncated, false);
+      }
+    );
+  }
 
   await fs.rm(getThumbnailCachePath(DOCUMENT_ID), { force: true });
 

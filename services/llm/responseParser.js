@@ -23,6 +23,12 @@
 
 const INVALID_JSON = 'Invalid JSON response from API';
 
+/**
+ * What a model writes when it declines a document as too thin to analyse.
+ * Matched only on an answer that did not parse (Finding 7c).
+ */
+const INSUFFICIENT_CONTENT_MARKERS = ["i'm sorry", 'i cannot', 'insufficient'];
+
 /** Drop reasoning blocks and code fences around the answer. */
 function stripResponseWrapping(text) {
   return String(text ?? '')
@@ -30,6 +36,22 @@ function stripResponseWrapping(text) {
     .replace(/```json\n?/gi, '')
     .replace(/```\n?/g, '')
     .trim();
+}
+
+/**
+ * Whether an answer that did not parse is a refusal rather than broken JSON.
+ * Such a document is reported as insufficient content: it still reaches OCR,
+ * under that reason, and the retry loop does not ask the model again.
+ *
+ * @param {string} raw - The model's answer
+ * @returns {boolean}
+ */
+function isInsufficientContentAnswer(raw) {
+  const text = stripResponseWrapping(raw).toLowerCase();
+  return (
+    text !== '' &&
+    INSUFFICIENT_CONTENT_MARKERS.some((marker) => text.includes(marker))
+  );
 }
 
 /**
@@ -163,4 +185,5 @@ function parseAnalysisResponse(raw) {
 module.exports = {
   parseAnalysisResponse,
   stripResponseWrapping,
+  isInsufficientContentAnswer,
 };

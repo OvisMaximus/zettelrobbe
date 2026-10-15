@@ -39,6 +39,7 @@ const {
 const {
   parseAnalysisResponse,
   stripResponseWrapping,
+  isInsufficientContentAnswer,
 } = require('../services/llm/responseParser');
 const { shouldQueueForOcrOnAiError } = require('../services/serviceUtils');
 const openaiService = require('../services/openaiService');
@@ -245,6 +246,29 @@ function sameDocument(label, actual, expected) {
       assert.deepStrictEqual(parsed, RESULT);
     }
   );
+
+  /* Finding 7c: an unreadable answer that reads like a refusal is reported
+     as insufficient content instead. The answers above must stay plain
+     failures, or the cases further down would test the refusal path. */
+  for (const [name, answer] of UNREADABLE_ANSWERS) {
+    await check(`${name} is not a refusal`, () => {
+      assert.strictEqual(isInsufficientContentAnswer(answer), false);
+    });
+  }
+
+  await check('a refusal is recognised, case and wrapping aside', () => {
+    for (const answer of [
+      "I'm sorry, I cannot help with this document.",
+      'I CANNOT analyse this.',
+      '<think>too short</think>The content is insufficient.',
+      '```\nInsufficient text.\n```',
+    ]) {
+      assert.strictEqual(isInsufficientContentAnswer(answer), true, answer);
+    }
+    for (const answer of ['', null, undefined, 'A scanned letter.']) {
+      assert.strictEqual(isInsufficientContentAnswer(answer), false, answer);
+    }
+  });
 
   for (const [name, answer] of UNREADABLE_ANSWERS) {
     await check(`fails on ${name} with the OCR fallback phrase`, () => {
