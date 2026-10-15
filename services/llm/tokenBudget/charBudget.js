@@ -10,7 +10,7 @@
  * the context window and the document cut agree by construction (Finding 5
  * of services/ManualServiceRefactoring.md — do not unify it with tiktoken's).
  *
- * Shares its reserve()/fit() shape with tiktokenBudget.js.
+ * Shares its reserve()/fit()/count()/cut() shape with tiktokenBudget.js.
  */
 
 const config = require('../../../config/config');
@@ -90,4 +90,22 @@ async function fit(content, availableTokens) {
   return text.substring(0, maxChars);
 }
 
-module.exports = { estimateTokens, numCtx, reserve, fit };
+/**
+ * Cut a text to a token count, e.g. the external API data.
+ *
+ * @param {string} text
+ * @param {number} maxTokens
+ * @returns {string}
+ */
+function cut(text, maxTokens) {
+  return String(text).substring(0, maxTokens * CHARS_PER_TOKEN);
+}
+
+module.exports = {
+  estimateTokens,
+  count: estimateTokens,
+  cut,
+  numCtx,
+  reserve,
+  fit,
+};

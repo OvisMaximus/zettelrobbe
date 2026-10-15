@@ -7,11 +7,13 @@
  * not know), the configured answer is reserved, and the document gets what is
  * left of TOKEN_LIMIT. This block used to be copied into all three services.
  *
- * Shares its reserve()/fit() shape with charBudget.js, which is Ollama's.
+ * Shares its reserve()/fit()/count()/cut() shape with charBudget.js, which is
+ * Ollama's.
  */
 
 const config = require('../../../config/config');
 const {
+  calculateTokens,
   calculateTotalPromptTokens,
   truncateToTokenLimit,
 } = require('../../serviceUtils');
@@ -66,4 +68,14 @@ function fit(content, availableTokens, model) {
   return truncateToTokenLimit(content, availableTokens, model);
 }
 
-module.exports = { reserve, fit };
+/** Tokens of a text, e.g. the external API data. */
+function count(text, model) {
+  return calculateTokens(text, model);
+}
+
+/** Cut a text to a token count, e.g. the external API data. */
+function cut(text, maxTokens, model) {
+  return truncateToTokenLimit(text, maxTokens, model);
+}
+
+module.exports = { reserve, fit, count, cut };

@@ -24,10 +24,10 @@ function assertMatches(content, regex, message) {
 function run() {
   console.log('\n=== Native Install Log Path Checks ===');
 
+  // The chat providers share the response log of the DocumentAnalyzer.
   const filesUsingResponseLogPath = [
-    'services/openaiService.js',
+    'services/llm/documentAnalyzer.js',
     'services/customService.js',
-    'services/azureService.js',
   ];
 
   filesUsingResponseLogPath.forEach((relativePath) => {
