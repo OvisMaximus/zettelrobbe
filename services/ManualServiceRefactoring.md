@@ -625,17 +625,29 @@ reservedTokens, availableTokens }` and `fit(content, availableTokens)`; the char
      signatures, so neither was taken over.
 
 7. **Delete `services/manualService.js`** and repoint `POST /manual/analyze`
-   (`routes/setup.js:7477`) at `AIServiceFactory.getService()`, collapsing its four-way switch.
-   Clean up what used to trigger Finding 7j while here: all four branches pass `id || []`
-   (`routes/setup.js:7501`, `:7516`, `:7525`, `:7534`), and `String([])` is
-   `''`, which `getThumbnailCachePath()` rejects. That no longer costs the analysis — the request now
-   succeeds with a warning — but `id || []` is still a nonsense default; pass the id through as-is,
-   or require it. Note that
-   `/manual/analyze` currently calls
-   `documentModel.addOpenAIMetrics()` only on the OpenAI branch — decide explicitly whether metrics
-   are recorded for every provider, and if the
-   response shape changes, update the `@swagger` JSDoc and run `node scripts/regen-openapi.js`
-   (the CI drift check will fail otherwise).
+   (`routes/setup.js:8273` after the v2026.10.01 merge) at `AIServiceFactory.getService()`,
+   collapsing its provider switch — five branches since upstream added Anthropic, whose branch
+   already goes through the factory and is the template. Clean up what used to trigger Finding 7j
+   while here: every branch passes `id || []`, and `String([])` is `''`, which
+   `getThumbnailCachePath()` rejects. That no longer costs the analysis — the request succeeds with
+   a warning — but `id || []` is still a nonsense default.
+
+   **Decisions, taken by the maintainer on 2026-10-15:**
+   - **Metrics for every provider.** `documentModel.addOpenAIMetrics()` is called for every
+     provider, not only OpenAI — when the analysis returned `metrics` and the request carried an
+     `id`, as the Anthropic branch does today. Without an id there is no document to record them
+     against.
+   - **No API change.** `id` stays optional and is passed through as it is (no `|| []`); no new
+     required field, no new status code.
+
+   Also fix on the way: the OpenAI branch reads `analyzeDocument.metrics.promptTokens` without a
+   guard, so a failed analysis (`metrics: null`) answers 500 with a TypeError instead of returning
+   the failure record; the guard above removes it. The `@swagger` JSDoc of the route describes the
+   response wrongly — flat `correspondent`/`title`/`tags`/`documentType` and metrics "when using
+   OpenAI", while the route returns the AnalysisResult `{ document, metrics, truncated }` (plus
+   `error`/`errorCode` on failure). Correcting the text to what the route already returns is no API
+   change; run `node scripts/regen-openapi.js` afterwards (the CI drift check fails otherwise).
+
 8. **Verify Finding 7h** (unreachable `initialize()` branches in the former `openaiService`) and drop
    the dead branches.
 9. **Full verification.** `node scripts/run-tests.js --all`; ESLint/Prettier on every changed file;
@@ -669,7 +681,8 @@ Written when step 6 was done (tag `refactor-step-6-done`), for whoever continues
   run the suite on the parent commit as well and compare the lists of failed tests. Back every new
   test with a mutation check: break the code it guards, see it fail, restore.
 - **Step 7 can now use the factory:** every provider has the same `analyzeDocument()` signature
-  and result, so `/manual/analyze` can call `AIServiceFactory.getService()` without a switch.
+  and result, so `/manual/analyze` can call `AIServiceFactory.getService()` without a switch. The
+  decisions it needs are recorded under step 7.
 
 ## Out of Scope / Follow-ups
 
