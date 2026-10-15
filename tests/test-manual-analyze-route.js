@@ -7,7 +7,7 @@
  * analysis answered 500 with a TypeError instead of the failure record), and
  * every branch passed `id || []` — a nonsense id that the thumbnail cache
  * rejects. Since every provider has the same analyzeDocument() signature and
- * result (services/ManualServiceRefactoring.md, step 6), the route goes
+ * result (docs/llm-service-refactoring.md, step 6), the route goes
  * through AIServiceFactory.getService() like the scan loop does.
  *
  * The router runs for real on a throwaway database (tests/helpers/mount-router);

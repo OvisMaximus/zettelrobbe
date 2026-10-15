@@ -1,7 +1,7 @@
 /**
  * The two token budgets, each written once.
  *
- * Step 4 of the LLM service refactoring (services/ManualServiceRefactoring.md).
+ * Step 4 of the LLM service refactoring (docs/llm-service-refactoring.md).
  * openai, azure and custom carried the same reserve-then-truncate block:
  * tiktoken counts for the prompt, the configured answer reserved, the
  * document cut to what is left. It lives in

@@ -2,7 +2,7 @@
  * Azure carries the configured temperature on both its paths.
  *
  * Step 6 decision 7a of the LLM service refactoring
- * (services/ManualServiceRefactoring.md): analysis sends
+ * (docs/llm-service-refactoring.md): analysis sends
  * config.aiTemperatureAnalysis (was a hardcoded 0.3) and generateText()
  * defaults to config.aiTemperatureGeneration (was a hardcoded 0.7). The rest
  * of the request — model, messages, max_tokens, the absence of

@@ -1,7 +1,7 @@
 /**
  * The analysis result contract, pinned across all four providers.
  *
- * Safety net for the LLM service refactoring (services/ManualServiceRefactoring.md,
+ * Safety net for the LLM service refactoring (docs/llm-service-refactoring.md,
  * step 1). It describes what analyzeDocument() promises its three callers today —
  * server.js:766-821, services/mistralOcrService.js:988-997, and
  * routes/setup.js:3167-3177 — so that collapsing four implementations into one

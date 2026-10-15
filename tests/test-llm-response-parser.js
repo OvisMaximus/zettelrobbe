@@ -1,7 +1,7 @@
 /**
  * The analysis answer, parsed once for all four providers.
  *
- * Step 3 of the LLM service refactoring (services/ManualServiceRefactoring.md).
+ * Step 3 of the LLM service refactoring (docs/llm-service-refactoring.md).
  * Finding 7d: there were three parsers. Custom matched braces and stripped
  * <think> blocks, openai and azure stripped fences and called JSON.parse on
  * the rest, Ollama took everything from the first "{" to the last "}" and

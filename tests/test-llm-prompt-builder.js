@@ -1,7 +1,7 @@
 /**
  * The analysis prompt, built once for all four providers.
  *
- * Step 2 of the LLM service refactoring (services/ManualServiceRefactoring.md).
+ * Step 2 of the LLM service refactoring (docs/llm-service-refactoring.md).
  * The %CUSTOMFIELDS% block and the prompt cascade after it — pre-existing
  * data, mustHavePrompt, restriction placeholders, external API data,
  * USE_PROMPT_TAGS and the webhook's custom prompt — used to be copied into

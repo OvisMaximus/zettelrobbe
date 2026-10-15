@@ -1,5 +1,17 @@
 # LLM Service Refactoring Plan
 
+**Status: done** (2026-10-15) — steps 1-8, and step 9 except the live smoke run. The four
+provider services are composition roots of one `DocumentAnalyzer` (`services/llm/`),
+`POST /manual/analyze` goes through `AIServiceFactory`, and `services/manualService.js` is gone.
+What is left is listed under Out of Scope / Follow-ups. The plan is kept as the record of why the
+code looks the way it does; the commit bodies hold the details of each step.
+
+Measured against the expected benefits: the four services shrank from 2783 lines to four one-line
+re-exports and `manualService.js` (284 lines) is gone, while `services/llm/` holds 2636 lines. The
+saving is smaller than the ~2000 lines expected: the remaining code carries JSDoc, and the checks
+that now apply to every provider — the refusal check (7c), the metadata check (7k), the field
+defaults — each existed in one service before.
+
 ## The Goal
 
 Four provider services offer the same business service through different AI APIs. Implement the
@@ -652,22 +664,41 @@ reservedTokens, availableTokens }` and `fit(content, availableTokens)`; the char
    - **The dead file.** `services/manualService.js` (284 lines) is deleted; `git grep manualService`
      finds only this plan.
 
-8. **Verify Finding 7h** (unreachable `initialize()` branches in the former `openaiService`) and drop
-   the dead branches.
-9. **Full verification.** `node scripts/run-tests.js --all`; ESLint/Prettier on every changed file;
-   `node scripts/regen-openapi.js` + `git diff --exit-code OPENAPI/openapi.json`; a manual smoke run
-   of `/manual/analyze` and a scan cycle against a real provider, since no test exercises a live API.
+8. ~~**Verify Finding 7h**~~ **Done.** Verified unreachable: since step 7 the only non-test module
+   that requires `openaiService` is `aiServiceFactory.js`, which hands it out for `openai` and as
+   the default for an unknown provider only, and no production code changes `config.aiProvider` at
+   runtime. `createClient()` in `services/llm/providers/openaiProvider.js` no longer builds an
+   Ollama (`<OLLAMA_API_URL>/v1`) or a Custom client; it builds one for `openai` with an API key and
+   returns `null` otherwise. One case in `llm-transport-request-mapping` pins that — it failed
+   before the change (an Ollama client for `ollama`).
+9. ~~**Full verification.**~~ **Done, except the live smoke run.** See "Final verification" below.
 
 ---
 
-## Handoff notes for step 8 onwards
+## Final verification
 
-Written when step 6 was done (tag `refactor-step-6-done`) and updated after step 7, for whoever
-continues — human or agent.
+On 2026-10-15, at the commit that moved this document to `docs/`:
 
-- **Read first:** `/CLAUDE.md`, this plan (Findings, the done notes of steps 1-7),
-  `services/llm/documentAnalyzer.js`, `services/llm/promptLayout.js` and one composition root,
-  e.g. `services/llm/providers/azureProvider.js`.
+- `node scripts/run-tests.js --all`: 112 passed, 7 skipped, 23 failed. The failed tests are the same list as on the
+  commit before step 7 (`0a7a2f8`) plus `manual-analyze-route`, whose nine cases pass and which
+  fails only because `tests/helpers/mount-router.js` cannot remove its temp directory on Windows
+  (EPERM) — the reason `duplicates-endpoints` fails there too. The rest of that list is
+  environmental on the Windows development machine (temp-dir EPERM/EBUSY, native crashes, CRLF
+  in the working copy, the shell's `ANTHROPIC_BASE_URL`).
+- ESLint, Prettier and stylelint on every file the branch changes against upstream `main`, the
+  way CI selects them: clean.
+- `node scripts/regen-openapi.js` + `git diff --exit-code OPENAPI/openapi.json`: no drift.
+- **Not done: a manual smoke run** of `/manual/analyze` and a scan cycle against a real
+  Paperless-ngx and a real provider. No test exercises a live API, and none was available here.
+  Do this before the release that carries the refactoring: one document per configured provider
+  through the scan, one through the manual page, and check the token metrics appear for it.
+
+## Notes for whoever works on this code next
+
+- **Read first:** `/CLAUDE.md`, the Findings and done notes above, `services/llm/documentAnalyzer.js`,
+  `services/llm/promptLayout.js` and one composition root, e.g.
+  `services/llm/providers/azureProvider.js`. A new chat-completions provider is one composition
+  root plus a factory case.
 - **Seams the tests rely on — keep them on the four exported singletons:** `service.client` is
   replaced directly by many tests; `lastGenerateTextUsage` is read and set; `service.transport` is
   inspected and its `generate` stubbed. Ollama's `apiUrl`, `model`, `documentAnalysisSchema`,
@@ -676,22 +707,16 @@ continues — human or agent.
   singleton in `ollamaProvider.js`. `ollama-temperature-wiring` mocks axios through
   `require.cache` and loads `services/ollamaService.js` first in a fresh process, so the client is
   created with the mock. `ollama-upstream-error` patches the global `setTimeout`.
-- **Rules:** TDD; new tests are plain node scripts in `tests/`, registered in `TESTS` and an
-  `AREAS` entry of `scripts/run-tests.js`; ESLint and Prettier clean on every touched file; one
-  green commit per sub-step, commit body with Background / Changes / Testing / Impact / Upstream
-  Status; English only in the repo.
+- **The factory is the only door.** No route or service requires a provider singleton directly;
+  `POST /manual/analyze` and the scan loop both call `AIServiceFactory.getService()`.
+- **Router tests:** `tests/helpers/mount-router.js` mounts the real `routes/setup.js` on a throwaway
+  database; `tests/test-manual-analyze-route.js` is the smallest example. On Windows its `close()`
+  fails with EPERM on the temp directory — expected there; the cases themselves pass.
 - **Verify like this:** `node scripts/run-tests.js --all` takes about ten minutes. Some tests
   fail for reasons unrelated to the code, depending on the machine (native crashes, temp-dir
   permissions, line endings, environment variables of the shell). Never judge a run by its count:
   run the suite on the parent commit as well and compare the lists of failed tests. Back every new
   test with a mutation check: break the code it guards, see it fail, restore.
-- **After step 7** no route switches on the provider any more: `POST /manual/analyze` goes through
-  the factory like the scan loop, and `aiServiceFactory.js` is the only non-test module that
-  requires the provider singletons. Step 8 (row h) can therefore reason about
-  `openaiService.initialize()` from the factory alone.
-- **Router tests:** `tests/helpers/mount-router.js` mounts the real `routes/setup.js` on a throwaway
-  database; `tests/test-manual-analyze-route.js` is the smallest example. On Windows its `close()`
-  fails with EPERM on the temp directory — expected there; the cases themselves pass.
 
 ## Out of Scope / Follow-ups
 
@@ -703,7 +728,7 @@ continues — human or agent.
   the caller is a small change whenever someone wants to make it.
 - **Vision/multimodal analysis**, which is presumably why the thumbnail is cached at all.
 - **`CachedNameIdEnum`'s semantic match calls a method no provider has.** `_findSemanticMatch()`
-  (`services/CachedNameIdEnum.js:176`) calls `ai_service.generateAnswer()`, which exists only in
+  (`services/CachedNameIdEnum.js`) calls `ai_service.generateAnswer()`, which exists only in
   test stubs. The call throws, is caught and returns "no match", so tag/correspondent/document type
   lookup silently falls back to its text matchers. Step 6 settled the contract — `generateText(prompt,
 options)` is the same on all four, the Anthropic provider included — so either point it there
@@ -719,9 +744,8 @@ options)` is the same on all four, the Anthropic provider included — so either
   composition root needs a Messages transport and a decision on those two differences.
 - **`services/llm/contracts.js`** with the typedefs of "The delegation contracts" was not written;
   the constructor JSDoc of `DocumentAnalyzer` and the transports document the shapes instead.
-- **This plan document's location.** `/CLAUDE.md` asks for records in the commit body rather than
-  Markdown files, and `services/` holds services. Move it to `docs/` or fold it into the PR
-  description before the refactor lands.
+- ~~**This plan document's location.**~~ Moved from `services/ManualServiceRefactoring.md` to
+  `docs/llm-service-refactoring.md` at the end of the refactoring; `services/` holds services.
 
 ## Risks
 

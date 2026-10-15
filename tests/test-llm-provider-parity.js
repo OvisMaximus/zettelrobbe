@@ -2,7 +2,7 @@
  * The same answer gives the same result on all four providers, and the
  * four are one DocumentAnalyzer each behind a re-export.
  *
- * Step 6 of the LLM service refactoring (services/ManualServiceRefactoring.md,
+ * Step 6 of the LLM service refactoring (docs/llm-service-refactoring.md,
  * "Done means"): once the four providers share one DocumentAnalyzer, an
  * answer must come back byte-identical from each of them — the document, the
  * metrics, the truncation flag and, for a failure, the error and its code.

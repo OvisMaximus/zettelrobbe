@@ -1,7 +1,7 @@
 /**
  * The transports: what each API family is sent, and what comes back.
  *
- * Step 5 of the LLM service refactoring (services/ManualServiceRefactoring.md).
+ * Step 5 of the LLM service refactoring (docs/llm-service-refactoring.md).
  * A transport owns exactly one thing — how to talk to one API family — and
  * never shapes an analysis result:
  *

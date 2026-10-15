@@ -8,7 +8,7 @@
  * ~4 of English, and a ÷4 estimate under-sizes num_ctx for exactly those
  * documents. Everything here uses the same divisor, so the prompt estimate,
  * the context window and the document cut agree by construction (Finding 5
- * of services/ManualServiceRefactoring.md — do not unify it with tiktoken's).
+ * of docs/llm-service-refactoring.md — do not unify it with tiktoken's).
  *
  * Shares its reserve()/fit()/count()/cut() shape with tiktokenBudget.js.
  */

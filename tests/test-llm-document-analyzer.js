@@ -1,7 +1,7 @@
 /**
  * The DocumentAnalyzer on its own, every collaborator a fake.
  *
- * Step 6 of the LLM service refactoring (services/ManualServiceRefactoring.md):
+ * Step 6 of the LLM service refactoring (docs/llm-service-refactoring.md):
  * the four providers are composition roots over this one class, so the order
  * of its steps is the business logic of all four. The provider suites
  * (llm-analysis-result-contract, llm-provider-parity, ...) pin the outcome

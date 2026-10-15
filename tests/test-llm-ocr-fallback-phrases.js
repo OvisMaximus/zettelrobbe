@@ -1,7 +1,7 @@
 /**
  * The OCR fallback phrases, pinned end to end (Finding 4).
  *
- * Safety net for the LLM service refactoring (services/ManualServiceRefactoring.md,
+ * Safety net for the LLM service refactoring (docs/llm-service-refactoring.md,
  * step 1). server.js:774-821 decides whether a failed analysis goes to the OCR
  * queue by matching analysis.error against a fixed list of **substrings** in
  * shouldQueueForOcrOnAiError(), and picks the queue reason with
